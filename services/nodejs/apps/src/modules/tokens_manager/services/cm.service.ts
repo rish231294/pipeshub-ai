@@ -63,6 +63,10 @@ export interface DefaultStorageConfig {
   storageType: string;
   endpoint: string;
 }
+
+export interface DefaultNotificationConfig {
+  notificationUrl: string;
+}
 // Main Config Service
 export class ConfigService {
   private static instance: ConfigService;

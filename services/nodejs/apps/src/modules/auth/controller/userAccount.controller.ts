@@ -1132,7 +1132,7 @@ export class UserAccountController {
           user,
           this.config.jwtSecret,
         );
-        this.logger.debug('accessToken', accessToken);
+
         if (!user.hasLoggedIn) {
           const userInfo = {
             ...user,

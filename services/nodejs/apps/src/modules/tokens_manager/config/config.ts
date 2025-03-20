@@ -64,6 +64,9 @@ export interface AppConfig {
     storageType: string;
     endpoint: string;
   };
+  notification: {
+    notificationUrl: string;
+  };
 }
 
 export const loadAppConfig = async (): Promise<AppConfig> => {
@@ -84,6 +87,9 @@ export const loadAppConfig = async (): Promise<AppConfig> => {
     iamBackend: commonBackendUrl,
     authUrl: commonBackendUrl,
     cmUrl: commonBackendUrl,
+    notification: {
+      notificationUrl: commonBackendUrl,
+    },
     kafka: await configService.getKafkaConfig(),
     redis: await configService.getRedisConfig(),
     arango: await configService.getArangoConfig(),

@@ -7,7 +7,12 @@ import axios from 'axios';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import { storageEtcdPaths } from '../../storage/constants/constants';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
-import { DefaultStorageConfig } from '../../tokens_manager/services/cm.service';
+import {
+  DefaultNotificationConfig,
+  DefaultStorageConfig,
+} from '../../tokens_manager/services/cm.service';
+import { NotificationCommand } from '../../../libs/commands/notification/notification.command';
+import { NOTIFICATION_EVENTS } from '../../notification/constants/constants';
 
 const logger = Logger.getInstance({
   service: 'knowledge_base.utils',
@@ -29,6 +34,7 @@ export const saveFileToStorageAndGetDocumentId = async (
   isVersionedFile: boolean,
   keyValueStoreService: KeyValueStoreService,
   defaultConfig: DefaultStorageConfig,
+  notificationConfig: DefaultNotificationConfig,
 ): Promise<StorageResponseMetadata> => {
   const formData = new FormData();
 
@@ -74,7 +80,15 @@ export const saveFileToStorageAndGetDocumentId = async (
       const documentId = error.response.headers['x-document-id'];
       const documentName = error.response.headers['x-document-name'];
 
-      runInBackGround(file.buffer, redirectUrl, documentId, documentName);
+      runInBackGround(
+        req.user?.userId,
+        file.buffer,
+        redirectUrl,
+        documentId,
+        documentName,
+        req.headers.authorization,
+        notificationConfig,
+      );
       return { documentId, documentName };
     } else {
       logger.error('Error uploading file to storage', {
@@ -86,12 +100,20 @@ export const saveFileToStorageAndGetDocumentId = async (
 };
 
 function runInBackGround(
+  userId: string,
   buffer: Buffer,
   redirectUrl: string,
   documentId: string,
   documentName: string,
+  authToken: string | undefined,
+  notificationConfig: DefaultNotificationConfig,
 ) {
   // Start the upload in the background
+  logger.info('Starting background upload', {
+    userId,
+    documentId,
+    documentName,
+  });
   (async () => {
     try {
       // Create a readable stream from the buffer
@@ -113,6 +135,14 @@ function runInBackGround(
       })
         .then((response) => {
           // TODO: Notify the user about the upload completion
+          sendNotificationToUser(
+            userId,
+            documentId,
+            documentName,
+            response.status,
+            authToken,
+            notificationConfig,
+          );
           logger.info('Background upload completed successfully', {
             documentId,
             documentName,
@@ -121,6 +151,14 @@ function runInBackGround(
         })
         .catch((uploadError) => {
           // TODO: Notify the user about the upload failure
+          sendNotificationToUser(
+            userId,
+            documentId,
+            documentName,
+            uploadError.status,
+            authToken,
+            notificationConfig,
+          );
           logger.error('Background upload failed', {
             documentId,
             documentName,
@@ -181,4 +219,41 @@ export const uploadNextVersionToStorage = async (
 function getFilenameWithoutExtension(originalname: string) {
   const fileExtension = originalname.slice(originalname.lastIndexOf('.') + 1);
   return originalname.slice(0, -fileExtension.length - 1);
+}
+
+async function sendNotificationToUser(
+  userId: string,
+  documentId: string,
+  documentName: string,
+  status: number,
+  authToken: string | undefined,
+  notificationConfig: DefaultNotificationConfig,
+) {
+  const notificationCommand = new NotificationCommand({
+    uri: `${notificationConfig.notificationUrl}/api/v1/notifications/notify/user/${userId}`,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${authToken}`,
+    },
+    body: {
+      event: NOTIFICATION_EVENTS.FILE_UPLOAD_STATUS,
+      data: {
+        documentId,
+        documentName,
+        status,
+      },
+    },
+  });
+  try {
+    const response = await notificationCommand.execute();
+    logger.debug('Notification sent to user', {
+      response,
+    });
+  } catch (error: any) {
+    logger.error('Error sending notification to user', {
+      error: error.message,
+    });
+    // do nothing, notification is not critical
+  }
 }

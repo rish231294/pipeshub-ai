@@ -110,6 +110,7 @@ export const createRecords =
             isVersioned,
             keyValueStoreService,
             appConfig.storage,
+            appConfig.notification,
           );
 
         const record = {
