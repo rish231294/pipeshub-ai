@@ -2,7 +2,7 @@
 import { Response, NextFunction, Request, RequestHandler } from 'express';
 import { UnauthorizedError } from '../errors/http.errors';
 import { Logger } from '../services/logger.service';
-import { ScopedTokenRequest, AuthenticatedUserRequest } from './types';
+import { AuthenticatedServiceRequest, AuthenticatedUserRequest } from './types';
 import { AuthTokenService } from '../services/authtoken.service';
 import { inject, injectable } from 'inversify';
 
@@ -38,7 +38,7 @@ export class AuthMiddleware {
 
   scopedTokenValidator = (scope: string): RequestHandler => {
     return async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       _res: Response,
       next: NextFunction,
     ) => {

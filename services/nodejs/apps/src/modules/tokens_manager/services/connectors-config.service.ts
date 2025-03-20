@@ -7,7 +7,7 @@ import { HttpMethod } from '../../../libs/enums/http-methods.enum';
 import { NotFoundError } from '../../../libs/errors/http.errors';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import {
   GOOGLE_WORKSPACE_BUSINESS_CREDENTIALS_PATH,
@@ -211,7 +211,7 @@ export const setGoogleWorkspaceIndividualCredentials = async (
 };
 
 export const getRefreshTokenCredentials = async (
-  req: ScopedTokenRequest,
+  req: AuthenticatedServiceRequest,
   url: string,
 ): Promise<ConfigurationManagerResponse> => {
   if (!req.tokenPayload) {
@@ -232,7 +232,7 @@ export const getRefreshTokenCredentials = async (
 };
 
 export const getRefreshTokenConfig = async (
-  req: ScopedTokenRequest,
+  req: AuthenticatedServiceRequest,
   url: string,
 ): Promise<ConfigurationManagerResponse> => {
   if (!req.tokenPayload) {
@@ -253,7 +253,7 @@ export const getRefreshTokenConfig = async (
 };
 
 export const setRefreshTokenCredentials = async (
-  req: ScopedTokenRequest,
+  req: AuthenticatedServiceRequest,
   url: string,
   access_token: string,
   refresh_token: string,

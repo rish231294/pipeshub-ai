@@ -4,7 +4,7 @@ import { ValidationMiddleware } from '../../../libs/middlewares/validation.middl
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import { extensionToMimeType } from '../mimetypes/mimetypes';
 import { Logger } from '../../../libs/services/logger.service';
@@ -52,7 +52,7 @@ export function createStorageRouter(container: Container): Router {
     }).getMiddleware,
     ValidationMiddleware.validate(UploadNewSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -74,7 +74,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(CreateDocumentSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -96,7 +96,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(DocumentIdParams),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -114,7 +114,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(DocumentIdParams),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -149,7 +149,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(DocumentIdParamsWithVersion),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -168,7 +168,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(GetBufferSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -195,7 +195,7 @@ export function createStorageRouter(container: Container): Router {
     }).getMiddleware,
     ValidationMiddleware.validate(DocumentIdParams),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -224,7 +224,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(UploadNextVersionSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -247,7 +247,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(RollBackToPreviousVersionSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -269,7 +269,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(DirectUploadSchema),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {
@@ -287,7 +287,7 @@ export function createStorageRouter(container: Container): Router {
     metricsMiddleware(container),
     ValidationMiddleware.validate(DocumentIdParams),
     async (
-      req: ScopedTokenRequest,
+      req: AuthenticatedServiceRequest,
       res: Response,
       next: NextFunction,
     ): Promise<void> => {

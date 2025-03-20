@@ -15,7 +15,7 @@ import {
   InternalServerError,
 } from '../../../libs/errors/http.errors';
 import { StorageServiceAdapter } from '../adapter/base-storage.adapter';
-import { ScopedTokenRequest } from '../../../libs/middlewares/types';
+import { AuthenticatedServiceRequest } from '../../../libs/middlewares/types';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
 import {
   parseBoolean,
@@ -67,7 +67,7 @@ export class UploadDocumentService {
   }
 
   async uploadDocument(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {
@@ -160,7 +160,7 @@ export class UploadDocumentService {
   }
 
   async handleDocumentUpload(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     getDocumentDetails: () => DocumentDetails,
   ): Promise<void> {

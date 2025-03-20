@@ -12,7 +12,7 @@ import { AuthSessionRequest } from '../middlewares/types';
 import { UserAccountController } from '../controller/userAccount.controller';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
-import { ScopedTokenRequest } from '../../../libs/middlewares/types';
+import { AuthenticatedServiceRequest } from '../../../libs/middlewares/types';
 
 const otpGenerationBody = z.object({
   email: z.string().email('Invalid email'),
@@ -109,7 +109,7 @@ export function createUserAccountRouter(container: Container) {
   router.post(
     '/password/reset/token',
     authMiddleware.scopedTokenValidator(TokenScopes.PASSWORD_RESET),
-    async (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    async (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       try {
         await userAccountController.resetPasswordViaEmailLink(req, res, next);
       } catch (error) {

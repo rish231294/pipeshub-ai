@@ -22,7 +22,7 @@ import { userActivitiesType } from '../../../libs/utils/userActivities.utils';
 import { UserActivities } from '../schema/userActivities.schema';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import { UserCredentials } from '../schema/userCredentials.schema';
 
@@ -539,7 +539,7 @@ export class UserAccountController {
   }
 
   async resetPasswordViaEmailLink(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {
@@ -727,7 +727,7 @@ export class UserAccountController {
   };
 
   async getAccessTokenFromRefreshToken(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {

@@ -9,7 +9,7 @@ import {
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import axios from 'axios';
 
@@ -663,7 +663,7 @@ export function createConnectorRouter(container: Container) {
   router.post(
     '/internal/refreshIndividualConnectorToken',
     authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
-    async (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    async (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       const refreshTokenCommandResponse = await getRefreshTokenCredentials(
         req,
         config.cmUrl,

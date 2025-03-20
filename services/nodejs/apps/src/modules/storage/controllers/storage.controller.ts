@@ -3,7 +3,7 @@ import { inject, injectable } from 'inversify';
 import { DefaultStorageConfig } from '../../tokens_manager/services/cm.service';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import { Response, NextFunction } from 'express';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
@@ -177,7 +177,7 @@ export class StorageController {
   }
 
   async uploadDocument(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {
@@ -203,7 +203,7 @@ export class StorageController {
   }
 
   async createPlaceholderDocument(
-    req: ScopedTokenRequest,
+    req: AuthenticatedServiceRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {

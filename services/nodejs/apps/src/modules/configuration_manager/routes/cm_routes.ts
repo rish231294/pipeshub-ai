@@ -65,7 +65,7 @@ import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
 import { AppConfig } from '../../tokens_manager/config/config';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import { NotFoundError } from '../../../libs/errors/http.errors';
 
@@ -398,7 +398,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       maxFileSize: 1024 * 1024 * 5,
       strictFileUpload: false,
     }).getMiddleware,
-    (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }
@@ -436,7 +436,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     '/internal/connectors/individual/googleWorkspaceCredentials',
     authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
     metricsMiddleware(container),
-    (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }
@@ -451,7 +451,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     '/internal/connectors/business/googleWorkspaceCredentials',
     authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
     metricsMiddleware(container),
-    (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }
@@ -466,7 +466,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     '/internal/connectors/business/googleWorkspaceCredentials',
     authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
     metricsMiddleware(container),
-    (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }

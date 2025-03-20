@@ -9,7 +9,7 @@ import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { userAdminCheck } from '../../user_management/middlewares/userAdminCheck';
 import {
   AuthenticatedUserRequest,
-  ScopedTokenRequest,
+  AuthenticatedServiceRequest,
 } from '../../../libs/middlewares/types';
 import { smtpConfigChecker } from '../middlewares/checkSmtpConfig';
 import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
@@ -34,7 +34,7 @@ export function createMailServiceRouter(container: Container) {
     '/emails/sendEmail',
     smtpConfigChecker,
     jwtValidator,
-    async (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
       try {
         await mailController.sendMail(req, res, next);
       } catch (error) {
@@ -47,7 +47,7 @@ export function createMailServiceRouter(container: Container) {
     '/emails/sendUnprotectedEmail',
     smtpConfigChecker,
     authMiddleware.scopedTokenValidator(TokenScopes.SEND_MAIL),
-    async (req: ScopedTokenRequest, res: Response, next: NextFunction) => {
+    async (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
       try {
         await mailController.sendMail(req, res, next);
       } catch (error) {
