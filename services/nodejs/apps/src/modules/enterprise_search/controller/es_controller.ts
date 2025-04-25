@@ -1,4 +1,4 @@
-import { buildMessageSortOptions } from './../utils/utils';
+import { buildAIFailureResponseMessage, buildMessageSortOptions } from './../utils/utils';
 import { Response, NextFunction } from 'express';
 import mongoose, { ClientSession } from 'mongoose';
 import { AuthenticatedUserRequest } from '../../../libs/middlewares/types';
@@ -69,6 +69,23 @@ export const createConversation =
     ): Promise<any> {
       const userQueryMessage = buildUserQueryMessage(req.body.query);
 
+      const userConversationData: Partial<IConversation> = {
+        orgId,
+        userId,
+        initiator: userId,
+        title: req.body.query.slice(0, 100),
+        messages: [userQueryMessage] as IMessageDocument[],
+        lastActivityAt: new Date(),
+      };
+
+      const conversation = new Conversation(userConversationData);
+      const savedConversation = session
+        ? await conversation.save({ session })
+        : await conversation.save();
+      if (!savedConversation) {
+        throw new InternalServerError('Failed to create conversation');
+      }
+
       const aiCommandOptions: AICommandOptions = {
         uri: `${appConfig.aiBackend}/api/v1/chat`,
         method: HttpMethod.POST,
@@ -87,69 +104,79 @@ export const createConversation =
         filters: req.body.filters,
       });
 
-      const aiServiceCommand = new AIServiceCommand(aiCommandOptions);
-      const aiResponseData =
-        (await aiServiceCommand.execute()) as AIServiceResponse<IAIResponse>;
-      if (!aiResponseData?.data || aiResponseData.statusCode !== 200) {
-        throw new InternalServerError(
-          'Failed to get AI response',
-          aiResponseData?.data,
+      try {
+        const aiServiceCommand = new AIServiceCommand(aiCommandOptions);
+        const aiResponseData =
+          (await aiServiceCommand.execute()) as AIServiceResponse<IAIResponse>;
+        if (!aiResponseData?.data || aiResponseData.statusCode !== 200) {
+          throw new InternalServerError(
+            'Failed to get AI response',
+            aiResponseData?.data,
+          );
+        }
+
+        const citations = await Promise.all(
+          aiResponseData.data?.citations?.map(async (citation: any) => {
+            const newCitation = new Citation({
+              content: citation.content,
+              chunkIndex: citation.chunkIndex,
+              citationType: citation.citationType,
+              metadata: {
+                ...citation.metadata,
+                orgId,
+              },
+            });
+            return newCitation.save();
+          }) || [],
         );
-      }
 
-      const citations = await Promise.all(
-        aiResponseData.data?.citations?.map(async (citation: any) => {
-          const newCitation = new Citation({
-            content: citation.content,
-            chunkIndex: citation.chunkIndex,
-            citationType: citation.citationType,
-            metadata: {
-              ...citation.metadata,
-              orgId,
-            },
-          });
-          return newCitation.save();
-        }) || [],
-      );
+        // Update the existing conversation with AI response
+        const aiResponseMessage = buildAIResponseMessage(
+          aiResponseData,
+          citations,
+        ) as IMessageDocument;
+        // Add the AI message to the conversation
+        savedConversation.messages.push(aiResponseMessage);
+        savedConversation.lastActivityAt = new Date();
 
-      const messages = [
-        userQueryMessage,
-        buildAIResponseMessage(aiResponseData, citations),
-      ];
+        const updatedConversation = session
+          ? await savedConversation.save({ session })
+          : await savedConversation.save();
 
-      const conversationData: Partial<IConversation> = {
-        orgId,
-        userId,
-        initiator: userId,
-        title: req.body.query.slice(0, 100),
-        messages: messages as IMessageDocument[],
-        lastActivityAt: new Date(),
-      };
-
-      const conversation = new Conversation(conversationData);
-      // Save conversation, using the session if available.
-      const savedConversation = session
-        ? await conversation.save({ session })
-        : await conversation.save();
-      if (!savedConversation) {
-        throw new InternalServerError('Failed to create conversation');
-      }
-      const plainConversation: IConversation = savedConversation.toObject();
-      return {
-        conversation: {
-          _id: savedConversation._id,
-          ...plainConversation,
-          messages: plainConversation.messages.map((message: IMessage) => ({
-            ...message,
-            citations: message.citations?.map((citation: IMessageCitation) => ({
-              ...citation,
-              citationData: citations.find(
-                (c: ICitation) => c._id === citation.citationId,
+        if (!updatedConversation) {
+          throw new InternalServerError('Failed to update conversation');
+        }
+        const plainConversation: IConversation = updatedConversation.toObject();
+        return {
+          conversation: {
+            _id: updatedConversation._id,
+            ...plainConversation,
+            messages: plainConversation.messages.map((message: IMessage) => ({
+              ...message,
+              citations: message.citations?.map(
+                (citation: IMessageCitation) => ({
+                  ...citation,
+                  citationData: citations.find(
+                    (c: ICitation) => c._id === citation.citationId,
+                  ),
+                }),
               ),
             })),
-          })),
-        },
-      };
+          },
+        };
+      } catch (error: any) {
+        // TODO: Add support for retry mechanism and generate response from retry
+        // and append the response to the correct messageId
+
+        // persist and serve the error message to the user.
+        const failedMessage = buildAIFailureResponseMessage() as IMessageDocument;
+        savedConversation.messages.push(failedMessage);
+        savedConversation.lastActivityAt = new Date();
+        session
+          ? await savedConversation.save({ session })
+          : await savedConversation.save();
+        throw error;
+      }
     }
 
     try {
@@ -243,6 +270,8 @@ export const addMessage =
           throw new NotFoundError('Conversation not found');
         }
 
+        // add previous conversations to the conversation
+        // in case of bot_response message
         // Format previous conversations for context
         const previousConversations = formatPreviousConversations(
           conversation.messages,
@@ -252,7 +281,20 @@ export const addMessage =
         });
 
         const userQueryMessage = buildUserQueryMessage(req.body.query);
+        // First, add the user message to the existing conversation
+        conversation.messages.push(userQueryMessage as IMessageDocument);
+        conversation.lastActivityAt = new Date();
 
+        // Save the user message to the existing conversation first
+        const savedConversation = session
+          ? await conversation.save({ session })
+          : await conversation.save();
+
+        if (!savedConversation) {
+          throw new InternalServerError(
+            'Failed to update conversation with user message',
+          );
+        }
         logger.debug('Sending query to AI service', {
           requestId,
           payload: {
@@ -272,10 +314,10 @@ export const addMessage =
             filters: req.body.filters || {},
           },
         };
-
-        const aiServiceCommand = new AIServiceCommand(aiCommandOptions);
-        const aiResponseData =
-          (await aiServiceCommand.execute()) as AIServiceResponse<IAIResponse>;
+        try {
+          const aiServiceCommand = new AIServiceCommand(aiCommandOptions);
+          const aiResponseData =
+            (await aiServiceCommand.execute()) as AIServiceResponse<IAIResponse>;
 
         if (!aiResponseData?.data || aiResponseData.statusCode !== 200) {
           throw new InternalServerError(
@@ -299,27 +341,22 @@ export const addMessage =
           }) || [],
         );
 
-        const messages = [
-          userQueryMessage,
-          buildAIResponseMessage(aiResponseData, savedCitations),
-        ];
+        // Update the existing conversation with AI response
+        const aiResponseMessage = buildAIResponseMessage(
+          aiResponseData,
+          savedCitations,
+        ) as IMessageDocument;
+        // Add the AI message to the existing conversation
+        savedConversation.messages.push(aiResponseMessage);
+        savedConversation.lastActivityAt = new Date();
 
-        // Update conversation: push new messages and update lastActivityAt
-        const updatedConversation = await Conversation.findByIdAndUpdate(
-          req.params.conversationId,
-          {
-            $push: { messages: { $each: messages } },
-            $set: { lastActivityAt: new Date() },
-          },
-          {
-            new: true,
-            session,
-            runValidators: true,
-          },
-        );
+        // Save the updated conversation with AI response
+        const updatedConversation = session
+          ? await savedConversation.save({ session })
+          : await savedConversation.save();
 
         if (!updatedConversation) {
-          throw new InternalServerError('Failed to update conversation');
+          throw new InternalServerError('Failed to update conversation with AI response');
         }
 
         // Return the updated conversation with new messages.
@@ -327,7 +364,7 @@ export const addMessage =
         return {
           conversation: {
             ...plainConversation,
-            messages: messages.map((message) => ({
+            messages: plainConversation.messages.map((message: IMessage) => ({
               ...message,
               citations:
                 message.citations?.map((citation: IMessageCitation) => ({
@@ -342,7 +379,20 @@ export const addMessage =
           },
           recordsUsed: savedCitations.length, // or validated record count if needed
         };
+      } catch (error: any) {
+         // TODO: Add support for retry mechanism and generate response from retry
+        // and append the response to the correct messageId
+
+        // persist and serve the error message to the user.
+        const failedMessage = buildAIFailureResponseMessage() as IMessageDocument;
+        conversation.messages.push(failedMessage);
+        conversation.lastActivityAt = new Date();
+        session
+          ? await conversation.save({ session })
+          : await conversation.save();
+        throw error;
       }
+    }
 
       let responseData;
       if (rsAvailable) {

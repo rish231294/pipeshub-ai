@@ -19,6 +19,14 @@ export const buildUserQueryMessage = (query: string): IMessage => ({
   updatedAt: new Date(),
 });
 
+export const buildAIFailureResponseMessage = (): IMessage => ({
+  messageType: 'error',
+  content: "Error Generating Response, Please try again",
+  contentFormat: 'MARKDOWN',
+  createdAt: new Date(),
+  updatedAt: new Date(),
+});
+
 export const buildAIResponseMessage = (
   aiResponse: AIServiceResponse<IAIResponse>,
   citations: ICitation[] = [],
@@ -53,10 +61,12 @@ export const buildAIResponseMessage = (
 };
 
 export const formatPreviousConversations = (messages: IMessage[]) => {
-  return messages.map((msg) => ({
-    content: msg.content,
-    role: msg.messageType,
-  }));
+  return messages
+    .filter((msg) => msg.messageType !== 'error')
+    .map((msg) => ({
+      content: msg.content,
+      role: msg.messageType,
+    }));
 };
 
 export const getPaginationParams = (req: AuthenticatedUserRequest) => {

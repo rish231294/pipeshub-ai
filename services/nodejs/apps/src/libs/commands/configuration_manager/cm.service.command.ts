@@ -55,7 +55,6 @@ export class ConfigurationManagerServiceCommand extends BaseCommand<Configuratio
         statusCode: response.status,
         statusText: response.statusText,
         url: url,
-        requestOptions: requestOptions,
       });
 
       // Assuming the response is JSON; adjust as needed.
