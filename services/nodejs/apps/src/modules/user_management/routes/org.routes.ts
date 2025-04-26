@@ -1,4 +1,3 @@
-import { PrometheusService } from './../../../libs/services/prometheus/prometheus.service';
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { Container } from 'inversify';
@@ -64,7 +63,6 @@ export function createOrgRouter(container: Container) {
   const router = Router();
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
   const orgController = container.get<OrgController>('OrgController');
-  const prometheusService = container.get<PrometheusService>(PrometheusService);
   router.use(attachContainerMiddleware(container));
 
   router.get(
@@ -118,7 +116,6 @@ export function createOrgRouter(container: Container) {
           req,
           res,
           next,
-          prometheusService,
         );
       } catch (error) {
         next(error);
@@ -141,7 +138,6 @@ export function createOrgRouter(container: Container) {
           req,
           res,
           next,
-          prometheusService,
         );
       } catch (error) {
         next(error);

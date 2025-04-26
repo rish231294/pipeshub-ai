@@ -18,7 +18,6 @@ import {
 } from '../../../libs/errors/http.errors';
 import { inject, injectable } from 'inversify';
 import { MailService } from '../services/mail.service';
-import { PrometheusService } from '../../../libs/services/prometheus/prometheus.service';
 import {
   EntitiesEventProducer,
   Event,
@@ -631,7 +630,6 @@ export class UserController {
     req: AuthenticatedUserRequest,
     res: Response,
     next: NextFunction,
-    prometheusService: PrometheusService,
   ): Promise<void> {
     try {
       const { id } = req.params;
@@ -701,19 +699,7 @@ export class UserController {
           throw new InternalServerError('Error sending invite');
         }
       }
-      // metric collection
-      prometheusService.recordUserActivity(
-        'Invite re-sent',
-        req.user?.userId as string,
-        req.user?.orgId as string,
-        email,
-      );
-      prometheusService.recordUserActivity(
-        'Invite re-sent',
-        req.user?.userId as string,
-        req.user?.orgId as string,
-        email,
-      );
+
       res.status(200).json({ message: 'Invite sent successfully' });
       return;
     } catch (error) {
@@ -725,7 +711,6 @@ export class UserController {
     req: AuthenticatedUserRequest,
     res: Response,
     next: NextFunction,
-    prometheusService: PrometheusService,
   ): Promise<void> {
     try {
       const { emails } = req.body;
@@ -897,19 +882,7 @@ export class UserController {
             throw new InternalServerError('Error sending invite');
           }
         }
-        // metric collection
-        prometheusService.recordUserActivity(
-          'Invite sent on new accounts',
-          req.user?.userId as string,
-          req.user?.orgId as string,
-          email,
-        );
-        prometheusService.recordUserActivity(
-          'Invite sent on new accounts',
-          req.user?.userId as string,
-          req.user?.orgId as string,
-          email,
-        );
+
         const event: Event = {
           eventType: EventType.NewUserEvent,
           timestamp: Date.now(),
@@ -993,20 +966,6 @@ export class UserController {
             throw new InternalServerError('Error sending invite');
           }
         }
-
-        // metric collection
-        prometheusService.recordUserActivity(
-          'Invite sent on restored accounts',
-          req.user?.userId as string,
-          req.user?.orgId as string,
-          email,
-        );
-        prometheusService.recordUserActivity(
-          'Invite sent on restored accounts',
-          req.user?.userId as string,
-          req.user?.orgId as string,
-          email,
-        );
 
         const event: Event = {
           eventType: EventType.NewUserEvent,

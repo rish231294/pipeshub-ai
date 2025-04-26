@@ -13,7 +13,6 @@ interface RequestContext {
     clientIp?: string;
     correlationId?: string;
     requestId: string;
-    authorization?: string;
     origin?: string;
     referer?: string;
     language?: string;
@@ -42,7 +41,7 @@ declare global {
  */
 const generateRequestId = (): string => {
   const timestamp = Date.now();
-  const random = crypto.randomBytes(4).toString("hex");
+  const random = crypto.randomBytes(10).toString("hex");
   return `${timestamp}-${random}`;
 };
 
@@ -54,10 +53,9 @@ const generateRequestId = (): string => {
 const createRequestContext = (req: Request): RequestContext => {
   const headers = {
     userAgent: req.get("user-agent") || "unknown",
-    clientIp: req.ip || (req.connection && req.connection.remoteAddress) || undefined,
+    clientIp: req.ip || undefined,
     correlationId: req.get("X-Correlation-ID") || undefined,
     requestId: req.get("X-Request-ID") || generateRequestId(),
-    authorization: req.get("authorization") || undefined,
     origin: req.get("origin") || undefined,
     referer: req.get("referer") || undefined,
     language: req.get("accept-language") || undefined,

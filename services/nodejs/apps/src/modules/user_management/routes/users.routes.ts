@@ -15,7 +15,6 @@ import {
 } from '../../../libs/middlewares/types';
 import { UserController } from '../controller/users.controller';
 import { metricsMiddleware } from '../../../libs/middlewares/prometheus.middleware';
-import { PrometheusService } from '../../../libs/services/prometheus/prometheus.service';
 import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
 import { FileProcessorFactory } from '../../../libs/middlewares/file_processor/fp.factory';
 import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
@@ -156,7 +155,6 @@ export function createUserRouter(container: Container) {
   const router = Router();
   const userController = container.get<UserController>('UserController');
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
-  const prometheusService = container.get<PrometheusService>(PrometheusService);
   const config = container.get<AppConfig>('AppConfig');
   // Todo: Apply Rate Limiter Middleware
   // Todo: Apply Validation Middleware
@@ -535,7 +533,7 @@ export function createUserRouter(container: Container) {
       next: NextFunction,
     ) => {
       try {
-        await userController.addManyUsers(req, res, next, prometheusService);
+        await userController.addManyUsers(req, res, next);
       } catch (error) {
         next(error);
       }
@@ -556,7 +554,7 @@ export function createUserRouter(container: Container) {
       next: NextFunction,
     ) => {
       try {
-        await userController.resendInvite(req, res, next, prometheusService);
+        await userController.resendInvite(req, res, next);
       } catch (error) {
         next(error);
       }

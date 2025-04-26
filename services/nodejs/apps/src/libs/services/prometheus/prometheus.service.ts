@@ -1,249 +1,222 @@
 import * as promClient from 'prom-client';
+import { Mutex } from 'async-mutex';
 import { inject, injectable } from 'inversify';
-import { Logger } from '../logger.service';
 import axios from 'axios';
+import * as https from 'https';
+import { Logger } from '../logger.service';
 import { KeyValueStoreService } from '../keyValueStore.service';
-import {
-  activeUsersFields,
-  apiCallCounterFields,
-  keyValues,
-  routeUsageFields,
-  userActivityFields,
-} from './constants';
+import { keyValues } from './constants';
 import { parseBoolean } from '../../../modules/storage/utils/utils';
 import { configPaths } from '../../../modules/configuration_manager/paths/paths';
 
-const logger = Logger.getInstance({
-  service: 'Prometheus Service',
-});
+const logger = Logger.getInstance({ service: 'Prometheus Service' });
+
+const DEFAULTS = {
+  METRIC_HOST: 'https://metrics-collector.intellysense.com/collect-metrics',
+  PUSH_INTERVAL: 60000,
+  APP_VERSION: '1.0.0',
+};
+
+const TIMEOUT_MS = 10000;
+const START_DELAY_MS = 200;
+
+interface MetricsConfig {
+  serverUrl?: string;
+  apiKey?: string;
+  appVersion?: string;
+  pushIntervalMs?: string;
+  enableMetricCollection?: string;
+  [key: string]: string | undefined;
+}
 
 @injectable()
 export class PrometheusService {
   private register!: promClient.Registry;
   private static instance: PrometheusService;
-  private static defaultMetricHost =
-    'https://metrics-collector.intellysense.com/collect-metrics';
-  private static defaultPushInterval = 60000; //ms
-  private apiCallCounter!: promClient.Counter;
-  private activeUsers!: promClient.Gauge;
-  private userActivityCounter!: promClient.Counter;
-  private routeUsageCounter!: promClient.Counter;
-  // Read configuration - use environment variables with defaults
-  private apiKey!: string;
-  private metricsServerUrl!: string;
-  private instanceId!: string;
-  private appVersion!: string;
-  private pushIntervalMs!: number;
-  private enableMetricCollection!: boolean;
+  private metricsServerUrl: string = DEFAULTS.METRIC_HOST;
+  private apiKey: string = '';
+  private instanceId: string = '';
+  private appVersion: string = DEFAULTS.APP_VERSION;
+  private pushIntervalMs: number = DEFAULTS.PUSH_INTERVAL;
+  private enableMetricCollection: boolean = true;
   private pushInterval: NodeJS.Timeout | null = null;
+  private isStarting: boolean = false;
+  private activityCounter!: promClient.Counter<string>;
+  private mutex: Mutex = new Mutex();
 
   constructor(
     @inject('KeyValueStoreService') private kvStore: KeyValueStoreService,
   ) {
+    logger.info('Initializing PrometheusService');
     if (PrometheusService.instance) {
       return PrometheusService.instance;
     }
-    logger.debug('PrometheusService initialized successfully');
+
     this.register = new promClient.Registry();
 
-    this.apiCallCounter = new promClient.Counter({
-      name: apiCallCounterFields.fieldName,
-      help: apiCallCounterFields.description,
-      labelNames: apiCallCounterFields.label,
+    // Initialize the activity counter
+    this.activityCounter = new promClient.Counter({
+      name: 'app_activity_total',
+      help: 'Total number of activities recorded',
+      labelNames: [
+        'activity',
+        'userId',
+        'orgId',
+        'email',
+        'requestId',
+        'method',
+        'path',
+        'reqContext',
+        'statusCode',
+      ],
+      registers: [this.register],
     });
 
-    this.activeUsers = new promClient.Gauge({
-      name: activeUsersFields.fieldName,
-      help: activeUsersFields.description,
-      labelNames: activeUsersFields.label,
-    });
-
-    this.userActivityCounter = new promClient.Counter({
-      name: userActivityFields.fieldName,
-      help: userActivityFields.description,
-      labelNames: userActivityFields.label,
-    });
-
-    this.routeUsageCounter = new promClient.Counter({
-      name: routeUsageFields.fieldName,
-      help: routeUsageFields.description,
-      labelNames: routeUsageFields.label,
-    });
-
-    // Read configuration - use environment variables with defaults
-    this.initAndStartMetricsCollection();
-
-    // Register metrics
-    this.register.registerMetric(this.apiCallCounter);
-    this.register.registerMetric(this.activeUsers);
-    this.register.registerMetric(this.userActivityCounter);
-    this.register.registerMetric(this.routeUsageCounter);
-
-    // add watch for enable metric collection field
-    this.watchKeysForMetricsCollection(configPaths.metricsCollection);
-
+    this.init();
     PrometheusService.instance = this;
+    logger.info('PrometheusService initialized successfully');
   }
 
-  async initAndStartMetricsCollection() {
-    logger.debug('Initializing and starting metrics collection');
+  async init(): Promise<void> {
+    await this.initializeMetricsCollection();
+    this.watchKeysForMetricsCollection(configPaths.metricsCollection);
+  }
+
+  private async initializeMetricsCollection(): Promise<void> {
     try {
-      const metricsServer = await this.getOrSet(
-        keyValues.SERVER_URL,
-        PrometheusService.defaultMetricHost,
-      );
-      // metric server ulr
-      this.metricsServerUrl =
-        metricsServer != null
-          ? metricsServer
-          : process.env.METRICS_SERVER_URL ||
-            PrometheusService.defaultMetricHost;
-      // api key
-      this.apiKey = await this.getOrSet(
-        keyValues.API_KEY,
-        this.generateInstanceId(),
-      );
-      // random instance id to separate out different user on server
-      this.instanceId = this.generateInstanceId();
-      // api version
-      this.appVersion = await this.getOrSet(keyValues.APP_VERSION, '1.0.0');
-      // interval in ms to push metrics
-      this.pushIntervalMs = parseInt(
-        await this.getOrSet(
-          keyValues.PUSH_INTERVAL,
-          String(PrometheusService.defaultPushInterval),
-        ),
-        10,
-      );
-      this.enableMetricCollection = parseBoolean(
-        await this.getOrSet(keyValues.ENABLE_METRIC_COLLECTION, 'true'),
-      );
-
-      logger.debug('The Prometheus Configuration:', {
-        metricsServerUrl: this.metricsServerUrl,
-        apiKey: this.apiKey,
-        instanceId: this.instanceId,
-        appVersion: this.appVersion,
-        pushIntervalMs: this.pushIntervalMs,
-        enableMetricCollection: this.enableMetricCollection,
-      });
-
+      await Promise.all([
+        await this.loadServerUrl(),
+        await this.loadApiKey(),
+        await this.loadInstanceId(),
+        await this.loadAppVersion(),
+        await this.loadPushInterval(),
+        await this.loadMetricCollectionFlag(),
+      ]);
+      this.logConfig();
       await this.startOrStopMetricCollection();
     } catch (error) {
-      // If fetching from the key-value store fails, use the fallback
-      this.metricsServerUrl =
-        process.env.METRICS_SERVER_URL || PrometheusService.defaultMetricHost;
-      logger.error('Failed to get metrics server URL from KV store:', error);
+      logger.error('Failed to initialize metrics collection:', error);
+      this.metricsServerUrl = this.getEnv(
+        'METRICS_SERVER_URL',
+        DEFAULTS.METRIC_HOST,
+      );
     }
   }
 
-  watchKeysForMetricsCollection(key: string) {
-    this.kvStore.watchKey(key, this.initAndStartMetricsCollection.bind(this));
+  private async loadServerUrl(): Promise<void> {
+    this.metricsServerUrl = await this.getOrSet(
+      keyValues.SERVER_URL,
+      this.getEnv('METRICS_SERVER_URL', DEFAULTS.METRIC_HOST),
+    );
   }
 
-  async startOrStopMetricCollection() {
-    logger.debug('Starting or stopping metrics collection');
-    const metricsCollection = JSON.parse(
-      (await this.kvStore.get<string>(configPaths.metricsCollection)) || '{}',
+  private async loadApiKey(): Promise<void> {
+    this.apiKey = await this.getOrSet(
+      keyValues.API_KEY,
+      this.generateInstanceId(),
     );
-    const currentValue = parseBoolean(metricsCollection.enableMetricCollection);
+  }
 
-    if (currentValue === true) {
-      logger.debug('metrics collection flag is TRUE - Starting metrics push');
-      this.startMetricsPush();
-    } else if (currentValue === false) {
-      logger.debug('metrics collection flag is FALSE - Stopping metrics push');
+  private async loadInstanceId(): Promise<void> {
+    this.instanceId = this.generateInstanceId();
+  }
+
+  private async loadAppVersion(): Promise<void> {
+    this.appVersion = await this.getOrSet(
+      keyValues.APP_VERSION,
+      DEFAULTS.APP_VERSION,
+    );
+  }
+
+  private async loadPushInterval(): Promise<void> {
+    this.pushIntervalMs = parseInt(
+      await this.getOrSet(
+        keyValues.PUSH_INTERVAL,
+        String(DEFAULTS.PUSH_INTERVAL),
+      ),
+      10,
+    );
+  }
+
+  private async loadMetricCollectionFlag(): Promise<void> {
+    this.enableMetricCollection = parseBoolean(
+      await this.getOrSet(keyValues.ENABLE_METRIC_COLLECTION, 'true'),
+    );
+  }
+
+  private watchKeysForMetricsCollection(key: string): void {
+    this.kvStore.watchKey(key, this.initializeMetricsCollection.bind(this));
+  }
+
+  private async startOrStopMetricCollection(): Promise<void> {
+    const config = await this.getConfig();
+    const currentValue = parseBoolean(
+      config[keyValues.ENABLE_METRIC_COLLECTION] || 'true',
+    );
+
+    if (currentValue) {
+      logger.debug('Starting metrics push');
+      await this.startMetricsPush();
+    } else {
+      logger.debug('Stopping metrics push');
       this.stopMetricsPush();
     }
   }
 
-  async getOrSet(key: string, value: string): Promise<string> {
-    const etcdValue = JSON.parse(
-      (await this.kvStore.get<string>(configPaths.metricsCollection)) || '{}',
-    );
-    if (!(key in etcdValue)) {
-      etcdValue[key] = value; // Add the key-value pair while keeping others intact
-      await this.kvStore.set<string>(configPaths.metricsCollection, JSON.stringify(etcdValue)); // Save back to store
-      return value;
-    }
-
-    return etcdValue[key];
-  }
-
-  /**
-   * Start pushing metrics to central server
-   */
-  startMetricsPush(): void {
-    this.stopMetricsPush();
-    // Add a small delay to ensure previous interval is fully cleared
-    setTimeout(() => {
-      logger.debug(
-        `Starting to push metrics to server every ${this.pushIntervalMs}ms`,
+  private async getConfig(): Promise<MetricsConfig> {
+    try {
+      return JSON.parse(
+        (await this.kvStore.get<string>(configPaths.metricsCollection)) || '{}',
       );
-
-      // Store the interval ID and log it for debugging
-      this.pushInterval = setInterval(() => {
-        logger.debug(`Pushing metrics to the remote server: ${this.metricsServerUrl}`);
-        this.pushMetricsToServer().catch((err) => {
-          logger.error('Failed to push metrics:', err);
-        });
-      }, this.pushIntervalMs);
-
-      logger.debug('Created new metrics push interval');
-    }, 200);
+    } catch (error) {
+      logger.error('Failed to parse metrics config:', error);
+      return {};
+    }
   }
 
-  /**
-   * Stop pushing metrics
-   */
-  stopMetricsPush(): void {
-    logger.debug('Attempting to stop metrics push');
+  private async getOrSet(key: string, defaultValue: string): Promise<string> {
+    const config = await this.getConfig();
+    if (!(key in config)) {
+      config[key] = defaultValue;
+      await this.kvStore.set<string>(
+        configPaths.metricsCollection,
+        JSON.stringify(config),
+      );
+      return defaultValue;
+    }
+    return config[key]!;
+  }
 
-    // Force clear any interval that might exist
-    if (this.pushInterval !== null) {
+  private async startMetricsPush(): Promise<void> {
+    if (this.isStarting) return;
+    const release = await this.mutex.acquire();
+    this.isStarting = true;
+    try {
+      this.stopMetricsPush();
+      await new Promise((resolve) => setTimeout(resolve, START_DELAY_MS));
+      this.pushInterval = setInterval(() => {
+        this.pushMetricsToServer().catch((err) =>
+          logger.error('Failed to push metrics:', err),
+        );
+      }, this.pushIntervalMs);
+      logger.debug(`Started pushing metrics every ${this.pushIntervalMs}ms`);
+    } finally {
+      this.isStarting = false;
+      release(); // Release the mutex in the finally block
+    }
+  }
+
+  private stopMetricsPush(): void {
+    if (this.pushInterval) {
       clearInterval(this.pushInterval);
       this.pushInterval = null;
-
-      // Double-check that we've actually stopped
-      setTimeout(() => {
-        if (this.pushInterval === null) {
-          logger.debug('Metrics push successfully stopped');
-        } else {
-          logger.error('Failed to stop metrics push - interval still exists');
-        }
-      }, 100);
-    } else {
-      logger.debug('No active push interval to stop (null reference)');
+      logger.debug('Metrics push stopped');
     }
-
-    // Safety measure: Check for any global intervals that might be running
-    // This is a debugging step to identify potential issues
-    const globalIntervals = Object.keys(global).filter(
-      (key) => key.includes('Timeout') || key.includes('Interval'),
-    );
-    logger.debug('Current global timers:', globalIntervals.length);
   }
 
-  /**
-   * Push metrics to your company's server
-   */
-  async pushMetricsToServer(): Promise<void> {
+  private async pushMetricsToServer(): Promise<void> {
     try {
-      // Get metrics as string
       const metricsText = await this.register.metrics();
-
-      // Create axios instance with specific SSL configuration
-      const https = require('https');
-      const httpsAgent = new https.Agent({
-        rejectUnauthorized: true, // Set to false only for testing if you're having certificate validation issues
-        minVersion: 'TLSv1.2', // Specify minimum TLS version
-        maxVersion: 'TLSv1.3', // Specify maximum TLS version
-        ciphers:
-          'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384',
-        honorCipherOrder: true,
-      });
-
-      // Send to your server with enhanced configuration
       await axios.post(
         this.metricsServerUrl,
         {
@@ -257,157 +230,98 @@ export class PrometheusService {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
-          timeout: 10000, // 10 second timeout
-          httpsAgent,
-          maxContentLength: Infinity, // For large metric sets
+          timeout: TIMEOUT_MS,
+          httpsAgent: this.createHttpsAgent(),
+          maxContentLength: Infinity,
           maxBodyLength: Infinity,
           decompress: true,
         },
       );
-
       logger.debug('Successfully pushed metrics to server');
     } catch (error: any) {
-      // Enhanced error logging
-      if (error.response) {
-        // The server responded with a status code outside the 2xx range
-        logger.error('Error pushing metrics - Server responded with error:', {
-          status: error.response.status,
-          serverUrl: this.metricsServerUrl,
-        });
-      } else if (error.request) {
-        // The request was made but no response was received
-        logger.error('Error pushing metrics - No response received:', {
-          request: error.request._currentUrl || error.request.path,
-          error: error.message,
-        });
-        if (error.cause) {
-          logger.error('Error cause details:', error.cause);
-        }
-      } else {
-        // Something happened in setting up the request
-        logger.error('Error pushing metrics - Request setup error:', {
-          message: error.message,
-          stack: error.stack,
-        });
-      }
+      this.handlePushError(error);
     }
   }
 
-  /**
-   * Generate a unique instance ID (without PII)
-   */
+  private createHttpsAgent(): https.Agent {
+    return new https.Agent({
+      rejectUnauthorized: true,
+      minVersion: 'TLSv1.2',
+      maxVersion: 'TLSv1.3',
+      ciphers:
+        'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384',
+      honorCipherOrder: true,
+    });
+  }
+
+  private handlePushError(error: any): void {
+    if (error.response) {
+      logger.error('Server responded with error:', {
+        status: error.response.status,
+        serverUrl: this.metricsServerUrl,
+      });
+    } else if (error.request) {
+      logger.error('No response received:', {
+        request: error.request._currentUrl || error.request.path,
+        error: error.message,
+      });
+    } else {
+      logger.error('Request setup error:', {
+        message: error.message,
+        stack: error.stack,
+      });
+    }
+  }
+
   private generateInstanceId(): string {
     const crypto = require('crypto');
-    // Generate a hash of hostname or another unique identifier
-    // that doesn't contain personal information
     const hash = crypto
       .createHash('sha256')
       .update(process.env.HOSTNAME || Math.random().toString())
       .digest('hex');
-    return hash.substring(0, 16); // Use first 16 chars of hash
+    return hash.substring(0, 16);
   }
 
-  /**
-   * Get metrics data for Prometheus scraping
-   */
-  getMetrics(): Promise<string> {
-    return this.register.metrics();
+  private getEnv(key: string, fallback: string): string {
+    return process.env[key] || fallback;
   }
 
-  /**
-   * Increment API call counter
-   */
-  incrementApiCall(
-    method: string,
-    endpoint: string,
-    userId?: string,
-    orgId?: string,
-    email?: string,
-  ): void {
-    this.apiCallCounter.inc({
-      method,
-      endpoint,
-      userId: userId || 'anonymous',
-      orgId: orgId || 'anonymous',
-      email,
+  private logConfig(): void {
+    logger.debug('Prometheus Configuration', {
+      metricsServerUrl: this.metricsServerUrl,
+      apiKey: this.apiKey,
+      instanceId: this.instanceId,
+      appVersion: this.appVersion,
+      pushIntervalMs: this.pushIntervalMs,
+      enableMetricCollection: this.enableMetricCollection,
     });
   }
 
-  /**
-   * Record user login (increment active users)
-   */
-  recordUserLogin(userType: string, email: string): void {
-    this.activeUsers.inc({ userType, email });
+  public async getMetrics(): Promise<string> {
+    return this.register.metrics();
   }
 
-  /**
-   * Record user logout (decrement active users)
-   */
-  recordUserLogout(userType: string, email: string): void {
-    this.activeUsers.dec({ userType, email });
-  }
-
-  /**
-   * Record user activity
-   */
-  recordUserActivity(
+  public recordActivity(
     activity: string,
     userId?: string,
     orgId?: string,
     email?: string,
+    requestId?: string,
+    method?: string,
+    path?: string,
+    reqContext?: any,
+    statusCode?: number,
   ): void {
-    this.userActivityCounter.inc({
+    this.activityCounter.inc({
       activity,
       userId: userId || 'anonymous',
       orgId: orgId || 'anonymous',
       email,
+      requestId,
+      method,
+      path,
+      reqContext,
+      statusCode: statusCode || undefined,
     });
-  }
-
-  /**
-   * Record Org activity
-   */
-  recordOrgActivity(activity: string, email: string, orgId: string): void {
-    this.userActivityCounter.inc({
-      activity,
-      email: email || 'anonymous',
-      orgId: orgId || 'anonymous',
-    });
-  }
-
-  /**
-   * Record route usage
-   */
-  recordRouteUsage(
-    route: string,
-    userId?: string,
-    orgId?: string,
-    email?: string,
-  ): void {
-    this.routeUsageCounter.inc({
-      route,
-      userId: userId || 'anonymous',
-      orgId: orgId || 'anonymous',
-      email: email || 'anonymous',
-    });
-  }
-
-  /**
-   * Set the current number of active users directly
-   */
-  setActiveUserCount(userType: string, email: string, count: number): void {
-    this.activeUsers.set({ userType, email }, count);
-  }
-
-  /**
-   * Create and register a custom metric
-   */
-  createCustomMetric<T extends promClient.Metric<any>>(
-    metricType: new (...args: any[]) => T,
-    config: promClient.MetricConfiguration<any>,
-  ): T {
-    const metric = new metricType(config);
-    this.register.registerMetric(metric);
-    return metric;
   }
 }

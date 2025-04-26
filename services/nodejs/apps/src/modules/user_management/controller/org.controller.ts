@@ -23,7 +23,6 @@ import {
   NotFoundError,
 } from '../../../libs/errors/http.errors';
 import { Logger } from '../../../libs/services/logger.service';
-import { PrometheusService } from '../../../libs/services/prometheus/prometheus.service';
 import { ContainerRequest } from '../../auth/middlewares/types';
 import {
   EntitiesEventProducer,
@@ -36,6 +35,9 @@ import {
 } from '../services/entity_events.service';
 import { mailJwtGenerator } from '../../../libs/utils/createJwt';
 import { AppConfig } from '../../tokens_manager/config/config';
+import { PrometheusService } from '../../../libs/services/prometheus/prometheus.service';
+import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
+import { ORG_CREATED_ACTIVITY } from '../constants/constants';
 
 @injectable()
 export class OrgController {
@@ -171,12 +173,17 @@ export class OrgController {
         await adminUserCredentials.save();
         await org.save();
       }
-      // create an activity for metrics
-      prometheusService.recordUserActivity(
-        'Org created',
-        adminUser._id as string,
-        org._id as string,
+
+      prometheusService.recordActivity(
+        ORG_CREATED_ACTIVITY,
+        adminUser._id?.toString(),
+        org._id?.toString(),
         contactEmail,
+        req.context?.requestId,
+        req.method,
+        req.path,
+        JSON.stringify(req.context),
+        HTTP_STATUS.OK,
       );
 
       if (sendEmail) {
@@ -261,7 +268,6 @@ export class OrgController {
     req: AuthenticatedUserRequest,
     res: Response,
     next: NextFunction,
-    prometheusService: PrometheusService,
   ): Promise<void> {
     const { contactEmail, registeredName, shortName, permanentAddress } =
       req.body as {
@@ -297,12 +303,6 @@ export class OrgController {
       const updatedOrg = await Org.findByIdAndUpdate(orgId, updateData, {
         new: true,
       });
-      // metric collection
-      prometheusService.recordOrgActivity(
-        'Org Updated',
-        orgId,
-        contactEmail as string,
-      );
 
       await this.eventService.start();
       let event: Event = {
@@ -331,7 +331,6 @@ export class OrgController {
     req: AuthenticatedUserRequest,
     res: Response,
     next: NextFunction,
-    prometheusService: PrometheusService,
   ): Promise<void> {
     try {
       const orgId = req.user?.orgId;
@@ -344,12 +343,6 @@ export class OrgController {
       // Soft delete: set isDeleted to true
       org.isDeleted = true;
       await org.save();
-      // metric collection
-      prometheusService.recordOrgActivity(
-        'Org Deleted',
-        orgId,
-        org.contactEmail as string,
-      );
 
       await this.eventService.start();
       let event: Event = {
@@ -427,7 +420,7 @@ export class OrgController {
 
       if (!orgLogo || !orgLogo.logo) {
         res.status(204).end();
-        return
+        return;
       }
 
       const logoBuffer = Buffer.from(orgLogo.logo, 'base64');
