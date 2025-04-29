@@ -61,6 +61,8 @@ export const extensionToMimeType: Record<string, string> = {
   csv: 'text/csv',
   tsv: 'text/tab-separated-values',
   md: 'text/markdown',
+  mdx: 'text/mdx',
+  appmdx: 'application/mdx',
 
   // Archive and compression formats
   zip: 'application/zip',
