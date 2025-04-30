@@ -30,25 +30,31 @@ sudo apt install ocrmypdf tesseract-ocr ghostscript unpaper qpdf
 # Install Homebrew if not already installed
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
+
 # Install required packages
 brew install python@3.10
 brew install libreoffice
 brew install ocrmypdf tesseract ghostscript unpaper qpdf
+
+# Install optional packages
+brew install tesseract
 ```
 
 #### Windows
+```bash
 - Install Python 3.10
-- Install LibreOffice
 - Install Tesseract OCR if you need to test OCR functionality
 - Consider using WSL2 for a Linux-like environment
+```
 
 ### Application Dependencies
-
+```bash
 1. **Docker** - Install Docker for your platform
 2. **Python 3.10** - Install as shown above
 3. **Optional debugging tools:**
    - MongoDB Compass or Studio 3T
    - etcd-manager
+```
 
 ### Starting Required Docker Containers
 
@@ -116,6 +122,7 @@ npm run dev
 ### Starting Python Backend Services
 ```bash
 cd services/python
+cp ../env.template .env
 # Create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
