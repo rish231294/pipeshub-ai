@@ -45,7 +45,7 @@ from app.setups.connector_setup import AppContainer
 from app.utils.llm import get_llm
 from app.utils.logger import create_logger
 
-logger = create_logger("Python Connector Service")
+logger = create_logger("connector_service")
 
 router = APIRouter()
 

@@ -48,7 +48,7 @@ class AppContainer(containers.DeclarativeContainer):
     """Dependency injection container for the application."""
 
     # Log when container is initialized
-    logger = providers.Singleton(create_logger, "Python Indexing Service")
+    logger = providers.Singleton(create_logger, "indexing_service")
 
     logger().info("🚀 Initializing AppContainer")
 
