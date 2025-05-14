@@ -36,7 +36,7 @@ Beyond search, our platform allows enterprises to create custom apps and AI agen
 #### Your Workplace, Our AI.
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=czDNbS_OEDQ">
+  <a href="https://youtu.be/uDN6b43rcVY">
     <img src="https://img.youtube.com/vi/czDNbS_OEDQ/maxresdefault.jpg" alt="PipesHub Workplace AI" width="600" style="border-radius:10px"/>
     <br>
     <img src="https://img.shields.io/badge/Watch%20Video-red?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch on YouTube"/>
