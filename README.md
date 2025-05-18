@@ -94,43 +94,32 @@ Beyond search, our platform allows enterprises to create custom apps and AI agen
 - Highly available and scalable Kubernetes deployment
 - PageRank
 
-## 📦 Developer Build
-
-#### 🔁 Clone the repository
-
-```bash
-git clone https://github.com/pipeshub-ai/pipeshub-ai.git
-```
-
-#### 📁 Navigate to the deployment folder
-
-```bash
-cd pipeshub-ai/deployment/docker-compose
-```
-
-# Set Optional Environment Variables
-
-> 👉 Set Environment Variables for secrets, passwords, and the public URLs of the **Frontend** and **Connector** services  
-> _(Required for webhook notifications and real-time updates)_
-> Refer to env.template
-
-#### 🚀 Start the development deployment with build
-
-```bash
-docker compose -f docker-compose.dev.yml -p pipeshub-ai up --build -d
-```
-
-#### 🛑 To stop the services
-
-```bash
-docker compose -f docker-compose.dev.yml -p pipeshub-ai down
-```
-
 ## 🚀 Deployment Guide
 
 PipesHub — the Workplace AI Platform — can be run locally or deployed on the cloud using Docker Compose.
 
 ---
+
+### 📦 Developer Deployment Build
+
+```bash
+# Clone the repository
+git clone https://github.com/pipeshub-ai/pipeshub-ai.git
+
+# 📁 Navigate to the deployment folder
+cd pipeshub-ai/deployment/docker-compose
+
+# Set Optional Environment Variables
+> 👉 Set Environment Variables for secrets, passwords, and the public URLs of the **Frontend** and **Connector** services  
+> _(Required for webhook notifications and real-time updates)_
+> Refer to env.template
+
+# 🚀 Start the development deployment with build
+docker compose -f docker-compose.dev.yml -p pipeshub-ai up --build -d
+
+# 🛑 To stop the services
+docker compose -f docker-compose.dev.yml -p pipeshub-ai down
+```
 
 ### 📦 Production Deployment
 
@@ -138,7 +127,7 @@ PipesHub — the Workplace AI Platform — can be run locally or deployed on the
 # Clone the repository
 git clone https://github.com/pipeshub-ai/pipeshub-ai.git
 
-# Navigate to the deployment folder
+# 📁 Navigate to the deployment folder
 cd pipeshub-ai/deployment/docker-compose
 
 # Set Environment Variables
@@ -146,10 +135,10 @@ cd pipeshub-ai/deployment/docker-compose
 > _(Required for webhook notifications and real-time updates)_
 > Refer to env.template
 
-# Start the production deployment
+# 🚀 Start the production deployment
 docker compose -f docker-compose.prod.yml -p pipeshub-ai up -d
 
-# To stop the services
+# 🛑 To stop the services
 docker compose -f docker-compose.prod.yml -p pipeshub-ai down
 ```
 
