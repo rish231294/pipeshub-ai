@@ -14,6 +14,9 @@
 <a href="https://docs.pipeshub.com/" target="_blank">
     <img src="https://img.shields.io/badge/docs-view-blue" alt="Documentation">
 </a>
+<a href="https://discord.com/invite/K5RskzJBm2" target="_blank">
+    <img src="https://img.shields.io/badge/docs-view-red" alt="Documentation">
+</a>
 </p>
 
 <!--Intro-->
