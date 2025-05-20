@@ -1,7 +1,7 @@
 [tool.ruff]
 line-length = 88
 target-version = "py310"
-select = ["E", "F", "W", "I", "F401"]
+select = ["E", "F", "W", "I", "F401", "PLW0603"]
 ignore = [
     "E501",  # Line too long
 ]
