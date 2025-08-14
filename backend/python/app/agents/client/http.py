@@ -22,8 +22,9 @@ class HTTPClient:
             A dictionary containing the response from the server
         """
         await self._ensure_session()
+        assert self.session is not None
         headers = {**self.headers, **headers}
-        async with self.session.request("GET", url, headers=headers, **kwargs) as response: #type: ignore
+        async with self.session.request("GET", url, headers=headers, **kwargs) as response:
             return await response.json()
 
     async def post(self, url: str, data: dict, headers: dict = {}, **kwargs) -> dict:
@@ -35,8 +36,9 @@ class HTTPClient:
             A dictionary containing the response from the server
         """
         await self._ensure_session()
+        assert self.session is not None
         headers = {**self.headers, **headers}
-        async with self.session.request("POST", url, headers=headers, json=data, **kwargs) as response: #type: ignore
+        async with self.session.request("POST", url, headers=headers, json=data, **kwargs) as response:
             return await response.json()
 
     async def put(self, url: str, data: dict, headers: dict = {}, **kwargs) -> dict:
@@ -48,8 +50,9 @@ class HTTPClient:
             A dictionary containing the response from the server
         """
         await self._ensure_session()
+        assert self.session is not None
         headers = {**self.headers, **headers}
-        async with self.session.request("PUT", url, headers=headers, json=data, **kwargs) as response: #type: ignore
+        async with self.session.request("PUT", url, headers=headers, json=data, **kwargs) as response:
             return await response.json()
 
     async def close(self) -> None:

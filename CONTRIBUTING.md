@@ -12,6 +12,7 @@ Welcome to our open source project! We're excited that you're interested in cont
 - [Testing](#testing)
 - [Documentation](#documentation)
 - [Community Guidelines](#community-guidelines)
+- [Stars History](#star-history)
 
 ## Setting Up the Development Environment
 
@@ -262,6 +263,16 @@ Our project consists of three main components:
 - Help new contributors get started
 - Report any inappropriate behavior to the project maintainers
 
----
 
 Thank you for contributing to our project! If you have any questions or need help, please open an issue or reach out to the maintainers.
+
+## Star History
+<a href="https://star-history.com/#pipeshub-ai/pipeshub-ai&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=pipeshub-ai/pipeshub-ai&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=pipeshub-ai/pipeshub-ai&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pipeshub-ai/pipeshub-ai&type=Date" />
+  </picture>
+</a>
+
+---
