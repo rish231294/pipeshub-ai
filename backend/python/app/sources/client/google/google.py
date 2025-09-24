@@ -108,8 +108,6 @@ class GoogleClient(IClient):
             logger: Logger instance
             config_service: Configuration service instance
             graph_db_service: GraphDB service instance
-            org_id: Organization ID
-            user_id: User ID
             is_individual: Flag to indicate if the client is for an individual user or an enterprise account
             version: Version of the service to build the client for
         Returns:

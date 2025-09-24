@@ -449,8 +449,6 @@ class AzureBlobClient(IClient):
         logger,
         config_service: ConfigurationService,
         graph_db_service: IGraphService,
-        org_id: str,
-        user_id: str,
     ) -> "AzureBlobClient": # type: ignore
         """Build AzureBlobClient using configuration service and graphdb service"""
         raise NotImplementedError("build_from_services is not implemented for AzureBlobClient")

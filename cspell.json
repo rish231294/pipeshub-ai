@@ -22,6 +22,7 @@
         "daterange",
         "dependency_injector",
         "docparser",
+        "Docu",
         "domainaliases",
         "dotenv",
         "exactnumber",
