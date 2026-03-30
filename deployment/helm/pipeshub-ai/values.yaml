@@ -91,6 +91,72 @@ config:
 
 secretKey: "" # Fill
 
+# Managed services configuration
+# Each flag controls whether the service runs inside this Helm release (false)
+# or is provided externally -- either as a cloud-managed service (e.g., AWS MSK,
+# ElastiCache, DocumentDB) or as a separate K8s deployment.
+# When true, the in-cluster pod/PVC for that service is NOT created and you must
+# provide connection details in the "external" section below.
+# Set to false if you want this Helm chart to deploy the service in-cluster.
+managed:
+  kafka: false
+  mongodb: false
+  redis: false
+  etcd: true
+  arango: true
+  qdrant: true
+  neo4j: true
+
+# External service endpoints (used when managed.<service> is true)
+external:
+  kafka:
+    brokers: ""
+    ssl: "false"
+    saslMechanism: ""
+    username: ""
+    passwordSecretName: ""
+    passwordSecretKey: "kafka-password"
+  mongodb:
+    uri: ""
+    dbName: "es"
+  redis:
+    host: ""
+    port: "6379"
+    password: ""
+    passwordSecretName: ""
+    passwordSecretKey: "redis-password"
+    url: ""
+  etcd:
+    url: ""
+    host: ""
+  arango:
+    url: ""
+    dbName: "es"
+    username: "root"
+    password: ""
+    passwordSecretName: ""
+    passwordSecretKey: "arango-password"
+  qdrant:
+    host: ""
+    port: "6333"
+    grpcPort: "6334"
+    apiKey: ""
+    apiKeySecretName: ""
+    apiKeySecretKey: "qdrant-api-key"
+  neo4j:
+    uri: ""
+    username: "neo4j"
+    password: ""
+    passwordSecretName: ""
+    passwordSecretKey: "neo4j-password"
+    database: "neo4j"
+
+# KV store type: "etcd" or "redis"
+kvStoreType: "etcd"
+
+# Data store type: "arangodb" or "neo4j"
+dataStore: "arangodb"
+
 mongodb:
   replicaCount: 1
   tls:
@@ -284,10 +350,9 @@ qdrant:
   affinity: {}
   apiKey: "api_key"
 
-# Neo4j (optional). When enabled, the app uses Neo4j as the graph database (DATA_STORE=neo4j).
+# Neo4j (optional, in-cluster). Used when dataStore is "neo4j" and managed.neo4j is false.
 # Override neo4j.auth.password in production (e.g. --set neo4j.auth.password=... or values from secret manager).
 neo4j:
-  enabled: false
   image:
     repository: neo4j
     tag: "5.26.0"

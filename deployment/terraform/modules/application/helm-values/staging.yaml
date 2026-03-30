@@ -1,0 +1,97 @@
+# PipesHub AI - Staging Environment Values
+# Moderate resources that approximate production topology at lower scale
+
+replicaCount: 1
+
+image:
+  pullPolicy: Always
+
+config:
+  nodeEnv: "production"
+  logLevel: "info"
+  allowedOrigins: "*"
+
+resources:
+  requests:
+    cpu: 2
+    memory: 4Gi
+  limits:
+    cpu: 4
+    memory: 6Gi
+
+persistence:
+  enabled: true
+  size: 10Gi
+
+# -- In-cluster infrastructure (staging-sized) --
+
+mongodb:
+  replicaCount: 1
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+
+redis:
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+
+arango:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 10Gi
+
+qdrant:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 10Gi
+
+etcd:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 2Gi
+
+kafka:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+zookeeper:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+neo4j:
+  enabled: false

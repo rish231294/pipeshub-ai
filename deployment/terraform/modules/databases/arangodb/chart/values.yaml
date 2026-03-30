@@ -1,0 +1,43 @@
+image:
+  repository: arangodb
+  tag: "3.12.4"
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+auth:
+  rootPasswordSecretName: ""
+  rootPasswordSecretKey: password
+
+environment: production
+
+labels: {}
+nodeSelector: {}
+tolerations: []
+
+podSecurityContext:
+  runAsUser: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL

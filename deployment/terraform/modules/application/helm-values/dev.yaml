@@ -1,0 +1,97 @@
+# PipesHub AI - Development Environment Values
+# Minimal resources for local/dev clusters (kind, minikube, dev EKS/GKE/AKS)
+
+replicaCount: 1
+
+image:
+  pullPolicy: Always
+
+config:
+  nodeEnv: "development"
+  logLevel: "debug"
+  allowedOrigins: "*"
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+
+persistence:
+  enabled: true
+  size: 5Gi
+
+# -- In-cluster infrastructure (dev-sized) --
+
+mongodb:
+  replicaCount: 1
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+
+redis:
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+
+arango:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 5Gi
+
+qdrant:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistence:
+    enabled: true
+    size: 5Gi
+
+etcd:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  persistence:
+    enabled: true
+    size: 1Gi
+
+kafka:
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+zookeeper:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+neo4j:
+  enabled: false

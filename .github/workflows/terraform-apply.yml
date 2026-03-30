@@ -1,0 +1,167 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deployment/terraform/**'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.changes.outputs.environments }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- deployment/terraform/ | \
+            grep -oP 'environments/\K[^/]+/[^/]+' | sort -u | jq -R -s 'split("\n") | map(select(. != ""))' -c)
+          if git diff --name-only HEAD~1 HEAD -- deployment/terraform/modules/; then
+            CHANGED='["aws/dev","azure/dev","gcp/dev"]'
+          fi
+          echo "environments=${CHANGED:-'[]'}" >> $GITHUB_OUTPUT
+
+  apply-dev:
+    needs: detect-changes
+    if: contains(toJson(needs.detect-changes.outputs.environments), '/dev')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Extract cloud
+        id: extract
+        run: echo "cloud=$(echo ${{ matrix.environment }} | cut -d/ -f1)" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        if: steps.extract.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Azure Login
+        if: steps.extract.outputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: GCP Auth
+        if: steps.extract.outputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Terraform Init & Apply
+        working-directory: deployment/terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve
+
+  apply-staging:
+    needs: [detect-changes, apply-dev]
+    if: contains(toJson(needs.detect-changes.outputs.environments), '/staging')
+    runs-on: ubuntu-latest
+    environment: staging  # Requires manual approval
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Extract cloud
+        id: extract
+        run: echo "cloud=$(echo ${{ matrix.environment }} | cut -d/ -f1)" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        if: steps.extract.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Azure Login
+        if: steps.extract.outputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: GCP Auth
+        if: steps.extract.outputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Terraform Init & Apply
+        working-directory: deployment/terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve
+
+  apply-production:
+    needs: [detect-changes, apply-staging]
+    if: contains(toJson(needs.detect-changes.outputs.environments), '/production')
+    runs-on: ubuntu-latest
+    environment: production  # Requires manual approval
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Extract cloud
+        id: extract
+        run: echo "cloud=$(echo ${{ matrix.environment }} | cut -d/ -f1)" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        if: steps.extract.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Azure Login
+        if: steps.extract.outputs.cloud == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: GCP Auth
+        if: steps.extract.outputs.cloud == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Terraform Init & Apply
+        working-directory: deployment/terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve

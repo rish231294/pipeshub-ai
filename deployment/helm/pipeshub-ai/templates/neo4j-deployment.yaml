@@ -1,4 +1,4 @@
-{{- if .Values.neo4j.enabled }}
+{{- if and (eq .Values.dataStore "neo4j") (not .Values.managed.neo4j) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

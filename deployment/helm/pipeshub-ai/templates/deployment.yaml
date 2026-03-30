@@ -79,13 +79,42 @@ spec:
             - name: INDEXING_BACKEND
               value: "http://localhost:8091"
             
-            # ETCD config
+            # ETCD / KV Store config
+            - name: KV_STORE_TYPE
+              value: {{ .Values.kvStoreType | quote }}
+            {{- if .Values.managed.etcd }}
+            - name: ETCD_URL
+              value: {{ .Values.external.etcd.url | quote }}
+            - name: ETCD_HOST
+              value: {{ .Values.external.etcd.host | quote }}
+            {{- else }}
             - name: ETCD_URL
               value: "http://{{ include "pipeshub-ai.fullname" . }}-etcd:2379"
             - name: ETCD_HOST
               value: "{{ include "pipeshub-ai.fullname" . }}-etcd"
-            
+            {{- end }}
+
             # ArangoDB config
+            - name: DATA_STORE
+              value: {{ .Values.dataStore | quote }}
+            {{- if .Values.managed.arango }}
+            - name: ARANGO_URL
+              value: {{ .Values.external.arango.url | quote }}
+            - name: ARANGO_DB_NAME
+              value: {{ .Values.external.arango.dbName | quote }}
+            - name: ARANGO_USERNAME
+              value: {{ .Values.external.arango.username | quote }}
+            {{- if .Values.external.arango.passwordSecretName }}
+            - name: ARANGO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.arango.passwordSecretName }}
+                  key: {{ .Values.external.arango.passwordSecretKey }}
+            {{- else }}
+            - name: ARANGO_PASSWORD
+              value: {{ .Values.external.arango.password | quote }}
+            {{- end }}
+            {{- else }}
             - name: ARANGO_URL
               value: "http://{{ include "pipeshub-ai.fullname" . }}-arango:8529"
             - name: ARANGO_DB_NAME
@@ -97,12 +126,29 @@ spec:
                 secretKeyRef:
                   name: {{ include "pipeshub-ai.fullname" . }}-secrets
                   key: arango-password
-            {{- if .Values.neo4j.enabled }}
-            # Neo4j config (app uses Neo4j as graph DB when DATA_STORE=neo4j)
+            {{- end }}
+            {{- if eq .Values.dataStore "neo4j" }}
+            # Neo4j config (app uses Neo4j as graph DB when dataStore=neo4j)
             - name: GRAPH_DB_TYPE
               value: "neo4j"
-            - name: DATA_STORE
-              value: "neo4j"
+            {{- if .Values.managed.neo4j }}
+            - name: NEO4J_URI
+              value: {{ .Values.external.neo4j.uri | quote }}
+            - name: NEO4J_USERNAME
+              value: {{ .Values.external.neo4j.username | quote }}
+            {{- if .Values.external.neo4j.passwordSecretName }}
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.neo4j.passwordSecretName }}
+                  key: {{ .Values.external.neo4j.passwordSecretKey }}
+            {{- else }}
+            - name: NEO4J_PASSWORD
+              value: {{ .Values.external.neo4j.password | quote }}
+            {{- end }}
+            - name: NEO4J_DATABASE
+              value: {{ .Values.external.neo4j.database | quote }}
+            {{- else }}
             - name: NEO4J_URI
               value: "bolt://{{ include "pipeshub-ai.fullname" . }}-neo4j:7687"
             - name: NEO4J_USERNAME
@@ -115,12 +161,53 @@ spec:
             - name: NEO4J_DATABASE
               value: {{ .Values.neo4j.auth.database | quote }}
             {{- end }}
+            {{- end }}
             
             # Kafka config
+            {{- if .Values.managed.kafka }}
+            - name: KAFKA_BROKERS
+              value: {{ .Values.external.kafka.brokers | quote }}
+            - name: KAFKA_SSL
+              value: {{ .Values.external.kafka.ssl | quote }}
+            {{- if .Values.external.kafka.saslMechanism }}
+            - name: KAFKA_SASL_MECHANISM
+              value: {{ .Values.external.kafka.saslMechanism | quote }}
+            - name: KAFKA_USERNAME
+              value: {{ .Values.external.kafka.username | quote }}
+            {{- if .Values.external.kafka.passwordSecretName }}
+            - name: KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.kafka.passwordSecretName }}
+                  key: {{ .Values.external.kafka.passwordSecretKey }}
+            {{- end }}
+            {{- end }}
+            {{- else }}
             - name: KAFKA_BROKERS
               value: "{{ include "pipeshub-ai.fullname" . }}-kafka:9092"
-            
+            {{- end }}
+
             # Redis config
+            {{- if .Values.managed.redis }}
+            - name: REDIS_HOST
+              value: {{ .Values.external.redis.host | quote }}
+            - name: REDIS_PORT
+              value: {{ .Values.external.redis.port | quote }}
+            {{- if .Values.external.redis.passwordSecretName }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.redis.passwordSecretName }}
+                  key: {{ .Values.external.redis.passwordSecretKey }}
+            {{- else }}
+            - name: REDIS_PASSWORD
+              value: {{ .Values.external.redis.password | quote }}
+            {{- end }}
+            {{- if .Values.external.redis.url }}
+            - name: REDIS_URL
+              value: {{ .Values.external.redis.url | quote }}
+            {{- end }}
+            {{- else }}
             - name: REDIS_HOST
               value: "{{ include "pipeshub-ai.fullname" . }}-redis-master"
             - name: REDIS_PORT
@@ -139,8 +226,15 @@ spec:
             - name: REDIS_URL
               value: "redis://{{ include "pipeshub-ai.fullname" . }}-redis-master:6379"
             {{- end }}
-            
+            {{- end }}
+
             # MongoDB config
+            {{- if .Values.managed.mongodb }}
+            - name: MONGO_URI
+              value: {{ .Values.external.mongodb.uri | quote }}
+            - name: MONGO_DB_NAME
+              value: {{ .Values.external.mongodb.dbName | quote }}
+            {{- else }}
             {{- if .Values.mongodb.auth.enabled }}
             - name: MONGO_USERNAME
               valueFrom:
@@ -162,8 +256,27 @@ spec:
               value: "es"
             - name: REPLICA_SET_AVAILABLE
               value: "false"
-            
+            {{- end }}
+
             # Qdrant config
+            {{- if .Values.managed.qdrant }}
+            {{- if .Values.external.qdrant.apiKeySecretName }}
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.external.qdrant.apiKeySecretName }}
+                  key: {{ .Values.external.qdrant.apiKeySecretKey }}
+            {{- else }}
+            - name: QDRANT_API_KEY
+              value: {{ .Values.external.qdrant.apiKey | quote }}
+            {{- end }}
+            - name: QDRANT_HOST
+              value: {{ .Values.external.qdrant.host | quote }}
+            - name: QDRANT_GRPC_PORT
+              value: {{ .Values.external.qdrant.grpcPort | quote }}
+            - name: QDRANT_PORT
+              value: {{ .Values.external.qdrant.port | quote }}
+            {{- else }}
             - name: QDRANT_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -175,6 +288,7 @@ spec:
               value: "6334"
             - name: QDRANT_PORT
               value: "6333"
+            {{- end }}
             - name: HOME
               value: /home/user
 

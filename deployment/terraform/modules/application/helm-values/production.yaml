@@ -1,0 +1,147 @@
+# PipesHub AI - Production Environment Values
+# Full production resources with hardened security and persistence
+
+replicaCount: 2
+
+image:
+  pullPolicy: IfNotPresent
+
+config:
+  nodeEnv: "production"
+  logLevel: "info"
+
+resources:
+  requests:
+    cpu: 4
+    memory: 8Gi
+  limits:
+    cpu: 8
+    memory: 16Gi
+
+persistence:
+  enabled: true
+  size: 50Gi
+
+podSecurityContext:
+  runAsUser: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: "OnRootMismatch"
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# -- In-cluster infrastructure (production-sized) --
+# NOTE: In production, prefer managed services (DocumentDB, ElastiCache, MSK,
+# Confluent, etc.) and disable these sub-charts via the Terraform module's
+# managed_service_endpoints variable. The values below are for self-hosted
+# production deployments.
+
+mongodb:
+  replicaCount: 1
+  auth:
+    enabled: true
+  persistence:
+    enabled: true
+  podSecurityContext:
+    enabled: true
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    enabled: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+redis:
+  auth:
+    enabled: true
+  persistence:
+    enabled: true
+
+arango:
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  persistence:
+    enabled: true
+    size: 50Gi
+  auth:
+    enabled: true
+
+qdrant:
+  resources:
+    requests:
+      cpu: 1000m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  persistence:
+    enabled: true
+    size: 100Gi
+
+etcd:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  persistence:
+    enabled: true
+    size: 5Gi
+
+kafka:
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 4Gi
+  config:
+    offsetsTopicReplicationFactor: "3"
+    transactionStateLogMinIsr: "2"
+    transactionStateLogReplicationFactor: "3"
+
+zookeeper:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+neo4j:
+  enabled: false
+  resources:
+    requests:
+      cpu: 2000m
+      memory: 4Gi
+    limits:
+      cpu: 4000m
+      memory: 8Gi
+  persistence:
+    enabled: true
+    size: 50Gi
+  env:
+    NEO4J_PLUGINS: '["apoc"]'
+    NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    NEO4J_dbms_memory_heap_initial__size: 2G
+    NEO4J_dbms_memory_heap_max__size: 4G
+    NEO4J_dbms_memory_pagecache_size: 2G
