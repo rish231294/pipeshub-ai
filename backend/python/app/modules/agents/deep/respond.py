@@ -21,18 +21,27 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.types import StreamWriter
+from app.utils.fetch_url_tool import create_fetch_url_tool
+from app.config.constants.service import config_node_constants
+from app.utils.web_search_tool import create_web_search_tool
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from app.modules.agents.capability_summary import build_capability_summary
 from app.modules.agents.deep.context_manager import (
     build_respond_conversation_context,
 )
-from app.modules.agents.deep.state import DeepAgentState
+from app.modules.agents.qna.chat_state import is_custom_agent_system_prompt
 from app.modules.agents.qna.stream_utils import safe_stream_write
+from app.modules.qna.response_prompt import build_direct_answer_time_context
+
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.types import StreamWriter
+
+    from app.modules.agents.deep.state import DeepAgentState
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +172,16 @@ async def _deep_respond_impl(
         "Fast-path check: analyses=%d, final_results=%d, virtual_map=%d, tool_results=%d",
         len(analyses), len(final_results), len(virtual_record_map), len(all_tool_results),
     )
-    if analyses and not final_results and not virtual_record_map:
+    _WEB_TOOL_NAMES = {"web_search", "fetch_url"}
+    has_web_tools = any(
+        r.get("tool_name", "") in _WEB_TOOL_NAMES
+        for r in all_tool_results
+        if r.get("status") == "success"
+    )
+    if has_web_tools:
+        log.info("Fast-path skipped: web_search/fetch_url results require standard citation path")
+
+    if analyses and not final_results and not virtual_record_map and not has_web_tools:
         log.info("Fast-path: API-only results with sub-agent analysis, using lightweight response")
         try:
             from app.modules.agents.qna.nodes import _generate_fast_api_response
@@ -185,22 +203,6 @@ async def _deep_respond_impl(
         except Exception as e:
             log.warning("Fast-path failed, falling back to standard: %s", e)
             # Fall through to standard path
-
-    # ================================================================
-    # Merge and deduplicate retrieval results from parallel calls.
-    # Sort by (virtual_record_id, block_index) for consistent R-labels.
-    # ================================================================
-    if final_results:
-        from app.modules.agents.qna.nodes import merge_and_number_retrieval_results
-        final_results = merge_and_number_retrieval_results(final_results, log)
-        final_results = sorted(
-            final_results,
-            key=lambda x: (
-                x.get("virtual_record_id") or x.get("metadata", {}).get("virtualRecordId", ""),
-                x.get("block_index", 0),
-            ),
-        )
-        state["final_results"] = final_results
 
     log.info("Citation data: %d results, %d records", len(final_results), len(virtual_record_map))
 
@@ -232,20 +234,16 @@ async def _deep_respond_impl(
                     "Please provide accurate and relevant information."
                 )
 
-        qna_content = _get_msg_content(
-            final_results, virtual_record_map, user_data, query, log, "json"
+        from app.utils.chat_helpers import CitationRefMapper as _CitationRefMapper
+        _ref_mapper = state.get("citation_ref_mapper") or _CitationRefMapper()
+        qna_content, _ref_mapper = _get_msg_content(
+            final_results, virtual_record_map, user_data, query, "json",is_multimodal_llm=state.get("is_multimodal_llm", False), ref_mapper=_ref_mapper, has_sql_connector=state.get("has_sql_connector", False) and state.get("has_sql_knowledge", False),
         )
+        state["citation_ref_mapper"] = _ref_mapper
         state["qna_message_content"] = qna_content
         log.debug("Built qna_message_content via get_message_content()")
     else:
         state["qna_message_content"] = None
-
-    # Build R-label → virtual_record_id mapping
-    from app.modules.qna.response_prompt import build_record_label_mapping
-    record_label_map: dict = build_record_label_mapping(final_results) if final_results else {}
-    if record_label_map:
-        log.debug("Record label mapping: %s", record_label_map)
-    state["record_label_to_uuid_map"] = record_label_map
 
     # ================================================================
     # Build messages.
@@ -281,7 +279,6 @@ async def _deep_respond_impl(
         r for r in all_tool_results
         if r.get("status") == "success"
         and "retrieval" not in r.get("tool_name", "").lower()
-        and "knowledge" not in r.get("tool_name", "").lower()
     ]
     failed_results = [r for r in all_tool_results if r.get("status") == "error"]
 
@@ -292,10 +289,14 @@ async def _deep_respond_impl(
     if has_api_results or analyses:
         from app.modules.agents.qna.nodes import _build_tool_results_context
 
-        context = _build_tool_results_context(
+        context = await _build_tool_results_context(
             all_tool_results,
             [] if qna_has_retrieval else final_results,
             has_retrieval_in_context=qna_has_retrieval,
+            ref_mapper=state.get("citation_ref_mapper"),
+            config_service=state.get("config_service"),
+            is_multimodal_llm=state.get("is_multimodal_llm", False),
+
         ) if has_api_results else ""
 
         # Prepend sub-agent analyses as supplementary structured context.
@@ -311,12 +312,15 @@ async def _deep_respond_impl(
             )
             if qna_has_retrieval:
                 analyses_text += (
-                    "Use these structured insights to provide a MORE DETAILED and DEEPER "
-                    "response than a simple retrieval answer. The context blocks above "
-                    "contain the raw source data with citation labels (R1, R2, etc.) — "
-                    "use those labels for citations. The analysis below provides "
-                    "structured findings, connections, and deeper insights that should "
-                    "enrich your response.\n\n"
+                    "Use these structured insights to build a COMPREHENSIVE, WELL-SYNTHESIZED "
+                    "response. Do NOT simply list findings — instead:\n"
+                    "  • Identify the key themes and cross-source connections the analyses reveal.\n"
+                    "  • For each topic in the user's query, draw from the relevant analyses AND "
+                    "the context blocks to construct a detailed, coherent explanation.\n"
+                    "  • Where multiple sub-agents investigated the same topic, merge their findings "
+                    "into a single, richer narrative rather than repeating similar content.\n"
+                    "  • Cover ALL distinct aspects of the user's query using the evidence available; "
+                    "if a topic is thoroughly documented, reflect that depth in your answer.\n\n"
                 )
             elif has_api_results:
                 analyses_text += (
@@ -343,32 +347,52 @@ async def _deep_respond_impl(
             else:
                 messages.append(HumanMessage(content=context))
 
-    # Log prompt size
-    total_chars = sum(
-        len(m.content) if isinstance(m.content, str)
-        else sum(len(p.get("text", "")) for p in m.content if isinstance(p, dict))
-        if isinstance(m.content, list) else 0
-        for m in messages
-    )
-    log.info("deep_respond_node: prompt built, %d chars total", total_chars)
-
     # ================================================================
     # Setup tools (fetch_full_record for retrieval)
     # ================================================================
     tools: list = []
     if virtual_record_map:
-        from app.utils.agent_fetch_full_record import (
-            create_agent_fetch_full_record_tool,
+        from app.utils.fetch_full_record import (
+            create_fetch_full_record_tool,
         )
-        fetch_tool = create_agent_fetch_full_record_tool(
+        fetch_tool = create_fetch_full_record_tool(
             virtual_record_map,
-            label_to_virtual_record_id=record_label_map if record_label_map else None,
+            org_id=state.get("org_id", ""),
+            graph_provider=state.get("graph_provider"),
         )
         tools = [fetch_tool]
         log.debug(
             "Added agent fetch_full_record tool (%d records, %d labels)",
-            len(virtual_record_map), len(record_label_map),
+            len(virtual_record_map),
+            len(final_results),
         )
+    
+   
+    
+
+    fetch_url_tool = create_fetch_url_tool(ref_mapper=state.get("citation_ref_mapper"))
+    tools.append(fetch_url_tool)
+    
+    web_search_provider_config = state.get("web_search_config")
+    has_web_search_tool = False
+    if web_search_provider_config:
+        web_search_tool = create_web_search_tool(config=web_search_provider_config)
+        tools.append(web_search_tool)
+        has_web_search_tool = True
+
+    if has_web_search_tool and messages:
+        web_tool_hint = (
+            "\n\n## Web Tools Available (CRITICAL — READ BEFORE RESPONDING)\n"
+            "You have `web_search` and `fetch_url` tools available.\n\n"
+            "**MANDATORY RULE**: If the retrieved knowledge blocks and sub-agent analyses above "
+            "do NOT contain sufficient information to answer the user's question, you MUST use "
+            "`web_search` (and/or `fetch_url` for specific URLs) to find the answer "
+            "from the web BEFORE responding.\n\n"
+        )
+        if isinstance(messages[0], SystemMessage):
+            messages[0] = SystemMessage(content=messages[0].content + web_tool_hint)
+        else:
+            messages.insert(0, SystemMessage(content=web_tool_hint))
 
     # Initialize blob_store if missing
     graph_provider = state.get("graph_provider")
@@ -385,11 +409,15 @@ async def _deep_respond_impl(
             state["blob_store"] = blob_store
         except Exception as _bs_err:
             log.warning("Could not initialise BlobStorage: %s", _bs_err)
-
+    
+    
+    
     tool_runtime_kwargs = {
         "blob_store": blob_store,
         "graph_provider": graph_provider,
         "org_id": state.get("org_id", ""),
+        "conversation_id": state.get("conversation_id"),
+        "config_service": state.get("config_service"),
     }
 
     # Construct all_queries — prefer decomposed_queries from planner,
@@ -423,12 +451,22 @@ async def _deep_respond_impl(
 
         DEFAULT_CONTEXT_LENGTH = 128000
 
+        # Pre-seed web_records from prior tool execution so that web citations
+        # are available even when the LLM does not re-invoke tools during streaming.
+        from app.modules.agents.qna.nodes import _extract_web_records_from_tool_results
+        _prior_web_records = _extract_web_records_from_tool_results(
+            all_tool_results, state.get("org_id", ""),
+        )
+        if _prior_web_records:
+            log.info("Pre-seeded %d web records from prior tool execution", len(_prior_web_records))
+
         answer_text = ""
         citations: list = []
         reason = None
         confidence = None
         reference_data: list = []
-        any_chunks_sent = False  # Track whether we already sent chunks to the client
+        any_chunks_sent = False
+        _captured_web_records: list[dict] = list(_prior_web_records)
 
         async for stream_event in stream_llm_response_with_tools(
             llm=llm,
@@ -446,15 +484,20 @@ async def _deep_respond_impl(
             tool_runtime_kwargs=tool_runtime_kwargs,
             target_words_per_chunk=1,
             mode="json",
-            is_agent=True,
+            conversation_id=state.get("conversation_id"),
+            ref_mapper=state.get("citation_ref_mapper"),
+            initial_web_records=_prior_web_records,
         ):
             event_type = stream_event.get("event")
             event_data = stream_event.get("data", {})
 
+            if event_type == "tool_execution_complete":
+                _captured_web_records = event_data.get("web_records", []) or []
+
             # ── Citation enrichment (second-pass extraction) ──────────
             if (
                 event_type == "complete"
-                and final_results
+                and (final_results or _captured_web_records)
                 and not event_data.get("citations")
             ):
                 _raw_answer = event_data.get("answer", "")
@@ -464,8 +507,11 @@ async def _deep_respond_impl(
                         from app.utils.citations import (
                             normalize_citations_and_chunks_for_agent as _ncc_agent,
                         )
+                        _ref_to_url_snap = state.get("citation_ref_mapper")
+                        _ref_to_url_snap = _ref_to_url_snap.ref_to_url if _ref_to_url_snap else None
                         _, _enriched = _ncc_agent(
-                            _raw_answer, final_results, virtual_record_map, []
+                            _raw_answer, final_results, virtual_record_map, [],
+                            ref_to_url=_ref_to_url_snap, web_records=_captured_web_records,
                         )
                         if _enriched:
                             log.info(
@@ -566,7 +612,7 @@ def _build_simple_retrieval_messages(
     Mirrors the chatbot approach: short system prompt + conversation history +
     qna_message_content as the user message. The user message (built by
     get_message_content) already contains all citation rules, output format,
-    tool instructions, and R-labeled blocks — no need for the 248-line
+    tool instructions, and blocks — no need for the 248-line
     system prompt from build_response_prompt().
     """
     messages: list = []
@@ -591,13 +637,33 @@ def _build_simple_retrieval_messages(
         "studied the data in depth).\n\n"
         "Your response should be MORE COMPREHENSIVE and MORE DETAILED than a standard "
         "retrieval answer. Specifically:\n"
-        "- Use the sub-agent analysis to identify key themes, connections between sources, "
-        "and deeper insights that a surface-level read would miss.\n"
-        "- Use the context blocks (R-labeled) for citations and exact quotes.\n"
-        "- Provide detailed explanations, not brief summaries.\n"
+        "- Synthesize the sub-agent analyses to identify key themes, connections between "
+        "sources, and deeper insights that a surface-level read would miss.\n"
+        "- Provide detailed explanations with specifics, not brief summaries.\n"
         "- When multiple sources cover the same topic, synthesize them into a coherent "
         "narrative rather than listing them separately.\n"
-        "- Expand on each point with specific details found in the blocks and analysis."
+        "- Expand on each point with specific details found in the blocks and analysis.\n\n"
+        "CRITICAL SYNTHESIS RULES:\n"
+        "- The sub-agent analyses ARE your primary knowledge source. They were produced "
+        "by specialized agents that fetched and studied the full source documents. "
+        "If an analysis covers a topic, you HAVE that information — present it.\n"
+        "- NEVER say 'I don't have information about X' or 'there is no content for X' "
+        "if the sub-agent analyses discuss X. Extract and present what the analyses reveal.\n"
+        "- If a specific document (e.g. an ERD page, a schema doc) is mentioned in the "
+        "analyses but its full text is not in the context blocks, summarise what the "
+        "analyses say about it and cite the source appropriately.\n"
+        "- Answer EVERY part of the user's query. If one part is covered only in the "
+        "analyses and another only in the blocks, combine both into a unified answer.\n\n"
+        "CITATION RULES:\n"
+        "- **Limit citations to the most relevant blocks.** Do NOT cite every sentence — only cite the most important, non-obvious, or specific factual claims.\n"
+        "- For internal knowledge blocks: each block has a 'Citation ID' (e.g., ref1, ref2) — use it exactly for citations: [source](ref1).\n"
+        "- For web search/fetch_url results: cite using the url/citation id.\n"
+        "- Use EXACTLY the Citation ID or URL shown in the context. Do NOT invent or modify them.\n"
+        "- If you cannot find the Citation ID or URL for a claim, omit the citation rather than guessing.\n\n"
+        "DATE/TIME FORMATTING:\n"
+        "- Render dates/times in human-readable form using the **Time zone** from the Time context (e.g., 'April 28, 2026 at 3:45 PM IST'). "
+        "Convert any epoch/numeric or ISO timestamp fields (`ts`, `timestamp`, `created_at`, `updated_at`, etc.) — "
+        "never output raw epoch numbers, ISO strings, or `ts`-style columns.\n\n"
     )
 
     messages.append(SystemMessage(content="\n\n".join(parts)))
@@ -635,10 +701,10 @@ def _build_simple_retrieval_messages(
 # ---------------------------------------------------------------------------
 
 def _trim_analyses_to_budget(
-    analyses: List[str],
+    analyses: list[str],
     log: logging.Logger,
     budget: int = _MAX_TOTAL_ANALYSES_CHARS,
-) -> List[str]:
+) -> list[str]:
     """Proportionally trim analyses to fit within budget."""
     total = sum(len(a) for a in analyses)
     if total <= budget:
@@ -694,7 +760,7 @@ def _log_state_diagnostic(state: DeepAgentState, log: logging.Logger) -> None:
 # Data collection
 # ---------------------------------------------------------------------------
 
-def _collect_analyses(state: DeepAgentState, log: logging.Logger) -> List[str]:
+def _collect_analyses(state: DeepAgentState, log: logging.Logger) -> list[str]:
     """
     Collect analyses from all available sources.
 
@@ -745,7 +811,7 @@ def _collect_analyses(state: DeepAgentState, log: logging.Logger) -> List[str]:
     return rebuilt
 
 
-def _collect_tool_results(state: DeepAgentState, log: logging.Logger) -> List[Dict[str, Any]]:
+def _collect_tool_results(state: DeepAgentState, log: logging.Logger) -> list[dict[str, Any]]:
     """
     Collect raw tool results for supplementary data (links, exact values).
 
@@ -834,15 +900,12 @@ def _collect_tool_results(state: DeepAgentState, log: logging.Logger) -> List[Di
 # Fallback response (when LLM returns empty)
 # ---------------------------------------------------------------------------
 
-def _build_fallback_response(analyses: List[str]) -> str:
+def _build_fallback_response(analyses: list[str]) -> str:
     """Build a fallback response directly from analyses when LLM fails."""
     parts = ["Here's what I found:\n"]
     for analysis in analyses:
         # Strip the [task_id (domains)]: prefix for cleaner output
-        if "]: " in analysis:
-            content = analysis.split("]: ", 1)[1]
-        else:
-            content = analysis
+        content = analysis.split("]: ", 1)[1] if "]: " in analysis else analysis
         parts.append(content)
     return "\n\n---\n\n".join(parts)
 
@@ -855,20 +918,20 @@ _URL_PATTERN = re.compile(r'https?://[^\s\)\]>]+')
 
 
 def _extract_reference_links(
-    analyses: List[str],
-    tool_results: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+    analyses: list[str],
+    tool_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Extract unique URLs from analyses and tool results for frontend referenceData."""
     seen: set = set()
-    links: List[Dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
 
     # From analyses text
     for text in analyses:
         for url in _URL_PATTERN.findall(text):
-            url = url.rstrip(".,;:!?\"'")
-            if url not in seen:
-                seen.add(url)
-                links.append({"url": url})
+            cleaned_url = url.rstrip(".,;:!?\"'")
+            if cleaned_url not in seen:
+                seen.add(cleaned_url)
+                links.append({"url": cleaned_url})
 
     # From tool results
     for r in tool_results:
@@ -884,20 +947,19 @@ def _extract_urls_from_value(value: object, seen: set, links: list, depth: int =
 
     if isinstance(value, str):
         for url in _URL_PATTERN.findall(value):
-            url = url.rstrip(".,;:!?\"'")
-            if url not in seen:
-                seen.add(url)
-                links.append({"url": url})
+            cleaned_url = url.rstrip(".,;:!?\"'")
+            if cleaned_url not in seen:
+                seen.add(cleaned_url)
+                links.append({"url": cleaned_url})
     elif isinstance(value, dict):
         # Check common URL fields first
         url_fields = ("url", "webLink", "webViewLink", "htmlUrl", "permalink",
                        "link", "href", "self", "joinUrl", "joinWebUrl")
         for field in url_fields:
             val = value.get(field)
-            if isinstance(val, str) and val.startswith("http"):
-                if val not in seen:
-                    seen.add(val)
-                    links.append({"url": val})
+            if isinstance(val, str) and val.startswith("http") and val not in seen:
+                seen.add(val)
+                links.append({"url": val})
         # Recurse into values
         for v in value.values():
             _extract_urls_from_value(v, seen, links, depth + 1)
@@ -937,7 +999,7 @@ def _handle_error_state(
 
 def _handle_clarify(
     state: DeepAgentState,
-    reflection: Dict[str, Any],
+    reflection: dict[str, Any],
     writer: StreamWriter,
     config: RunnableConfig,
     log: logging.Logger,
@@ -962,7 +1024,7 @@ def _handle_clarify(
 
 def _handle_error_decision(
     state: DeepAgentState,
-    reflection: Dict[str, Any],
+    reflection: dict[str, Any],
     writer: StreamWriter,
     config: RunnableConfig,
     log: logging.Logger,
@@ -1011,7 +1073,18 @@ async def _handle_direct_answer(
     if agent_instructions and agent_instructions.strip():
         instructions_prefix = f"## Agent Instructions\n{agent_instructions.strip()}\n\n"
 
-    system_content = f"{instructions_prefix}You are a helpful, friendly AI assistant. Respond naturally and concisely."
+    role_prefix = ""
+    persona = state.get("system_prompt")
+    if is_custom_agent_system_prompt(persona):
+        role_prefix = f"{persona.strip()}\n\n"
+
+    system_content = (
+        f"{instructions_prefix}{role_prefix}"
+        "You are a helpful, friendly AI assistant. Respond naturally and concisely.\n\n"
+        "Render dates/times in human-readable form using the **Time zone** from the Time context "
+        "(e.g., 'April 28, 2026 at 3:45 PM IST'). Convert any epoch/numeric or ISO timestamp fields "
+        "(`ts`, `timestamp`, `created_at`, `updated_at`, etc.) — never output raw epoch numbers, ISO strings, or `ts`-style columns."
+    )
 
     user_info = state.get("user_info") or {}
     org_info = state.get("org_info") or {}
@@ -1020,6 +1093,11 @@ async def _handle_direct_answer(
     if user_context:
         user_content += f"\n\n{user_context}"
         system_content += "\n\nWhen the user asks about themselves, use the provided info DIRECTLY."
+
+    # Add capability summary
+    capability_summary = build_capability_summary(state)
+    system_content += f"\n\n{capability_summary}"
+    system_content += f"\n\n{build_direct_answer_time_context(state)}"
 
     messages = [SystemMessage(content=system_content)]
 
@@ -1042,7 +1120,6 @@ async def _handle_direct_answer(
             final_results=[],
             logger=log,
             target_words_per_chunk=1,
-            mode="simple",
         ):
             event_type = stream_event.get("event")
             event_data = stream_event.get("data", {})
@@ -1155,5 +1232,4 @@ def _format_user_context(user_info: dict, org_info: dict) -> str:
         parts.append(f"Organization: {org_info['name']}")
 
     return ", ".join(parts)
-
 

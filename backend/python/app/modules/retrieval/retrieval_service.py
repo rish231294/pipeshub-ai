@@ -1,7 +1,7 @@
 import asyncio
 import time
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -36,13 +36,28 @@ from app.utils.chat_helpers import (
     get_flattened_results,
     get_record,
 )
-from app.utils.mimetype_to_extension import get_extension_from_mimetype
+from app.utils.image_utils import get_extension_from_mimetype
 
 # OPTIMIZATION: User data cache with TTL
 _user_cache: dict[str, tuple] = {}  # {user_id: (user_data, timestamp)}
 USER_CACHE_TTL = 300  # 5 minutes
 MAX_USER_CACHE_SIZE = 1000  # Max number of users to keep in cache
 
+# User-facing guidance when the graph/permissions yield no searchable corpus
+ACCESSIBLE_RECORDS_NOT_FOUND_MESSAGE = (
+    "No documents are available for you to search yet. Upload files in Collections "
+    "and/or connect a data source under Connectors so content can be indexed."
+)
+
+
+valid_group_labels = [
+        GroupType.LIST.value,
+        GroupType.ORDERED_LIST.value,
+        GroupType.FORM_AREA.value,
+        GroupType.INLINE.value,
+        GroupType.KEY_VALUE_AREA.value,
+        GroupType.TEXT_SECTION.value,
+    ]
 
 class RetrievalService:
     def __init__(
@@ -69,23 +84,34 @@ class RetrievalService:
         self.llm = None
         self.graph_provider = graph_provider
         self.blob_store = blob_store
-        # Initialize sparse embeddings
-        try:
-            self.sparse_embeddings = FastEmbedSparse(model_name="Qdrant/BM25")
-        except Exception as e:
-            self.logger.error("Failed to initialize sparse embeddings: " + str(e))
-            self.sparse_embeddings = None
-            raise Exception(
-                "Failed to initialize sparse embeddings: " + str(e),
-            )
+        # Defer sparse embeddings init to first use — FastEmbedSparse downloads
+        # and loads an ONNX model which blocks the event loop for 30-60s on a
+        # cold cache.  Lazy-load in a worker thread via _ensure_sparse_embeddings().
+        self.sparse_embeddings = None
+        self._sparse_embeddings_lock = asyncio.Lock()
         self.vector_db_service = vector_db_service
         self.collection_name = collection_name
         self.logger.info(f"Retrieval service initialized with collection name: {self.collection_name}")
         self.embedding_model = None
         self.embedding_size = None
         self.embedding_model_instance = None
+        # Serialize concurrent embedding model loads so we only build the model
+        # once even if multiple requests race during warmup. Safe to create at
+        # import-time on Python 3.10+ (no running loop required).
+        self._embedding_model_lock = asyncio.Lock()
 
-    async def get_llm_instance(self, use_cache: bool = True) -> Optional[BaseChatModel]:
+    async def _ensure_sparse_embeddings(self) -> FastEmbedSparse:
+        """Lazily initialise FastEmbedSparse in a worker thread."""
+        if self.sparse_embeddings is not None:
+            return self.sparse_embeddings
+        async with self._sparse_embeddings_lock:
+            if self.sparse_embeddings is None:
+                self.sparse_embeddings = await asyncio.to_thread(
+                    FastEmbedSparse, model_name="Qdrant/BM25"
+                )
+        return self.sparse_embeddings
+
+    async def get_llm_instance(self, use_cache: bool = False) -> BaseChatModel | None:
         try:
             self.logger.info("Getting LLM")
             ai_models = await self.config_service.get_config(
@@ -100,7 +126,7 @@ class RetrievalService:
             for config in llm_configs:
                 if config.get("isDefault", False):
                     provider = config["provider"]
-                    self.llm = get_generator_model(provider, config)
+                    self.llm = await asyncio.to_thread(get_generator_model, provider, config)
                 if self.llm:
                     break
 
@@ -110,7 +136,7 @@ class RetrievalService:
             if not self.llm:
                 for config in llm_configs:
                     provider = config["provider"]
-                    self.llm = get_generator_model(provider, config)
+                    self.llm = await asyncio.to_thread(get_generator_model, provider, config)
                     if self.llm:
                         break
                 if not self.llm:
@@ -122,56 +148,79 @@ class RetrievalService:
             self.logger.error(f"Error getting LLM: {str(e)}")
             return None
 
-    async def get_embedding_model_instance(self, use_cache: bool = True) -> Optional[Embeddings]:
+    async def get_embedding_model_instance(self, use_cache: bool = False) -> Embeddings | None:
         try:
             embedding_model = await self.get_current_embedding_model_name(use_cache)
-            if self.embedding_model == embedding_model:
+
+            # Fast path: same model already loaded, no lock needed.
+            if self.embedding_model == embedding_model and self.embedding_model_instance is not None:
                 return self.embedding_model_instance
-            self.embedding_model = embedding_model
-            try:
-                if not embedding_model or embedding_model == DEFAULT_EMBEDDING_MODEL:
-                    self.logger.info("Using default embedding model")
-                    embedding_model = DEFAULT_EMBEDDING_MODEL
-                    dense_embeddings = get_default_embedding_model()
 
-                else:
-                    self.logger.info(f"Using embedding model: {getattr(embedding_model, 'model', embedding_model)}")
-                    ai_models = await self.config_service.get_config(
-                        config_node_constants.AI_MODELS.value
-                    )
-                    dense_embeddings = None
-                    if ai_models["embedding"]:
-                        self.logger.info("No default embedding model found, using first available provider")
-                        configs = ai_models["embedding"]
-                        # Try to find the default config
-                        selected_config = next((c for c in configs if c.get("isDefault", False)), None)
-                        # If no default, take the first one
-                        if not selected_config and configs:
-                            selected_config = configs[0]
+            # Serialize the (potentially very slow) model load so concurrent
+            # callers don't all download / instantiate the embedding model.
+            async with self._embedding_model_lock:
+                # Re-check after acquiring the lock in case another coroutine
+                # already finished loading while we were waiting.
+                if self.embedding_model == embedding_model and self.embedding_model_instance is not None:
+                    return self.embedding_model_instance
 
-                        if selected_config:
-                            dense_embeddings = get_embedding_model(selected_config["provider"], selected_config)
-                            self.logger.info(f"Embedding provider: {selected_config['provider']}")
+                try:
+                    if not embedding_model or embedding_model == DEFAULT_EMBEDDING_MODEL:
+                        self.logger.info("Using default embedding model")
+                        effective_model = DEFAULT_EMBEDDING_MODEL
+                        # HuggingFaceEmbeddings(...) may download ~1GB+ and load a
+                        # transformer, which blocks the event loop. Offload to a
+                        # worker thread so the server stays responsive.
+                        dense_embeddings = await asyncio.to_thread(get_default_embedding_model)
+                    else:
+                        self.logger.info(
+                            f"Using embedding model: {getattr(embedding_model, 'model', embedding_model)}"
+                        )
+                        ai_models = await self.config_service.get_config(
+                            config_node_constants.AI_MODELS.value
+                        )
+                        dense_embeddings = None
+                        effective_model = embedding_model
+                        if ai_models["embedding"]:
+                            self.logger.info(
+                                "No default embedding model found, using first available provider"
+                            )
+                            configs = ai_models["embedding"]
+                            selected_config = next(
+                                (c for c in configs if c.get("isDefault", False)), None
+                            )
+                            if not selected_config and configs:
+                                selected_config = configs[0]
 
+                            if selected_config:
+                                # Provider clients (Bedrock/OpenAI/etc.) may also do
+                                # blocking I/O on construction, so offload here too.
+                                dense_embeddings = await asyncio.to_thread(
+                                    get_embedding_model,
+                                    selected_config["provider"],
+                                    selected_config,
+                                )
+                                self.logger.info(
+                                    f"Embedding provider: {selected_config['provider']}"
+                                )
 
-            except Exception as e:
-                self.logger.error(f"Error creating embedding model: {str(e)}")
-                raise EmbeddingModelCreationError(
-                    f"Failed to create embedding model: {str(e)}"
-                ) from e
+                except Exception as e:
+                    self.logger.error(f"Error creating embedding model: {str(e)}")
+                    raise EmbeddingModelCreationError(
+                        f"Failed to create embedding model: {str(e)}"
+                    ) from e
 
-            # Get the embedding dimensions from the model
-
-            self.logger.info(
-                f"Using embedding model: {getattr(embedding_model, 'model', embedding_model)}"
-            )
-            self.embedding_model_instance = dense_embeddings
-            return dense_embeddings
+                self.logger.info(
+                    f"Using embedding model: {getattr(effective_model, 'model', effective_model)}"
+                )
+                self.embedding_model = embedding_model
+                self.embedding_model_instance = dense_embeddings
+                return dense_embeddings
         except Exception as e:
             self.logger.error(f"Error getting embedding model: {str(e)}")
             return None
 
-    async def get_current_embedding_model_name(self, use_cache: bool = True) -> Optional[str]:
+    async def get_current_embedding_model_name(self, use_cache: bool = False) -> str | None:
         """Get the current embedding model name from configuration or instance."""
         try:
             # First try to get from AI_MODELS config
@@ -191,7 +240,7 @@ class RetrievalService:
             self.logger.error(f"Error getting current embedding model name: {str(e)}")
             return DEFAULT_EMBEDDING_MODEL
 
-    def get_embedding_model_name(self, dense_embeddings: Embeddings) -> Optional[str]:
+    def get_embedding_model_name(self, dense_embeddings: Embeddings) -> str | None:
         if hasattr(dense_embeddings, "model_name"):
             return dense_embeddings.model_name
         elif hasattr(dense_embeddings, "model"):
@@ -239,14 +288,12 @@ class RetrievalService:
         queries: list[str],
         user_id: str,
         org_id: str,
-        filter_groups: Optional[dict[str, list[str]]] = None,
+        filter_groups: dict[str, list[str]] | None = None,
         limit: int = 20,
-        virtual_record_ids_from_tool: Optional[list[str]] = None,
-        graph_provider: Optional[IGraphDBProvider] = None,
+        virtual_record_ids_from_tool: list[str] | None = None,
         knowledge_search:bool = False,
-        is_agent:bool = False,
     ) -> dict[str, Any]:
-        """Perform semantic search on accessible records with multiple queries."""
+        """Perform semantic search on records the given user may access (graph permission checks)."""
 
         try:
             # Get accessible records
@@ -271,13 +318,13 @@ class RetrievalService:
                 self._get_user_cached(user_id)  # Get user info in parallel with caching
             ]
 
-            accessible_virtual_record_ids, user = await asyncio.gather(*init_tasks)
+            accessible_virtual_id_to_record_id, user = await asyncio.gather(*init_tasks)
 
-            if not accessible_virtual_record_ids:
+            if not accessible_virtual_id_to_record_id:
                 self.logger.error(f"No accessible documents found for user {user_id} and org {org_id}")
-                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+                return self._create_empty_response(ACCESSIBLE_RECORDS_NOT_FOUND_MESSAGE, Status.ACCESSIBLE_RECORDS_NOT_FOUND)
 
-            self.logger.debug(f"Accessible virtual record ids count: {len(accessible_virtual_record_ids)}")
+            self.logger.debug(f"Accessible virtual record ids count: {len(accessible_virtual_id_to_record_id)}")
 
             if virtual_record_ids_from_tool:
                 filter  = await self.vector_db_service.filter_collection(
@@ -286,7 +333,7 @@ class RetrievalService:
             else:
                 filter = await self.vector_db_service.filter_collection(
                         must={"orgId": org_id},
-                        should={"virtualRecordId": accessible_virtual_record_ids}  # Pass as should condition
+                        should={"virtualRecordId": list(accessible_virtual_id_to_record_id.keys())}
                     )
             search_results = await self._execute_parallel_searches(queries, filter, limit)
 
@@ -309,16 +356,25 @@ class RetrievalService:
             self.logger.debug(f"Qdrant returned {len(returned_virtual_record_ids)} unique virtualRecordIds")
 
             if not returned_virtual_record_ids:
-                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+                return self._create_empty_response(ACCESSIBLE_RECORDS_NOT_FOUND_MESSAGE, Status.ACCESSIBLE_RECORDS_NOT_FOUND)
 
-            self.logger.debug(f"Fetching {len(returned_virtual_record_ids)} records by virtualRecordIds")
-            fetched_records = await self.graph_provider.get_records_by_virtual_record_ids(
-                returned_virtual_record_ids, org_id
+            # Resolve only the permission-verified recordIds for the returned virtual IDs.
+            # This prevents cross-connector leakage: if multiple connectors share the same
+            # virtualRecordId, we only fetch the specific record the user has access to.
+            record_ids_to_fetch = list({
+                accessible_virtual_id_to_record_id[vid]
+                for vid in returned_virtual_record_ids
+                if vid in accessible_virtual_id_to_record_id
+            })
+
+            self.logger.debug(f"Fetching {len(record_ids_to_fetch)} records by permission-verified record IDs")
+            fetched_records = await self.graph_provider.get_records_by_record_ids(
+                record_ids_to_fetch, org_id
             )
 
             if not fetched_records:
-                self.logger.error("Failed to fetch records by virtualRecordIds")
-                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+                self.logger.error("Failed to fetch records by record IDs")
+                return self._create_empty_response(ACCESSIBLE_RECORDS_NOT_FOUND_MESSAGE, Status.ACCESSIBLE_RECORDS_NOT_FOUND)
 
             record_id_to_record_map = {}
             for r in fetched_records:
@@ -338,7 +394,7 @@ class RetrievalService:
             unique_record_ids = {r.get("_key") for r in virtual_to_record_map.values() if r}
 
             if not unique_record_ids:
-                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
+                return self._create_empty_response(ACCESSIBLE_RECORDS_NOT_FOUND_MESSAGE, Status.ACCESSIBLE_RECORDS_NOT_FOUND)
             self.logger.info(f"Unique record IDs count: {len(unique_record_ids)}")
 
             file_record_ids_to_fetch = []
@@ -362,6 +418,7 @@ class RetrievalService:
                     if record:
                         result["metadata"]["origin"] = record.get("origin")
                         result["metadata"]["connector"] = record.get("connectorName", None)
+                        result["metadata"]["connectorId"] = record.get("connectorId", None)
                         result["metadata"]["kbId"] = record.get("kbId", None)
                         weburl = record.get("webUrl")
                         if weburl and weburl.startswith("https://mail.google.com/mail?authuser="):
@@ -384,7 +441,7 @@ class RetrievalService:
                             continue
                         else:
                             result["metadata"]["mimeType"] = record.get("mimeType")
-                            ext =  get_extension_from_mimetype(record.get("mimeType"))
+                            ext = get_extension_from_mimetype(record.get("mimeType"))
                             if ext:
                                 result["metadata"]["extension"] = ext
 
@@ -400,14 +457,13 @@ class RetrievalService:
                         if knowledge_search:
                             meta = result.get("metadata")
                             is_block_group = meta.get("isBlockGroup")
-                            if is_block_group is not None:
-                                if virtual_id not in virtual_record_id_to_record:
-                                    await get_record(virtual_id,virtual_record_id_to_record,self.blob_store,org_id,virtual_to_record_map)
-                                    record = virtual_record_id_to_record[virtual_id]
-                                    if record is None:
-                                        continue
-                                    new_type_results.append(result)
+                            if is_block_group is not None and virtual_id not in virtual_record_id_to_record:
+                                await get_record(virtual_id, virtual_record_id_to_record, self.blob_store, org_id, virtual_to_record_map)
+                                record = virtual_record_id_to_record[virtual_id]
+                                if record is None:
                                     continue
+                                new_type_results.append(result)
+                                continue
 
                 final_search_results.append(result)
 
@@ -458,7 +514,7 @@ class RetrievalService:
                     continue
 
                 weburl = None
-                fallback_mimetype= None
+                fallback_mimetype = None
                 if record_type == "file" and record_id in files_map:
                     files = files_map[record_id]
                     weburl = files.get("webUrl")
@@ -477,7 +533,7 @@ class RetrievalService:
 
                 if fallback_mimetype:
                     result["metadata"]["mimeType"] = fallback_mimetype
-                    fallback_ext =  get_extension_from_mimetype(fallback_mimetype)
+                    fallback_ext = get_extension_from_mimetype(fallback_mimetype)
                     if fallback_ext:
                         result["metadata"]["extension"] = fallback_ext
 
@@ -492,11 +548,11 @@ class RetrievalService:
 
             if new_type_results:
                 is_multimodal_llm = False   #doesn't matter for retrieval service
-                flattened_results = await get_flattened_results(new_type_results,self.blob_store,org_id,is_multimodal_llm,virtual_record_id_to_record,from_retrieval_service=True)
+                flattened_results = await get_flattened_results(new_type_results, self.blob_store, org_id, is_multimodal_llm, virtual_record_id_to_record, from_retrieval_service=True)
                 for result in flattened_results:
                     block_type = result.get("block_type")
-                    if block_type == GroupType.TABLE.value:
-                        _,child_results = result.get("content")
+                    if block_type == GroupType.TABLE.value or block_type in valid_group_labels:
+                        _, child_results = result.get("content")
                         for child in child_results:
                             final_search_results.append(child)
                     else:
@@ -509,7 +565,7 @@ class RetrievalService:
             )
 
             # Filter out incomplete results to prevent citation validation failures
-            required_fields = ['origin', 'recordName', 'recordId', 'mimeType',"orgId"]
+            required_fields = ['origin', 'recordName', 'recordId', 'mimeType', "orgId"]
             complete_results = []
 
             for result in final_search_results:
@@ -546,7 +602,7 @@ class RetrievalService:
             self.logger.error("VectorDBEmptyError")
             return self._create_empty_response(
                     "No records indexed yet. Please upload documents or enable connectors to index content",
-                    Status.EMPTY_RESPONSE if is_agent else Status.VECTOR_DB_EMPTY,
+                    Status.VECTOR_DB_EMPTY,
                 )
         except ValueError as e:
             self.logger.error(f"ValueError: {e}")
@@ -557,33 +613,20 @@ class RetrievalService:
                 return {}
             return self._create_empty_response("Unexpected server error during search.", Status.ERROR)
 
-    async def _get_accessible_records_task(self, user_id, org_id, filter_groups, graph_provider: IGraphDBProvider) -> list[dict[str, Any]]:
-        """Separate task for getting accessible records (legacy method - returns full records)"""
-        filter_groups = filter_groups or {}
-        filters = {}
-
-        if filter_groups:
-            for key, values in filter_groups.items():
-                metadata_key = key.lower()
-                filters[metadata_key] = values
-
-        return await graph_provider.get_accessible_records(
-            user_id=user_id, org_id=org_id, filters=filters
-        )
-
     async def _get_accessible_virtual_ids_task(
         self, user_id: str, org_id: str, filters: dict[str, list[str]], graph_provider: IGraphDBProvider
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """
-        Separate task for getting accessible virtualRecordIds (optimized version).
+        Separate task for getting accessible virtualRecordId -> recordId mapping (optimized version).
 
-        This is the optimized version that returns only virtualRecordIds instead of full records.
+        Returns a dict mapping each accessible virtualRecordId to the specific recordId that the
+        user has permission to access, preventing cross-connector leakage.
         """
         return await graph_provider.get_accessible_virtual_record_ids(
             user_id=user_id, org_id=org_id, filters=filters
         )
 
-    async def _get_user_cached(self, user_id: str) -> Optional[dict[str, Any]]:
+    async def _get_user_cached(self, user_id: str) -> dict[str, Any] | None:
         """
         OPTIMIZATION: Get user data with caching to avoid repeated DB calls.
         Cache expires after USER_CACHE_TTL seconds (default 5 minutes).
@@ -634,20 +677,19 @@ class RetrievalService:
         dense_embeddings = await self.get_embedding_model_instance()
         if not dense_embeddings:
             raise ValueError("No dense embeddings found")
-        if not self.sparse_embeddings:
+        sparse_embeddings = await self._ensure_sparse_embeddings()
+        if not sparse_embeddings:
             raise ValueError("No sparse embeddings found")
 
         # OPTIMIZATION: Parallelize dense and sparse embedding generation for multiple queries
         dense_tasks = [dense_embeddings.aembed_query(query) for query in queries]
         sparse_tasks = [
-            asyncio.to_thread(self.sparse_embeddings.embed_query, query) for query in queries
+            asyncio.to_thread(sparse_embeddings.embed_query, query) for query in queries
         ]
         dense_query_embeddings, sparse_query_embeddings = await asyncio.gather(
             asyncio.gather(*dense_tasks),
             asyncio.gather(*sparse_tasks),
         )
-
-
 
         query_requests = [
             models.QueryRequest(
@@ -670,7 +712,7 @@ class RetrievalService:
             )
             for dense_embedding, sparse_embedding in zip(dense_query_embeddings, sparse_query_embeddings)
         ]
-        search_results = self.vector_db_service.query_nearest_points(
+        search_results = await self.vector_db_service.query_nearest_points(
             collection_name=self.collection_name,
             requests=query_requests,
         )
@@ -681,7 +723,7 @@ class RetrievalService:
                     if point.id in seen_points:
                         continue
                     seen_points.add(point.id)
-                    metadata=point.payload.get("metadata", {})
+                    metadata = point.payload.get("metadata", {})
                     metadata.update({"point_id": point.id})
                     doc = Document(
                         page_content=point.payload.get("page_content", ""),
@@ -739,7 +781,6 @@ class RetrievalService:
                     if virtual_id not in virtual_to_records:
                         virtual_to_records[virtual_id] = []
                     virtual_to_records[virtual_id].append(record)
-
 
         # Create the final mapping using only the virtual record IDs from search results
         # Use the first record for each virtual record ID

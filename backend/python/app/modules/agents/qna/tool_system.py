@@ -13,11 +13,11 @@ Key features:
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
-
     from app.agents.tools.models import Tool
 
 from app.agents.tools.registry import _global_tools_registry
@@ -63,7 +63,7 @@ def _requires_sanitized_tool_names(llm: Optional['BaseChatModel']) -> bool:
         pass
 
     try:
-        from langchain_openai import ChatOpenAI, AzureChatOpenAI
+        from langchain_openai import AzureChatOpenAI, ChatOpenAI
         if isinstance(llm, (ChatOpenAI, AzureChatOpenAI)):
             return True
     except ImportError:
@@ -73,7 +73,6 @@ def _requires_sanitized_tool_names(llm: Optional['BaseChatModel']) -> bool:
 
     # Default to sanitized for safety — dots break most LLM function-calling APIs
     return True
-
 
 def _sanitize_tool_name_if_needed(tool_name: str, llm: Optional['BaseChatModel'], state: ChatState) -> str:
     """
@@ -100,7 +99,7 @@ class ToolLoader:
     """Clean tool loader with smart caching"""
 
     @staticmethod
-    def load_tools(state: ChatState) -> List[RegistryToolWrapper]:
+    def load_tools(state: ChatState) -> list[RegistryToolWrapper]:
         """
         Load tools with intelligent caching.
 
@@ -116,7 +115,7 @@ class ToolLoader:
         """
         state_logger = state.get("logger")
 
-        has_knowledge = bool(state.get("kb") or state.get("apps") or state.get("agent_knowledge"))
+        has_knowledge = state.get("has_knowledge", False)
 
         # Check cache validity
         cached_tools = state.get("_cached_agent_tools")
@@ -170,7 +169,7 @@ class ToolLoader:
         return all_tools
 
     @staticmethod
-    def get_tool_by_name(tool_name: str, state: ChatState) -> Optional[RegistryToolWrapper]:
+    def get_tool_by_name(tool_name: str, state: ChatState) -> RegistryToolWrapper | None:
         """Get specific tool by name"""
         registry_tools = _global_tools_registry.get_all_tools()
 
@@ -192,7 +191,65 @@ class ToolLoader:
 # Helper Functions
 # ============================================================================
 
-def _load_all_tools(state: ChatState, blocked_tools: Dict[str, int]) -> List[RegistryToolWrapper]:
+# Apps that let the LLM execute arbitrary user-controlled code on the host
+# (or in a sandbox container). These are *powerful* and must be gated behind
+# an explicit, opt-in deployment flag — otherwise any authenticated chat
+# user effectively has code-execution-as-a-service.
+_CODE_EXECUTION_APPS: frozenset[str] = frozenset({
+    "coding_sandbox",
+    "database_sandbox",
+})
+
+
+def _code_execution_enabled(state: ChatState) -> bool:
+    """Return whether this deployment/caller has access to code-execution tools.
+
+    Source of truth is the ``ENABLE_CODE_EXECUTION`` platform feature flag
+    managed from the admin **Labs** page. Defaults to ENABLED so the feature
+    works out of the box; admins disable it from the UI when desired.
+
+    Resolution order (first hit wins):
+
+    1. ``state["enable_code_execution"]`` — explicit per-request override
+       (bool). Lets callers force either on/off regardless of deployment
+       configuration.
+    2. ``PIPESHUB_ENABLE_CODE_EXECUTION`` env var — explicit deploy-level
+       override. Honoured only when set to a recognised truthy/falsy value;
+       unset or unrecognised values fall through.
+    3. ``FeatureFlagService`` — reads the ``ENABLE_CODE_EXECUTION`` flag from
+       the platform settings (etcd/kv store) populated by the Labs page.
+    4. Default: ``True``.
+    """
+    state_flag = state.get("enable_code_execution")
+    if isinstance(state_flag, bool):
+        return state_flag
+
+    import os as _os
+    env_val = _os.environ.get("PIPESHUB_ENABLE_CODE_EXECUTION")
+    if env_val is not None:
+        raw = env_val.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        # Unrecognised values fall through to the feature flag / default.
+
+    try:
+        from app.services.featureflag.config.config import CONFIG
+        from app.services.featureflag.featureflag import FeatureFlagService
+
+        return bool(
+            FeatureFlagService.get_service().is_feature_enabled(
+                CONFIG.ENABLE_CODE_EXECUTION, default=True
+            )
+        )
+    except Exception:
+        # If the feature flag subsystem is unavailable for any reason,
+        # fail open to the documented default.
+        return True
+
+
+def _load_all_tools(state: ChatState, blocked_tools: dict[str, int]) -> list[RegistryToolWrapper]:
     """
     Load all tools (internal + user toolsets).
 
@@ -232,8 +289,16 @@ def _load_all_tools(state: ChatState, blocked_tools: Dict[str, int]) -> List[Reg
     user_tools = []
 
     # Check if knowledge is configured - retrieval tool is only loaded when knowledge exists
-    agent_knowledge = state.get("agent_knowledge", [])
-    has_knowledge = bool(agent_knowledge)
+    has_knowledge = state.get("has_knowledge", False)
+
+    # SECURITY: Code-execution tools are opt-in. If the deployment has not
+    # enabled them, filter out coding_sandbox / database_sandbox completely
+    # so the LLM can never be tricked into running them.
+    code_exec_enabled = _code_execution_enabled(state)
+    if state_logger and not code_exec_enabled:
+        state_logger.info(
+            "Code-execution tools disabled (toggle in Labs → Enable Code Execution)"
+        )
 
     for full_name, registry_tool in registry_tools.items():
         try:
@@ -245,8 +310,16 @@ def _load_all_tools(state: ChatState, blocked_tools: Dict[str, int]) -> List[Reg
                     state_logger.warning(f"Blocking {full_name} (failed {blocked_tools[full_name]} times)")
                 continue
 
+            # SECURITY: Gate code-execution apps behind the opt-in flag.
+            if app_name.lower() in _CODE_EXECUTION_APPS and not code_exec_enabled:
+                if state_logger:
+                    state_logger.debug(
+                        f"Skipping code-execution tool {full_name} - disabled by deployment policy"
+                    )
+                continue
+
             # Skip retrieval tools when no knowledge is configured
-            is_retrieval = _is_retrieval_tool(full_name, registry_tool)
+            is_retrieval = _is_knowledge_dependent_tool(full_name, registry_tool)
             if is_retrieval and not has_knowledge:
                 if state_logger:
                     state_logger.debug(f"Skipping retrieval tool {full_name} - no knowledge configured")
@@ -260,11 +333,11 @@ def _load_all_tools(state: ChatState, blocked_tools: Dict[str, int]) -> List[Reg
                 is_internal = True
 
             # Check if user-enabled - ONLY exact matches, no toolset-level matching
-            is_user_enabled = False
-            if user_enabled_tools is not None:
+            is_user_enabled = (
+                user_enabled_tools is not None
                 # SECURITY: Only exact full name match - no toolset-level matching
-                if full_name in user_enabled_tools:
-                    is_user_enabled = True
+                and full_name in user_enabled_tools
+            )
 
             # Load tool if internal OR user-enabled
             if is_internal:
@@ -299,7 +372,7 @@ def _load_all_tools(state: ChatState, blocked_tools: Dict[str, int]) -> List[Reg
     return tools
 
 
-def _extract_tool_names_from_toolsets(agent_toolsets: List[Dict]) -> Optional[Set[str]]:
+def _extract_tool_names_from_toolsets(agent_toolsets: list[dict]) -> set[str] | None:
     """
     Extract tool names from agent's configured toolsets.
 
@@ -339,19 +412,20 @@ def _extract_tool_names_from_toolsets(agent_toolsets: List[Dict]) -> Optional[Se
     return tool_names if tool_names else None
 
 
-def _is_retrieval_tool(full_name: str, registry_tool: 'Tool') -> bool:
+def _is_knowledge_dependent_tool(full_name: str, registry_tool: 'Tool') -> bool:
     """
-    Check if a tool is a retrieval/RAG tool.
+    Check if a tool is a knowledge-dependent internal tool.
 
-    Retrieval tools should only be included when knowledge is configured.
+    These tools should only be included when knowledge is configured.
+    Includes both retrieval (semantic search) and knowledgehub (file browsing).
     """
     if hasattr(registry_tool, 'app_name'):
         app_name = str(registry_tool.app_name).lower()
-        if app_name == 'retrieval':
+        if app_name in ('retrieval', 'knowledgehub'):
             return True
 
-    retrieval_patterns = ["retrieval."]
-    return any(p in full_name.lower() for p in retrieval_patterns)
+    knowledge_patterns = ["retrieval.", "knowledgehub."]
+    return any(p in full_name.lower() for p in knowledge_patterns)
 
 
 def _is_internal_tool(full_name: str, registry_tool: 'Tool') -> bool:
@@ -359,7 +433,7 @@ def _is_internal_tool(full_name: str, registry_tool: 'Tool') -> bool:
     Check if tool is internal (always included).
 
     Internal tools are marked in registry with isInternal=True.
-    Note: Retrieval tools are handled separately via _is_retrieval_tool.
+    Note: Retrieval tools are handled separately via _is_knowledge_dependent_tool.
     """
     # Check registry metadata
     if hasattr(registry_tool, 'metadata'):
@@ -374,20 +448,29 @@ def _is_internal_tool(full_name: str, registry_tool: 'Tool') -> bool:
     # Check app name (retrieval is NOT always internal - depends on knowledge config)
     if hasattr(registry_tool, 'app_name'):
         app_name = str(registry_tool.app_name).lower()
-        if app_name in ['calculator', 'datetime', 'utility']:
+        if app_name in [
+            'calculator',
+            'datetime',
+            'utility',
+            'coding_sandbox',
+            'database_sandbox',
+            'image_generator',
+        ]:
             return True
 
     # Fallback patterns (retrieval excluded - handled separately based on knowledge)
     internal_patterns = [
         "calculator.",
-        "web_search",
+        "fetch_url",
         "get_current_datetime",
+        "image_generator.",
+        "web_search",
     ]
 
     return any(p in full_name.lower() for p in internal_patterns)
 
 
-def _get_blocked_tools(state: ChatState) -> Dict[str, int]:
+def _get_blocked_tools(state: ChatState) -> dict[str, int]:
     """Get tools that recently failed multiple times"""
     all_results = state.get("all_tool_results", [])
 
@@ -423,15 +506,57 @@ def _initialize_tool_state(state: ChatState) -> None:
 
 
 # ============================================================================
+# Web Tools (fetch_url + web_search)
+# ============================================================================
+
+def _create_web_tools(state: ChatState) -> list:
+    """Create fetch_url and (optionally) web_search tools.
+
+    - fetch_url: always included (implicit tool for all agents)
+    - web_search: only when agent has a webSearch provider attached
+    """
+    tools: list = []
+    state_logger = state.get("logger")
+
+    ref_mapper = state.get("citation_ref_mapper")
+    if ref_mapper is None:
+        from app.utils.chat_helpers import CitationRefMapper
+        ref_mapper = CitationRefMapper()
+        state["citation_ref_mapper"] = ref_mapper
+
+    try:
+        from app.utils.fetch_url_tool import create_fetch_url_tool
+           
+        fetch_url_tool = create_fetch_url_tool(
+            ref_mapper=ref_mapper,
+        )
+        tools.append(fetch_url_tool)
+    except Exception as e:
+        if state_logger:
+            state_logger.warning(f"Failed to create fetch_url tool: {e}")
+
+    web_search_config = state.get("web_search_config")
+    if web_search_config:
+        try:
+            from app.utils.web_search_tool import create_web_search_tool
+            web_search_tool = create_web_search_tool(config=web_search_config)
+            tools.append(web_search_tool)
+        except Exception as e:
+            if state_logger:
+                state_logger.warning(f"Failed to create web_search tool: {e}")
+
+    return tools
+
+
+# ============================================================================
 # Public API
 # ============================================================================
 
-def get_agent_tools(state: ChatState) -> List[RegistryToolWrapper]:
+def get_agent_tools(state: ChatState) -> list[RegistryToolWrapper]:
     """
     Get all agent tools (cached).
 
     Returns internal tools + user's configured toolset tools.
-    Also adds dynamic tools like fetch_full_record_tool.
     """
     tools = ToolLoader.load_tools(state)
 
@@ -439,13 +564,13 @@ def get_agent_tools(state: ChatState) -> List[RegistryToolWrapper]:
     virtual_record_map = state.get("virtual_record_id_to_result", {})
     if virtual_record_map:
         try:
-            from app.utils.agent_fetch_full_record import (
-                create_agent_fetch_full_record_tool,
+            from app.utils.fetch_full_record import (
+                create_fetch_full_record_tool,
             )
-            record_label_to_uuid_map = state.get("record_label_to_uuid_map", {})
-            fetch_tool = create_agent_fetch_full_record_tool(
+            fetch_tool = create_fetch_full_record_tool(
                 virtual_record_map,
-                label_to_virtual_record_id=record_label_to_uuid_map if record_label_to_uuid_map else None,
+                org_id=state.get("org_id", ""),
+                graph_provider=state.get("graph_provider"),
             )
             tools.append(fetch_tool)
 
@@ -460,7 +585,7 @@ def get_agent_tools(state: ChatState) -> List[RegistryToolWrapper]:
     return tools
 
 
-def get_tool_by_name(tool_name: str, state: ChatState) -> Optional[RegistryToolWrapper]:
+def get_tool_by_name(tool_name: str, state: ChatState) -> RegistryToolWrapper | None:
     """Get specific tool by name"""
     return ToolLoader.get_tool_by_name(tool_name, state)
 
@@ -516,7 +641,7 @@ def get_tool_results_summary(state: ChatState) -> str:
 # Modern Tool System with Pydantic Schemas (for ReAct Agent)
 # ============================================================================
 
-def get_agent_tools_with_schemas(state: ChatState) -> List:
+def get_agent_tools_with_schemas(state: ChatState) -> list:
     """
     Convert registry tools to StructuredTools with Pydantic schemas.
 
@@ -568,6 +693,35 @@ def get_agent_tools_with_schemas(state: ChatState) -> List:
         if state_logger:
             state_logger.debug(f"get_agent_tools_with_schemas: received {len(registry_tools)} tools from get_agent_tools")
 
+        def _make_async_tool_func(wrapper: RegistryToolWrapper) -> Callable:
+            """Create an async wrapper function that calls tool_wrapper.arun().
+
+            Normalises the return value into a string suitable for a
+            ``ToolMessage``:
+
+            * Unwrap real Python ``(success, data)`` tuples — tools in this
+              codebase use that convention. Do NOT unwrap ``list`` because a
+              tool genuinely returning a 2-element list would be corrupted.
+            * If the resulting value is already a ``str``, pass it through.
+            * If it is a ``dict`` or ``list``, JSON-encode it so the LLM
+              sees proper JSON rather than Python ``repr`` (``{'a': 1}``).
+            * Otherwise fall back to ``str()``.
+            """
+            async def _async_tool_func(**kwargs: object) -> str:
+                result = await wrapper.arun(kwargs)
+                if isinstance(result, tuple) and len(result) == 2:
+                    _success, result = result
+                if isinstance(result, str):
+                    return result
+                if isinstance(result, (dict, list)):
+                    try:
+                        import json as _json
+                        return _json.dumps(result, default=str)
+                    except (TypeError, ValueError):
+                        return str(result)
+                return str(result)
+            return _async_tool_func
+
         for tool_wrapper in registry_tools:
             try:
                 registry_tool = tool_wrapper.registry_tool
@@ -579,19 +733,8 @@ def get_agent_tools_with_schemas(state: ChatState) -> List:
                 original_tool_name = tool_wrapper.name
                 sanitized_tool_name = _sanitize_tool_name_if_needed(original_tool_name, llm, state)
 
-                # Create an async wrapper function that calls tool_wrapper.arun()
-                # This ensures proper async execution in the same event loop as FastAPI
-                def make_async_tool_func(wrapper: RegistryToolWrapper) -> Callable:
-                    async def async_tool_func(**kwargs) -> Union[Tuple[bool, str], str, Dict[str, Any], List[Any]]:
-                        """Async tool function that wraps RegistryToolWrapper.arun()"""
-                        # Call arun with kwargs as a dict (arun handles both formats)
-                        result = await wrapper.arun(kwargs)
-                        # Return result as-is to preserve tuple format (bool, str) if present
-                        # The tool executor in nodes.py will handle both tuple and string formats
-                        return result
-                    return async_tool_func
-
-                async_tool_func = make_async_tool_func(tool_wrapper)
+                # Create an async wrapper that ensures proper execution in the same event loop as FastAPI
+                async_tool_func = _make_async_tool_func(tool_wrapper)
 
                 # Create StructuredTool with schema if available
                 # Explicitly mark as coroutine to ensure LangChain handles it correctly
@@ -627,19 +770,19 @@ def get_agent_tools_with_schemas(state: ChatState) -> List:
         if state_logger:
             state_logger.debug(f"get_agent_tools_with_schemas: returning {len(structured_tools)} structured tools")
             tool_names = [getattr(t, 'name', str(t)) for t in structured_tools]
-            state_logger.debug(f"Structured tool names: {tool_names[:10]}")
+            state_logger.debug(f"Structured tool names: {tool_names[:12]}")
 
         # Add dynamic agent fetch_full_record tool
         virtual_record_map = state.get("virtual_record_id_to_result", {})
         if virtual_record_map:
             try:
-                from app.utils.agent_fetch_full_record import (
-                    create_agent_fetch_full_record_tool,
+                from app.utils.fetch_full_record import (
+                    create_fetch_full_record_tool,
                 )
-                record_label_to_uuid_map = state.get("record_label_to_uuid_map", {})
-                fetch_tool = create_agent_fetch_full_record_tool(
+                fetch_tool = create_fetch_full_record_tool(
                     virtual_record_map,
-                    label_to_virtual_record_id=record_label_to_uuid_map if record_label_to_uuid_map else None,
+                    org_id=state.get("org_id", ""),
+                    graph_provider=state.get("graph_provider"),
                 )
                 structured_tools.append(fetch_tool)
 
@@ -650,6 +793,42 @@ def get_agent_tools_with_schemas(state: ChatState) -> List:
                 state_logger = state.get("logger")
                 if state_logger:
                     state_logger.warning(f"Failed to add agent fetch_full_record tool: {e}")
+
+        config_service = state.get("config_service")
+        if config_service and state.get("has_sql_connector") and state.get("has_sql_knowledge"):
+            try:
+                from app.utils.execute_query import create_execute_query_tool
+                graph_provider = state.get("graph_provider")
+                org_id = state.get("org_id")
+                conversation_id = state.get("conversation_id")
+                blob_store = state.get("blob_store")
+                execute_query_tool = create_execute_query_tool(
+                    config_service=config_service,
+                    graph_provider=graph_provider,
+                    org_id=org_id,
+                    conversation_id=conversation_id,
+                    blob_store=blob_store,
+                )
+
+                setattr(execute_query_tool, "_original_name", "sql.execute_sql_query")
+                structured_tools.append(execute_query_tool)
+                state_logger = state.get("logger")
+                if state_logger:
+                    state_logger.debug("✅ Added execute_sql_query_tool for database queries")
+            except Exception as e:
+                state_logger = state.get("logger")
+                if state_logger:
+                    state_logger.warning(f"Failed to add execute_sql_query_tool: {e}")
+        # Add web tools (fetch_url always, web_search if agent has it configured)
+        try:
+            web_tools = _create_web_tools(state)
+            structured_tools.extend(web_tools)
+            if state_logger and web_tools:
+                web_tool_names = [getattr(t, 'name', str(t)) for t in web_tools]
+                state_logger.debug(f"Added web tools: {web_tool_names}")
+        except Exception as e:
+            if state_logger:
+                state_logger.warning(f"Failed to add web tools: {e}")
 
         # Cache the StructuredTools for reuse
         state["_cached_schema_tools"] = structured_tools

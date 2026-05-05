@@ -1,4 +1,4 @@
-from typing import Optional
+import logging
 from uuid import uuid4
 
 from app.config.constants.arangodb import (
@@ -9,6 +9,7 @@ from app.config.constants.arangodb import (
 )
 from app.connectors.core.base.event_service.event_service import BaseEventService
 from app.connectors.core.factory.connector_factory import ConnectorFactory
+from app.connectors.core.sync.task_manager import sync_task_manager
 from app.containers.connector import (
     ConnectorAppContainer,
 )
@@ -17,9 +18,12 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
 class EntityEventService(BaseEventService):
-    def __init__(self, logger,
-                graph_provider: IGraphDBProvider,
-                app_container: ConnectorAppContainer) -> None:
+    def __init__(
+        self,
+        logger: logging.Logger,
+        graph_provider: IGraphDBProvider,
+        app_container: ConnectorAppContainer,
+    ) -> None:
         self.logger = logger
         self.graph_provider = graph_provider
         self.app_container = app_container
@@ -135,6 +139,9 @@ class EntityEventService(BaseEventService):
 
             # Automatically create Knowledge Base connector instance for the new org
             await self.__create_kb_connector_app_instance(payload['orgId'], payload.get('userId'))
+
+            # Create "All" team for the org (first user will be added with OWNER in userAdded)
+            await self.__create_all_team_for_org(payload['orgId'], payload.get('userId'))
 
             return True
 
@@ -269,6 +276,9 @@ class EntityEventService(BaseEventService):
             # Create user-app relation edge for KB app
             await self.__create_user_kb_app_relation(user_key, payload["orgId"])
 
+            # Get or create "All" team for org and add user with PERMISSION edge
+            await self.__get_or_create_all_team_and_add_user(payload["orgId"], user_key)
+
             # Only proceed with app connections if syncAction is 'immediate'
             if payload["syncAction"] == "immediate":
                 # Get all apps associated with the org
@@ -395,6 +405,7 @@ class EntityEventService(BaseEventService):
             sync_action = payload.get("syncAction", "none")
             connector_id = payload.get("connectorId", "")
             scope = payload.get("scope", ConnectorScopes.PERSONAL.value)
+            full_sync = payload.get("fullSync", False)
             # Get org details to check account type
             org = await self.graph_provider.get_document(
                 org_id, CollectionNames.ORGS.value
@@ -410,9 +421,10 @@ class EntityEventService(BaseEventService):
                         event_type=f"{app_name.lower()}.start",
                         value={
                             "orgId": org_id,
-                            "connector":app_name,
-                            "connectorId":connector_id,
+                            "connector": app_name,
+                            "connectorId": connector_id,
                             "scope": scope,
+                            "fullSync": full_sync,
                         },
                     )
 
@@ -462,6 +474,13 @@ class EntityEventService(BaseEventService):
                 app_updates, CollectionNames.APPS.value
             )
 
+            # Cancel any running sync task so it stops promptly
+            try:
+                await sync_task_manager.cancel_sync(connector_id)
+                self.logger.info(f"✅ Cancelled running sync for connector {connector_id}")
+            except Exception as cancel_err:
+                self.logger.error(f"❌ Failed to cancel sync for connector {connector_id}: {cancel_err}")
+
             self.logger.info(f"✅ Successfully disabled apps for org: {org_id}")
             return True
 
@@ -478,6 +497,45 @@ class EntityEventService(BaseEventService):
         if email:
             return f"{email}'s Private"
         return "Private"
+
+    async def __create_all_team_for_org(self, org_id: str, created_by_user_id: str | None = None) -> None:
+        """
+        Create the "All" team when an org is created. Called from __handle_org_created.
+        created_by_user_id is the external userId (e.g. MongoDB id); graph user key is set when first user is added.
+        """
+        try:
+            current_timestamp = get_epoch_timestamp_in_ms()
+            team_key = f"all_{org_id}"
+            created_by = created_by_user_id if created_by_user_id else "system"
+            team_node = {
+                "id": team_key,
+                "name": "All",
+                "description": "All organization members",
+                "createdBy": created_by,
+                "orgId": org_id,
+                "createdAtTimestamp": current_timestamp,
+                "updatedAtTimestamp": current_timestamp,
+            }
+            await self.graph_provider.batch_upsert_nodes(
+                [team_node], CollectionNames.TEAMS.value
+            )
+            self.logger.info(f"Created 'All' team for org {org_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to create 'All' team for org {org_id}: {str(e)}", exc_info=True)
+
+    async def __get_or_create_all_team_and_add_user(self, org_id: str, user_key: str) -> None:
+        """
+        Add the specific user to the org's "All" team.
+        Ensures team exists and creates PERMISSION edge for this user only.
+        """
+        try:
+            await self.graph_provider.add_user_to_all_team(org_id, user_key)
+            self.logger.info(f"Added user {user_key} to 'All' team for org {org_id}")
+        except Exception as e:
+            self.logger.error(
+                f"Failed to add user {user_key} to 'All' team for org {org_id}: {str(e)}",
+                exc_info=True
+            )
 
     async def __get_or_create_knowledge_base(
         self,
@@ -572,7 +630,7 @@ class EntityEventService(BaseEventService):
             self.logger.error(f"Failed to get or create knowledge base: {str(e)}")
             return {}
 
-    async def __create_kb_connector_app_instance(self, org_id: str, created_by_user_id: Optional[str] = None) -> Optional[dict]:
+    async def __create_kb_connector_app_instance(self, org_id: str, created_by_user_id: str | None = None) -> dict | None:
         """
         Automatically create a Knowledge Base connector instance when an org is created.
 
@@ -671,12 +729,18 @@ class EntityEventService(BaseEventService):
             if not hasattr(self.app_container, 'connectors_map'):
                 self.logger.info(f"Creating connectors_map for org: {org_id}")
                 self.app_container.connectors_map = {}
+
+            scope = instance_document.get("scope", "personal")
+            created_by = instance_document.get("createdBy", "")
+
             connector = await ConnectorFactory.create_and_start_sync(
                 name="kb",
                 logger=self.logger,
                 data_store_provider=data_store_provider,
                 config_service=config_service,
                 connector_id=instance_key,
+                scope=scope,
+                created_by=created_by,
             )
             if connector:
                 self.app_container.connectors_map[instance_key] = connector
@@ -695,7 +759,7 @@ class EntityEventService(BaseEventService):
             # Don't fail org creation if KB connector creation fails
             return None
 
-    async def __get_or_create_kb_app_for_org(self, org_id: str, created_by_user_id: Optional[str] = None) -> Optional[dict]:
+    async def __get_or_create_kb_app_for_org(self, org_id: str, created_by_user_id: str | None = None) -> dict | None:
         """
         Get or create a Knowledge Base connector instance for an org.
 
@@ -721,8 +785,7 @@ class EntityEventService(BaseEventService):
 
             # Create KB app if it doesn't exist
             self.logger.info(f"KB app not found for org {org_id}, creating one...")
-            new_kb_app = await self.__create_kb_connector_app_instance(org_id, created_by_user_id)
-            return new_kb_app
+            return await self.__create_kb_connector_app_instance(org_id, created_by_user_id)
 
         except Exception as e:
             self.logger.error(f"❌ Error getting or creating KB app for org {org_id}: {str(e)}")

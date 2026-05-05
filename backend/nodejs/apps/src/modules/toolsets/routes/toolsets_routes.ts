@@ -43,6 +43,14 @@ import {
   listToolsetOAuthConfigs,
   updateToolsetOAuthConfig,
   deleteToolsetOAuthConfig,
+  updateUserToolsetInstance,
+  // Agent-scoped toolset management
+  getAgentToolsets,
+  authenticateAgentToolset,
+  updateAgentToolsetCredentials,
+  removeAgentToolsetCredentials,
+  reauthenticateAgentToolset,
+  getAgentToolsetOAuthUrl,
 } from '../controller/toolsets_controller';
 
 // ============================================================================
@@ -163,6 +171,83 @@ const handleOAuthCallbackSchema = z.object({
     state: z.string().optional(),
     error: z.string().optional(),
     base_url: z.string().optional(),
+  }),
+});
+
+/**
+ * Schema for updating user's credentials for a non-OAuth toolset instance
+ */
+const updateUserToolsetInstanceSchema = z.object({
+  body: z.object({
+    auth: z.object({
+      email: z.string().optional(),
+      apiToken: z.string().optional(),
+      username: z.string().optional(),
+      password: z.string().optional(),
+    }),
+  }),
+  params: z.object({
+    instanceId: z.string().min(1, 'Instance ID is required'),
+  }),
+});
+
+/**
+ * Schema for updating agent's credentials for a toolset instance.
+ * Auth fields are toolset-schema-defined (dynamic keys); do not restrict to a fixed set.
+ */
+const updateAgentToolsetInstanceSchema = z.object({
+  body: z.object({
+    auth: z.record(z.string(), z.any()),
+  }),
+  params: z.object({
+    instanceId: z.string().min(1, 'Instance ID is required'),
+    agentKey: z.string().min(1, 'Agent Key is required'),
+  }),
+});
+
+
+/**
+ * Schema for getting my toolsets.
+ * HTTP query params always arrive as strings, so numeric fields must be
+ * coerced and boolean fields preprocessed — identical to toolsetListSchema.
+ */
+const getMyToolsetsSchema = z.object({
+  query: z.object({
+    page: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().int().min(1))
+      .optional(),
+    limit: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().int().min(1).max(200))
+      .optional(),
+    search: z.string().optional(),
+    includeRegistry: z
+      .preprocess((arg) => arg === 'true', z.boolean())
+      .optional(),
+    /** When set, only instances for this toolset type (forwarded to Python). */
+    toolsetType: z.string().optional(),
+    authStatus: z
+      .enum(['authenticated', 'not-authenticated'])
+      .optional(),
+  }),
+});
+
+/**
+ * Schema for getting agent-scoped toolsets (service account agents).
+ * Same pagination/search/registry options as my-toolsets; no authStatus filter on agent list.
+ */
+const getAgentToolsetsSchema = z.object({
+  query: z.object({
+    page: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().int().min(1))
+      .optional(),
+    limit: z
+      .preprocess((arg) => (arg === '' || arg === undefined ? undefined : Number(arg)), z.number().int().min(1).max(200))
+      .optional(),
+    search: z.string().optional(),
+    includeRegistry: z
+      .preprocess((arg) => arg === 'true', z.boolean())
+      .optional(),
+    toolsetType: z.string().optional(),
   }),
 });
 
@@ -350,6 +435,7 @@ export function createToolsetsRouter(container: Container): Router {
     '/my-toolsets',
     authMiddleware.authenticate,
     metricsMiddleware(container),
+    ValidationMiddleware.validate(getMyToolsetsSchema),
     getMyToolsets(config)
   );
 
@@ -420,6 +506,19 @@ export function createToolsetsRouter(container: Container): Router {
     authenticateToolsetInstance(config)
   );
 
+
+  /**
+   * PUT /instances/:instanceId/credentials
+   *  Update user's credentials for an instance (non-OAuth: API token, bearer, username/password)
+   */
+  router.put(
+    '/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(updateUserToolsetInstanceSchema),
+    updateUserToolsetInstance(config) // Reuse the same controller for both create and update of credentials 
+  );
+  
   /**
    * DELETE /instances/:instanceId/credentials
    * Remove user's credentials for an instance
@@ -496,6 +595,80 @@ export function createToolsetsRouter(container: Container): Router {
     authMiddleware.authenticate,
     metricsMiddleware(container),
     deleteToolsetOAuthConfig(config)
+  );
+
+  // ============================================================================
+  // Agent-Scoped Toolset Routes (Service Account Agents)
+  // ============================================================================
+
+  /**
+   * GET /agents/:agentKey
+   * Get all toolset instances with auth status for a service account agent.
+   * Requires the requesting user to have edit access to the agent.
+   */
+  router.get(
+    '/agents/:agentKey',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(getAgentToolsetsSchema),
+    getAgentToolsets(config)
+  );
+
+  /**
+   * POST /agents/:agentKey/instances/:instanceId/authenticate
+   * Authenticate a toolset instance on behalf of a service account agent
+   * (non-OAuth: API token, bearer, username/password).
+   */
+  router.post(
+    '/agents/:agentKey/instances/:instanceId/authenticate',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    authenticateAgentToolset(config)
+  );
+
+  /**
+   * PUT /agents/:agentKey/instances/:instanceId/credentials
+   * Update credentials for a toolset instance on behalf of a service account agent.
+   */
+  router.put(
+    '/agents/:agentKey/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(updateAgentToolsetInstanceSchema),
+    updateAgentToolsetCredentials(config)
+  );
+
+  /**
+   * DELETE /agents/:agentKey/instances/:instanceId/credentials
+   * Remove credentials for a toolset instance on behalf of a service account agent.
+   */
+  router.delete(
+    '/agents/:agentKey/instances/:instanceId/credentials',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    removeAgentToolsetCredentials(config)
+  );
+
+  /**
+   * POST /agents/:agentKey/instances/:instanceId/reauthenticate
+   * Clear agent's OAuth tokens for an instance, forcing re-authentication.
+   */
+  router.post(
+    '/agents/:agentKey/instances/:instanceId/reauthenticate',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    reauthenticateAgentToolset(config)
+  );
+
+  /**
+   * GET /agents/:agentKey/instances/:instanceId/oauth/authorize
+   * Get OAuth authorization URL for a toolset instance scoped to a service account agent.
+   */
+  router.get(
+    '/agents/:agentKey/instances/:instanceId/oauth/authorize',
+    authMiddleware.authenticate,
+    metricsMiddleware(container),
+    getAgentToolsetOAuthUrl(config)
   );
 
   return router;

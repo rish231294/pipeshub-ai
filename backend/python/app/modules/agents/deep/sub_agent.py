@@ -19,22 +19,29 @@ Complex tasks use a phased execution model:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
-from langgraph.types import StreamWriter
 
 from app.modules.agents.deep.context_manager import build_sub_agent_context
 from app.modules.agents.deep.prompts import SUB_AGENT_SYSTEM_PROMPT
 from app.modules.agents.deep.state import DeepAgentState, SubAgentTask, _opik_tracer
 from app.modules.agents.deep.tool_router import get_tools_for_sub_agent
 from app.modules.agents.qna.stream_utils import safe_stream_write, send_keepalive
+from app.utils.time_conversion import build_llm_time_context
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
+    from uuid import UUID
+
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.types import StreamWriter
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +91,7 @@ async def execute_sub_agents_node(
         },
     }, config)
 
-    completed: List[SubAgentTask] = list(state.get("completed_tasks", []))
+    completed: list[SubAgentTask] = list(state.get("completed_tasks", []))
 
     # ------------------------------------------------------------------
     # Pre-warm API clients for all domains in parallel.
@@ -99,7 +106,7 @@ async def execute_sub_agents_node(
     # Each task gets an asyncio.Event that is set when the task finishes.
     # Dependent tasks await their dependencies' events, then execute.
     # ------------------------------------------------------------------
-    task_events: Dict[str, asyncio.Event] = {}
+    task_events: dict[str, asyncio.Event] = {}
 
     # Already-completed tasks (from prior aggregator iterations) are done
     for t in completed:
@@ -211,7 +218,7 @@ async def execute_sub_agents_node(
 async def _execute_single_sub_agent(
     task: SubAgentTask,
     state: DeepAgentState,
-    completed_tasks: List[SubAgentTask],
+    completed_tasks: list[SubAgentTask],
     config: RunnableConfig,
     writer: StreamWriter,
     log: logging.Logger,
@@ -254,6 +261,23 @@ async def _execute_single_sub_agent(
     # would summarize the raw blocks, losing detail needed for citations.
     is_retrieval_task = any(d in ("retrieval", "knowledge") for d in task_domains)
 
+    # Multi-step takes priority over complex: it executes sequential steps
+    # where each step's result feeds the next (e.g., find space → list pages
+    # → fetch content). Complex phased execution is for bulk fetch+summarize
+    # with no inter-step dependencies.
+    if task.get("multi_step") and task.get("sub_steps"):
+        log.info("Sub-agent %s: using multi-step execution (%d steps)", task_id, len(task["sub_steps"]))
+        try:
+            return await _execute_multi_step_sub_agent(
+                task, state, completed_tasks, config, writer, log,
+            )
+        except Exception as e:
+            log.warning(
+                "Multi-step execution failed for %s: %s — falling back to simple mode",
+                task_id, e,
+            )
+            # Fall through to simple execution
+
     if complexity == "complex" and not is_retrieval_task:
         log.info("Sub-agent %s: using complex phased execution", task_id)
         try:
@@ -272,19 +296,6 @@ async def _execute_single_sub_agent(
             "(respond node handles citation pipeline)", task_id,
         )
 
-    if task.get("multi_step") and task.get("sub_steps"):
-        log.info("Sub-agent %s: using multi-step execution (%d steps)", task_id, len(task["sub_steps"]))
-        try:
-            return await _execute_multi_step_sub_agent(
-                task, state, completed_tasks, config, writer, log,
-            )
-        except Exception as e:
-            log.warning(
-                "Multi-step execution failed for %s: %s — falling back to simple mode",
-                task_id, e,
-            )
-            # Fall through to simple execution
-
     return await _execute_simple_sub_agent(
         task, state, completed_tasks, config, writer, log,
     )
@@ -293,7 +304,7 @@ async def _execute_single_sub_agent(
 async def _execute_simple_sub_agent(
     task: SubAgentTask,
     state: DeepAgentState,
-    completed_tasks: List[SubAgentTask],
+    completed_tasks: list[SubAgentTask],
     config: RunnableConfig,
     writer: StreamWriter,
     log: logging.Logger,
@@ -340,6 +351,11 @@ async def _execute_simple_sub_agent(
         budget = _ToolCallBudget(max_calls)
         tools = _wrap_tools_with_budget(tools, budget, log)
 
+        # For retrieval tasks, strip final_results from what the LLM sees in its context
+        # window. Raw blocks from multiple retrieval calls accumulate to millions of tokens.
+        if is_retrieval:
+            tools = _wrap_retrieval_tools_for_context_efficiency(tools, state, log)
+
         # Build tool schemas description for the system prompt
         tool_schemas_text = _format_tools_for_prompt(tools, log)
 
@@ -347,13 +363,10 @@ async def _execute_simple_sub_agent(
         tool_guidance = _build_sub_agent_tool_guidance(task, state)
 
         # Build time context
-        time_ctx = ""
-        current_time = state.get("current_time")
-        timezone = state.get("timezone")
-        if current_time:
-            time_ctx += f"Current time: {current_time}"
-        if timezone:
-            time_ctx += f"\nTimezone: {timezone}"
+        time_ctx = build_llm_time_context(
+            current_time=state.get("current_time"),
+            time_zone=state.get("timezone"),
+        )
 
         # Build agent instructions prefix
         agent_instructions = _build_sub_agent_instructions(state)
@@ -361,6 +374,7 @@ async def _execute_simple_sub_agent(
         # Build system prompt
         system_prompt = SUB_AGENT_SYSTEM_PROMPT.format(
             task_description=task_desc,
+            task_scope_block=_format_task_scope_block(task),
             task_context=context_text,
             tool_schemas=tool_schemas_text or "No tool schemas available.",
             tool_guidance=tool_guidance,
@@ -404,6 +418,8 @@ async def _execute_simple_sub_agent(
             "callbacks": callbacks,
         }
 
+        _rebind_tool_state(tools, state)
+
         # Execute — no wall-clock timeout for deep agent; tool call budget
         # (_ToolCallBudget) stops the agent after _MAX_TOOL_CALLS_PER_AGENT calls.
         # Keepalive prevents proxy/nginx from closing the SSE connection during
@@ -415,10 +431,8 @@ async def _execute_simple_sub_agent(
             result = await agent.ainvoke({"messages": messages}, config=agent_config)
         finally:
             keepalive_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await keepalive_task
-            except asyncio.CancelledError:
-                pass
 
         # Extract results
         final_messages = result.get("messages", [])
@@ -471,7 +485,7 @@ async def _execute_simple_sub_agent(
 async def _execute_complex_sub_agent(
     task: SubAgentTask,
     state: DeepAgentState,
-    completed_tasks: List[SubAgentTask],
+    completed_tasks: list[SubAgentTask],
     config: RunnableConfig,
     writer: StreamWriter,
     log: logging.Logger,
@@ -531,13 +545,10 @@ async def _execute_complex_sub_agent(
     tool_guidance = _build_sub_agent_tool_guidance(task, state)
 
     # Build time context
-    time_ctx = ""
-    current_time = state.get("current_time")
-    timezone = state.get("timezone")
-    if current_time:
-        time_ctx += f"Current time: {current_time}"
-    if timezone:
-        time_ctx += f"\nTimezone: {timezone}"
+    time_ctx = build_llm_time_context(
+        current_time=state.get("current_time"),
+        time_zone=state.get("timezone"),
+    )
 
     agent_instructions = _build_sub_agent_instructions(state)
 
@@ -557,6 +568,7 @@ async def _execute_complex_sub_agent(
 
     system_prompt = SUB_AGENT_SYSTEM_PROMPT.format(
         task_description=augmented_desc,
+        task_scope_block=_format_task_scope_block(task),
         task_context=context_text,
         tool_schemas=tool_schemas_text or "No tool schemas available.",
         tool_guidance=tool_guidance,
@@ -596,6 +608,8 @@ async def _execute_complex_sub_agent(
         "callbacks": complex_callbacks,
     }
 
+    _rebind_tool_state(tools, state)
+
     # Execute — no wall-clock timeout for deep agent; tool call budget
     # (_ToolCallBudget) stops the agent after _MAX_TOOL_CALLS_COMPLEX calls.
     # Keepalive prevents proxy/nginx from closing the SSE connection during
@@ -607,10 +621,8 @@ async def _execute_complex_sub_agent(
         result = await agent.ainvoke({"messages": messages}, config=agent_config)
     finally:
         keepalive_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await keepalive_task
-        except asyncio.CancelledError:
-            pass
 
     final_messages = result.get("messages", [])
     tool_results = _extract_tool_results(final_messages, state, log)
@@ -703,10 +715,8 @@ async def _execute_complex_sub_agent(
         batch_summaries = await asyncio.gather(*summarize_coros, return_exceptions=True)
     finally:
         keepalive_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await keepalive_task
-        except asyncio.CancelledError:
-            pass
 
     # Filter out failures
     valid_summaries = []
@@ -753,10 +763,8 @@ async def _execute_complex_sub_agent(
         )
     finally:
         keepalive_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await keepalive_task
-        except asyncio.CancelledError:
-            pass
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     consolidate_duration = duration_ms - fetch_duration - summarize_duration
@@ -793,7 +801,7 @@ _MAX_TOOL_CALLS_PER_STEP = 10  # per sub-sub-agent step
 async def _execute_multi_step_sub_agent(
     task: SubAgentTask,
     state: DeepAgentState,
-    completed_tasks: List[SubAgentTask],
+    completed_tasks: list[SubAgentTask],
     config: RunnableConfig,
     writer: StreamWriter,
     log: logging.Logger,
@@ -842,13 +850,10 @@ async def _execute_multi_step_sub_agent(
     tool_guidance = _build_sub_agent_tool_guidance(task, state)
     agent_instructions = _build_sub_agent_instructions(state)
 
-    time_ctx = ""
-    current_time = state.get("current_time")
-    timezone = state.get("timezone")
-    if current_time:
-        time_ctx += f"Current time: {current_time}"
-    if timezone:
-        time_ctx += f"\nTimezone: {timezone}"
+    time_ctx = build_llm_time_context(
+        current_time=state.get("current_time"),
+        time_zone=state.get("timezone"),
+    )
 
     # Execute each step sequentially, accumulating results
     all_tool_results = []
@@ -885,6 +890,7 @@ async def _execute_multi_step_sub_agent(
 
         system_prompt = MINI_ORCHESTRATOR_PROMPT.format(
             task_description=task_desc,
+            task_scope_block=_format_task_scope_block(task),
             sub_steps=steps_text,
             tool_schemas=tool_schemas_text or "No tool schemas available.",
             task_context=step_context,
@@ -896,6 +902,9 @@ async def _execute_multi_step_sub_agent(
         # Wrap tools with budget for this step
         budget = _ToolCallBudget(_MAX_TOOL_CALLS_PER_STEP)
         step_tools = _wrap_tools_with_budget(tools, budget, log)
+        step_is_retrieval = any(d in ("retrieval", "knowledge") for d in task.get("domains", []))
+        if step_is_retrieval:
+            step_tools = _wrap_retrieval_tools_for_context_efficiency(step_tools, state, log)
 
         try:
             from langchain.agents import create_agent
@@ -921,6 +930,8 @@ async def _execute_multi_step_sub_agent(
                 "callbacks": callbacks,
             }
 
+            _rebind_tool_state(tools, state)
+
             # No wall-clock timeout — budget per step limits tool calls.
             # Keepalive prevents proxy timeout during each step's execution.
             keepalive_task = asyncio.create_task(
@@ -933,10 +944,8 @@ async def _execute_multi_step_sub_agent(
                 result = await agent.ainvoke({"messages": messages}, config=agent_config)
             finally:
                 keepalive_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await keepalive_task
-                except asyncio.CancelledError:
-                    pass
 
             final_messages = result.get("messages", [])
             response_text = _extract_response(final_messages, log)
@@ -992,7 +1001,7 @@ async def _execute_multi_step_sub_agent(
 # Result extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_response(messages: List, log: logging.Logger) -> str:
+def _extract_response(messages: list, log: logging.Logger) -> str:
     """Extract the final text response from agent messages.
 
     Falls back to summarizing tool results if no final text AIMessage exists,
@@ -1053,12 +1062,32 @@ def _extract_response(messages: List, log: logging.Logger) -> str:
 
 
 def _extract_tool_results(
-    messages: List,
+    messages: list,
     state: DeepAgentState,
     log: logging.Logger,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Extract tool results from agent messages and process retrieval outputs."""
     tool_results = []
+
+    # Process full retrieval results stored in the deep retrieval buffer.
+    # These were stripped from ToolMessages to prevent context explosion —
+    # _wrap_retrieval_tools_for_context_efficiency saves them here while only
+    # returning a compact summary to the LangGraph react agent.
+    deep_buffer = state.pop("_deep_retrieval_buffer", None)
+    if deep_buffer:
+        for full_result in deep_buffer:
+            try:
+                from app.modules.agents.qna.nodes import _process_retrieval_output
+                if isinstance(full_result, str):
+                    try:
+                        parsed = json.loads(full_result)
+                        _process_retrieval_output(parsed, state, log)
+                    except json.JSONDecodeError:
+                        _process_retrieval_output(full_result, state, log)
+                elif isinstance(full_result, dict):
+                    _process_retrieval_output(full_result, state, log)
+            except Exception as e:
+                log.warning("Failed to process buffered retrieval output: %s", e)
 
     for msg in messages:
         if not isinstance(msg, ToolMessage):
@@ -1067,8 +1096,17 @@ def _extract_tool_results(
         tool_name = msg.name if hasattr(msg, "name") else "unknown"
         result_content = msg.content
 
-        # Process retrieval results to extract final_results
-        if "retrieval" in tool_name.lower():
+        # Parse JSON strings back to dicts so downstream code can access
+        # structured fields (result_type, blocks, web_results, etc.).
+        if isinstance(result_content, str):
+            try:
+                result_content = json.loads(result_content)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Process retrieval results from ToolMessage only if NOT using the buffer
+        # (buffer path already handled above — avoids double-processing)
+        if "retrieval" in tool_name.lower() and not deep_buffer:
             try:
                 from app.modules.agents.qna.nodes import _process_retrieval_output
                 if isinstance(result_content, str):
@@ -1092,6 +1130,25 @@ def _extract_tool_results(
         })
 
     return tool_results
+
+
+def _rebind_tool_state(tools: list, state: object) -> None:
+    """Re-bind tool state references to the current node's state dict.
+
+    Tools were created in the orchestrator node and hold a stale reference
+    to that node's state snapshot. LangGraph creates a new state dict on
+    each node transition, so retrieval writes (final_results,
+    virtual_record_id_to_result) must land in the active state object
+    that this node will return — otherwise downstream nodes see EMPTY.
+    """
+    for _t in tools:
+        _wrapper = getattr(_t, '_tool_wrapper', None)
+        if _wrapper is None:
+            continue
+        if getattr(_wrapper, 'instance_creator', None) is not None:
+            _wrapper.instance_creator.state = state
+        with contextlib.suppress(Exception):
+            _wrapper.chat_state = state
 
 
 def _detect_status(result_content: object) -> str:
@@ -1124,10 +1181,10 @@ class _ToolCallBudget:
 
 
 def _wrap_tools_with_budget(
-    tools: List,
+    tools: list,
     budget: _ToolCallBudget,
     log: logging.Logger = logger,
-) -> List:
+) -> list:
     """
     Wrap tools with a call budget to prevent runaway tool loops.
 
@@ -1160,6 +1217,10 @@ def _wrap_tools_with_budget(
             )
             if hasattr(tool, "_original_name"):
                 new_tool._original_name = tool._original_name
+            # Preserve _tool_wrapper so re-binding code can update state refs
+            # on the wrapped tool after budget-wrapping.
+            if hasattr(tool, "_tool_wrapper"):
+                new_tool._tool_wrapper = tool._tool_wrapper
             wrapped.append(new_tool)
         except Exception as e:
             log.warning("Failed to wrap tool %s: %s, using original", tool_name, e)
@@ -1167,11 +1228,101 @@ def _wrap_tools_with_budget(
 
     return wrapped
 
+def _wrap_retrieval_tools_for_context_efficiency(
+    tools: list,
+    state: DeepAgentState,
+    log: logging.Logger,
+) -> list:
+    """
+    Wrap retrieval tools to track state writes and enable correct citation handling.
 
-def _make_budgeted_coro(orig_coro, orig_func, budget, tool_name, log) -> callable:
+    The retrieval tool (search_internal_knowledge) writes all citation data directly
+    to state["final_results"] / state["virtual_record_id_to_result"] and returns a
+    formatted string containing the full <record> blocks.
+
+    This wrapper serves two purposes:
+    1. Buffers the full return value in state["_deep_retrieval_buffer"] so that
+       _extract_tool_results knows state was already populated by the tool and skips
+       the fallback ToolMessage re-processing path (the `if not deep_buffer:` guard).
+    2. Returns the result UNCHANGED — the sub-agent LLM must see the full <record>
+       content to read and synthesize precise, in-depth answers. Stripping content
+       here would degrade answer quality.
+
+    _tool_wrapper is preserved on the new tool so _rebind_tool_state() can update
+    the Retrieval instance's self.state to the current node's state dict rather than
+    the orchestrator's stale snapshot (which would cause citations to be empty).
+    """
+    from langchain_core.tools import StructuredTool as LCStructuredTool
+
+    wrapped = []
+    for tool in tools:
+        tool_name = getattr(tool, "name", "unknown")
+        is_retrieval_tool = "retrieval" in tool_name.lower() or "knowledge" in tool_name.lower()
+
+        if not is_retrieval_tool:
+            wrapped.append(tool)
+            continue
+
+        orig_coro = getattr(tool, "coroutine", None)
+        orig_func = getattr(tool, "func", None)
+        if orig_coro is None and orig_func is None:
+            wrapped.append(tool)
+            continue
+
+        async def _context_efficient_coro(
+            _orig_coro=orig_coro,
+            _orig_func=orig_func,
+            _tool_name=tool_name,
+            **kwargs: object,
+        ) -> str:
+            result = await _orig_coro(**kwargs) if _orig_coro else _orig_func(**kwargs)
+            try:
+                # Buffer the full result so _extract_tool_results knows state was
+                # already written by the tool and skips double-processing of
+                # ToolMessage content (the `if not deep_buffer:` guard).
+                # The full <record> content is returned unchanged so the sub-agent
+                # LLM can read and synthesize it into precise, in-depth answers.
+                if state.get("_deep_retrieval_buffer") is None:
+                    state["_deep_retrieval_buffer"] = []
+                state["_deep_retrieval_buffer"].append(result)
+            except Exception as e:
+                log.warning("Failed to buffer retrieval output for %s: %s", _tool_name, e)
+            return result
+
+        try:
+            new_tool = LCStructuredTool.from_function(
+                func=_context_efficient_coro,
+                coroutine=_context_efficient_coro,
+                name=tool_name,
+                description=getattr(tool, "description", ""),
+                args_schema=getattr(tool, "args_schema", None),
+                return_direct=getattr(tool, "return_direct", False),
+            )
+            if hasattr(tool, "_original_name"):
+                new_tool._original_name = tool._original_name
+            # Preserve _tool_wrapper so _rebind_tool_state() can update the
+            # Retrieval instance's self.state to the current node's state dict.
+            # Without this, the tool writes final_results to the orchestrator's
+            # stale state snapshot and citations are always empty.
+            if hasattr(tool, "_tool_wrapper"):
+                new_tool._tool_wrapper = tool._tool_wrapper
+            wrapped.append(new_tool)
+            log.debug("Wrapped retrieval tool %s for context efficiency", tool_name)
+        except Exception as e:
+            log.warning("Failed to wrap retrieval tool %s for context efficiency: %s", tool_name, e)
+            wrapped.append(tool)
+
+    return wrapped
+def _make_budgeted_coro(
+    orig_coro: Callable[..., Coroutine[Any, Any, str]] | None,
+    orig_func: Callable[..., str] | None,
+    budget: _ToolCallBudget,
+    tool_name: str,
+    log: logging.Logger,
+) -> Callable[..., Coroutine[Any, Any, str]]:
     """Factory: create a budget-enforced async wrapper for a tool coroutine."""
 
-    async def _coro(**kwargs) -> str:
+    async def _coro(**kwargs: object) -> str:
         if not budget.consume():
             log.warning(
                 "Tool call budget exhausted (%d/%d) for %s",
@@ -1183,8 +1334,7 @@ def _make_budgeted_coro(orig_coro, orig_func, budget, tool_name, log) -> callabl
                 "now using the data from previous tool calls. Do NOT call any more tools."
             )
 
-        result = await orig_coro(**kwargs) if orig_coro else orig_func(**kwargs)
-        return result
+        return await orig_coro(**kwargs) if orig_coro else orig_func(**kwargs)
 
     return _coro
 
@@ -1194,7 +1344,7 @@ def _make_budgeted_coro(orig_coro, orig_func, budget, tool_name, log) -> callabl
 # ---------------------------------------------------------------------------
 
 async def _prewarm_clients(
-    tasks: List[SubAgentTask],
+    tasks: list[SubAgentTask],
     state: DeepAgentState,
     log: logging.Logger,
 ) -> None:
@@ -1211,7 +1361,7 @@ async def _prewarm_clients(
 
     # Collect one representative tool per (domain, toolset_id) pair
     tool_to_toolset_map = state.get("tool_to_toolset_map", {})
-    seen: Dict[tuple, str] = {}  # (app_name, toolset_id) -> tool_full_name
+    seen: dict[tuple, str] = {}  # (app_name, toolset_id) -> tool_full_name
     for task in tasks:
         for tool_name in task.get("tools", []):
             app_name = tool_name.split(".")[0] if "." in tool_name else tool_name.split("_")[0]
@@ -1269,19 +1419,50 @@ async def _prewarm_clients(
 # Agent instructions builder
 # ---------------------------------------------------------------------------
 
-def _build_sub_agent_instructions(state: DeepAgentState) -> str:
-    """Build agent instructions prefix for sub-agent prompts.
+def _format_task_scope_block(task: SubAgentTask) -> str:
+    """Orchestrator-distilled guidance for this task; never the user's verbatim system prompt / instructions."""
+    raw = task.get("scoped_instructions")
+    text = str(raw).strip() if raw else ""
+    if not text:
+        return ""
+    # Trailing blank lines so the next template section (e.g. ## Context) is not glued to the text.
+    return f"## Task-scoped agent guidance\n{text}\n\n"
 
-    Includes the agent's configured instructions so sub-agents
-    follow the same behavioral constraints and workflow rules
-    as the overall agent.
-    """
+
+def _build_sub_agent_instructions(state: DeepAgentState) -> str:
+    """User/org identity only. Verbatim workspace system prompt and instructions stay orchestrator-side."""
     parts = []
 
-    # Agent instructions (workflow-specific behavior)
-    instructions = state.get("instructions", "")
-    if instructions and instructions.strip():
-        parts.append(f"## Agent Instructions\n{instructions.strip()}")
+    # Current user context — sub-agents need this to resolve "my space",
+    # "my tickets", "assigned to me", etc. Without it, the LLM guesses
+    # based on token ownership or the first result, which is often wrong.
+    user_info = state.get("user_info", {})
+    user_email = (
+        state.get("user_email")
+        or user_info.get("userEmail")
+        or user_info.get("email")
+        or ""
+    )
+    user_name = (
+        user_info.get("fullName")
+        or user_info.get("name")
+        or user_info.get("displayName")
+        or (
+            f"{user_info.get('firstName', '')} {user_info.get('lastName', '')}".strip()
+            if user_info.get("firstName") or user_info.get("lastName")
+            else ""
+        )
+    )
+    if user_name or user_email:
+        user_parts = ["## Current User"]
+        if user_name:
+            user_parts.append(f"- Name: {user_name}")
+        if user_email:
+            user_parts.append(f"- Email: {user_email}")
+        user_parts.append(
+            'When the query says "my", "me", or "I", it refers to this user.'
+        )
+        parts.append("\n".join(user_parts))
 
     if parts:
         return "\n\n".join(parts) + "\n\n"
@@ -1320,25 +1501,64 @@ def _build_sub_agent_tool_guidance(
         "only if the task requires comprehensive data (reports, summaries)."
     )
 
-    # Retrieval-specific guidance — maximise coverage via diverse queries
+    # Retrieval-specific guidance — connector scoping + diverse query coverage
     is_retrieval = any(d in ("retrieval", "knowledge") for d in domains)
     if is_retrieval:
         parts.append(
-            "\n## Knowledge Base Search Strategy\n"
-            "Your goal is to retrieve the MOST COMPREHENSIVE set of relevant information.\n"
-            "1. **Derive search queries from the TASK DESCRIPTION**, not the raw user message. "
-            "The task description contains the resolved topic.\n"
-            "2. **Make 3-5 diverse search calls** with DIFFERENT query formulations:\n"
-            "   - First: a broad semantic query capturing the main topic\n"
-            "   - Then: rephrase using synonyms, related terms, or different angles\n"
-            "   - Then: targeted queries for specific sub-topics or details\n"
-            "3. **Use limit=100** on each call to maximise results per query.\n"
-            "4. **You have a hard budget of 5 search calls.** The retrieval system "
-            "returns ALL matching blocks per query, so additional queries with similar "
-            "terms will return the same results. Quality of query diversity matters "
-            "more than quantity of calls.\n"
-            "5. The retrieval results will be processed downstream for citations — "
-            "your job is to surface as much relevant content as possible."
+            "\n## Knowledge Base Search Strategy\n\n"
+            "### Step 1 — Identify the source(s) and correct parameter from your task description\n"
+            "Your task description specifies WHICH source(s) to search and WHICH parameter to use.\n"
+            "Read it carefully — there are two distinct filter parameters:\n\n"
+            "  **App connectors** (identified by `connector_id` in the task description):\n"
+            "  • One connector_id given → every call MUST use `connector_ids: [\"<that id>\"]`.\n"
+            "  • Multiple connector_ids → one parallel call per connector, each with its own\n"
+            "    single `connector_ids`. Never merge connector_ids into one call.\n"
+            "  • Use ONLY `connector_ids` — NEVER pass `collection_ids` for a connector.\n\n"
+            "  **KB collections** (identified by `collection_ids` or `record_group_id` in the task):\n"
+            "  • One collection_id given → every call MUST use `collection_ids: [\"<that id>\"]`.\n"
+            "  • Multiple collection_ids → one parallel call per collection.\n"
+            "  • Use ONLY `collection_ids` — NEVER pass `connector_ids` for a KB collection.\n\n"
+            "  **No ID specified / full KB search**:\n"
+            "  • Omit BOTH `connector_ids` and `collection_ids` — this searches all indexed content.\n\n"
+            "  ⚠️ **CRITICAL**: Using the wrong parameter returns empty results.\n"
+            "  `connector_ids` → for app connectors (Jira, Confluence, Slack, …)\n"
+            "  `collection_ids` → for KB record groups (knowledge base collections)\n\n"
+            "### Step 2 — Build diverse search queries\n"
+            "Your goal is to surface the MOST RELEVANT content across the assigned source(s).\n"
+            "1. **Derive queries from the TASK DESCRIPTION** — it contains the resolved topic.\n"
+            "2. **Issue 2–4 calls per source** with DIFFERENT query formulations in parallel:\n"
+            "   - Broad semantic query capturing the main topic\n"
+            "   - Rephrasing with synonyms, related terms, or different angles\n"
+            "   - Targeted queries for specific sub-topics or details mentioned in the task\n"
+            "3. **Use limit=10** on each call to maximise results per query.\n"
+            "4. **Hard budget: 5 search calls per source.** Quality of query diversity "
+            "matters more than call count — similar queries return the same blocks.\n\n"
+            "### Step 3 — Call format reminder\n"
+            "```\n"
+            "# For an app connector:\n"
+            "search_internal_knowledge(query=\"<query>\", connector_ids=[\"<connector_id>\"], limit=10)\n\n"
+            "# For a KB collection:\n"
+            "search_internal_knowledge(query=\"<query>\", collection_ids=[\"<record_group_id>\"], limit=10)\n\n"
+            "# For full KB (no specific ID):\n"
+            "search_internal_knowledge(query=\"<query>\", limit=10)\n"
+            "```\n"
+            "The retrieval results are processed downstream for citations. "
+            "Your job is to surface relevant content; do not try to parse or filter results yourself."
+        )
+
+    has_web_tools = any("web_search" in t or "fetch_url" in t for t in tool_names)
+    if has_web_tools:
+        parts.append(
+            "\n## Web Search Rules\n"
+            "- Prefer `web_search` over training data for anything that may have changed: "
+            "news, prices, weather, software versions, docs, regulations, current events.\n"
+            "- Also when the task asks for \"latest\"/\"current\"/\"up-to-date\" info.\n"
+            "- Use training data only for timeless knowledge. When in doubt, prefer `web_search`.\n"
+            "- Use `fetch_url` to get full content from a `web_search` result URL.\n"
+            "- **URL fetch failure recovery**: if `fetch_url` returns `ok: false` for a URL, "
+            "assess whether the context collected so far is sufficient to complete the task. "
+            "If it is not, identify other relevant URLs from previous search results and fetch "
+            "them until sufficient context is available or all candidates are exhausted."
         )
 
     # Generic link extraction guidance (for non-retrieval tasks)
@@ -1368,7 +1588,7 @@ def _build_sub_agent_tool_guidance(
 # Tool schema formatter for sub-agent prompts
 # ---------------------------------------------------------------------------
 
-def _format_tools_for_prompt(tools: List, log: logging.Logger) -> str:
+def _format_tools_for_prompt(tools: list, log: logging.Logger) -> str:
     """
     Format StructuredTool objects with their parameter schemas for the
     sub-agent's system prompt.
@@ -1386,7 +1606,7 @@ def _format_tools_for_prompt(tools: List, log: logging.Logger) -> str:
 
         lines.append(f"### {name}")
         if description:
-            desc_text = description[:_TOOL_DESC_TRUNCATE_LEN] if len(description) > _TOOL_DESC_TRUNCATE_LEN else description
+            desc_text = description
             lines.append(f"  {desc_text}")
 
         # Extract parameter schema
@@ -1396,13 +1616,14 @@ def _format_tools_for_prompt(tools: List, log: logging.Logger) -> str:
                 from app.modules.agents.deep.tool_router import _extract_params
                 params = _extract_params(schema)
                 if params:
+                    lines.append("")
                     lines.append("  **Parameters:**")
                     for param_name, param_info in params.items():
                         required_marker = "**required**" if param_info.get("required") else "optional"
                         param_type = param_info.get("type", "any").upper()
                         param_desc = param_info.get("description", "")
                         if param_desc:
-                            lines.append(f"  - `{param_name}` ({required_marker}): {param_desc[:100]} [{param_type}]")
+                            lines.append(f"  - `{param_name}` ({required_marker}): {param_desc} [{param_type}]")
                         else:
                             lines.append(f"  - `{param_name}` ({required_marker}) [{param_type}]")
         except Exception as e:
@@ -1432,10 +1653,10 @@ class _SubAgentStreamingCallback(AsyncCallbackHandler):
         self.config = config
         self.log = log
         self.task_id = task_id
-        self._tool_names: Dict[str, str] = {}
-        self.collected_results: List[Dict[str, Any]] = []
+        self._tool_names: dict[str, str] = {}
+        self.collected_results: list[dict[str, Any]] = []
 
-    def _write(self, event_data: Dict[str, Any]) -> None:
+    def _write(self, event_data: dict[str, Any]) -> None:
         token = var_child_runnable_config.set(self.config)
         try:
             self.writer(event_data)
@@ -1444,7 +1665,7 @@ class _SubAgentStreamingCallback(AsyncCallbackHandler):
         finally:
             var_child_runnable_config.reset(token)
 
-    async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs) -> None:
+    async def on_tool_start(self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, **kwargs: object) -> None:
         tool_name = serialized.get("name", kwargs.get("name", "unknown"))
         self._tool_names[str(run_id)] = tool_name
         display = tool_name.replace("_", " ").title()
@@ -1453,7 +1674,7 @@ class _SubAgentStreamingCallback(AsyncCallbackHandler):
             "data": {"status": "executing", "message": f"Executing {display}..."},
         })
 
-    async def on_tool_end(self, output, *, run_id, **kwargs) -> None:
+    async def on_tool_end(self, output: object, *, run_id: UUID, **kwargs: object) -> None:
         tool_name = self._tool_names.pop(str(run_id), "unknown")
         status = _detect_status(output)
         # Collect tool results for partial recovery on timeout
@@ -1467,7 +1688,7 @@ class _SubAgentStreamingCallback(AsyncCallbackHandler):
             "data": {"tool": tool_name, "status": status},
         })
 
-    async def on_tool_error(self, error, *, run_id, **kwargs) -> None:
+    async def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: object) -> None:
         tool_name = self._tool_names.pop(str(run_id), "unknown")
         self._write({
             "event": "status",

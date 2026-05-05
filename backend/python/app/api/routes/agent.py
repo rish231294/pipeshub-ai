@@ -4,27 +4,31 @@ Handles agent instances, templates, chat, and permissions using graph-based arch
 """
 
 import json
+import os
 import uuid
+from collections.abc import AsyncGenerator
 from logging import Logger
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.language_models.chat_models import BaseChatModel
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel
 
-from app.api.middlewares.auth import require_scopes
+from app.agents.registry.toolset_registry import ToolsetRegistry
+from app.api.middlewares.auth import authMiddleware, require_scopes
 from app.api.routes.chatbot import get_llm_for_chat
 from app.config.configuration_service import ConfigurationService
-from app.config.constants.arangodb import CollectionNames
+from app.config.constants.arangodb import CollectionNames, Connectors
 from app.config.constants.service import OAuthScopes, config_node_constants
+from app.modules.agents.capability_summary import fetch_connector_configs
+from app.utils.execute_query import has_sql_connector_configured
+from app.modules.agents.deep.graph import deep_agent_graph
+from app.modules.agents.deep.state import build_deep_agent_state
 from app.modules.agents.qna.cache_manager import get_cache_manager
 from app.modules.agents.qna.chat_state import build_initial_state
 from app.modules.agents.qna.graph import agent_graph, modern_agent_graph
-from app.modules.agents.deep.graph import deep_agent_graph
-from app.modules.agents.deep.state import build_deep_agent_state
-
-
 from app.modules.agents.qna.memory_optimizer import (
     auto_optimize_state,
     check_memory_health,
@@ -36,9 +40,19 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 router = APIRouter()
 
+# Opik tracer initialization
+_opik_tracer = None
+_opik_api_key = os.getenv("OPIK_API_KEY")
+_opik_workspace = os.getenv("OPIK_WORKSPACE")
+if _opik_api_key and _opik_workspace:
+    try:
+        from opik.integrations.langchain import OpikTracer
+        _opik_tracer = OpikTracer()
+    except Exception:
+        pass
 # Constants
 SPLIT_PATH_EXPECTED_PARTS = 2  # Expected parts when splitting path with "/" separator
-
+NO_KB_SELECTED_FILTER = "NO_KB_SELECTED"
 
 # ============================================================================
 # Request Models
@@ -46,20 +60,33 @@ SPLIT_PATH_EXPECTED_PARTS = 2  # Expected parts when splitting path with "/" sep
 
 class ChatQuery(BaseModel):
     query: str
-    limit: Optional[int] = 50
-    previousConversations: List[Dict] = []
+    limit: int | None = 50
+    previousConversations: list[dict] = []
     quickMode: bool = False
-    filters: Optional[Dict[str, Any]] = None
-    retrievalMode: Optional[str] = "HYBRID"
-    systemPrompt: Optional[str] = None
-    instructions: Optional[str] = None
-    tools: Optional[List[str]] = None
-    chatMode: Optional[str] = "auto"
-    modelKey: Optional[str] = None
-    modelName: Optional[str] = None
-    timezone: Optional[str] = None
-    currentTime: Optional[str] = None
+    filters: dict[str, Any] | None = None
+    retrievalMode: str | None = "HYBRID"
+    systemPrompt: str | None = None
+    instructions: str | None = None
+    tools: list[str] | None = None
+    chatMode: str | None = "auto"
+    modelKey: str | None = None
+    modelName: str | None = None
+    timezone: str | None = None
+    currentTime: str | None = None
+    conversationId: str | None = None
 
+
+class RouteDecision(BaseModel):
+    """
+    Routing decision with structured chain-of-thought reasoning.
+
+    reasoning: structured analysis — sub-tasks identified, dependency chain,
+               parameter availability, and justification for the chosen tier.
+               Written BEFORE committing to a route (CoT reduces misroutes).
+    route: the tier — type-safe, cannot produce an invalid value.
+    """
+    reasoning: str
+    route: Literal["quick", "react", "deep"]
 
 # ============================================================================
 # Custom Exceptions
@@ -115,12 +142,19 @@ class LLMInitializationError(AgentError):
             status_code=500
         )
 
+class ReasoningModelRequiredError(AgentError):
+    """Reasoning model required"""
+    def __init__(self) -> None:
+        super().__init__(
+            detail="Reasoning model is required in agent mode. Please use a reasoning model.",
+            status_code=400
+        )
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
-async def get_services(request: Request) -> Dict[str, Any]:
+async def get_services(request: Request) -> dict[str, Any]:
     """Get all required services from container"""
     container = request.app.container
 
@@ -147,7 +181,7 @@ async def get_services(request: Request) -> Dict[str, Any]:
     }
 
 
-def _get_user_context(request: Request) -> Dict[str, Any]:
+def _get_user_context(request: Request) -> dict[str, Any]:
     """Extract user context from request"""
     user = getattr(request.state, "user", {})
     user_id = user.get("userId")
@@ -162,77 +196,17 @@ def _get_user_context(request: Request) -> Dict[str, Any]:
     return {
         "userId": user_id,
         "orgId": org_id,
+        "isServiceAccount": bool(user.get("isServiceAccount", False)),
         "sendUserInfo": request.query_params.get("sendUserInfo", True),
     }
 
 
-def _extract_tool_names_for_routing(query_info: Dict[str, Any]) -> List[str]:
-    """Extract flattened tool names from query payload (tools or toolsets)."""
-    names: List[str] = []
-
-    def _normalize_tool_name(tool_obj: Any) -> Optional[str]:
-        """Return canonical tool name in `app.tool` format when possible."""
-        if isinstance(tool_obj, str):
-            return tool_obj
-        if not isinstance(tool_obj, dict):
-            return None
-
-        # Prefer fully-qualified keys first
-        for k in ("fullName", "full_name", "toolFullName"):
-            v = tool_obj.get(k)
-            if isinstance(v, str) and v:
-                return v
-
-        # Fallback to plain name
-        name = tool_obj.get("name")
-        if not isinstance(name, str) or not name:
-            return None
-        if "." in name:
-            return name
-
-        # Rebuild app.tool from additional fields if available
-        app_name = tool_obj.get("app") or tool_obj.get("appName") or tool_obj.get("toolsetName")
-        if isinstance(app_name, str) and app_name:
-            return f"{app_name}.{name}"
-        return name
-
-    # Direct tools list (legacy / explicit payloads)
-    for t in query_info.get("tools", []) or []:
-        normalized = _normalize_tool_name(t)
-        if normalized:
-            names.append(normalized)
-
-    # Toolsets list (graph-based payloads)
-    for toolset in query_info.get("toolsets", []) or []:
-        if not isinstance(toolset, dict):
-            continue
-        toolset_name = toolset.get("name")
-        for t in toolset.get("tools", []) or []:
-            normalized = _normalize_tool_name(t)
-            if not normalized and isinstance(t, dict):
-                # Last-resort fallback using toolset name as app prefix
-                tn = t.get("name")
-                if isinstance(toolset_name, str) and isinstance(tn, str) and tn:
-                    normalized = f"{toolset_name}.{tn}"
-            if normalized:
-                names.append(normalized)
-
-    # De-duplicate while preserving order
-    seen = set()
-    deduped: List[str] = []
-    for n in names:
-        if n and n not in seen:
-            deduped.append(n)
-            seen.add(n)
-    return deduped
-
 
 async def _select_agent_graph_for_query(
-    query_info: Dict[str, Any],
+    query_info: dict[str, Any],
     logger: Logger,
     llm: BaseChatModel,
-    agent: Dict[str, Any] = None,
-):
+) -> CompiledStateGraph:
     """
     Graph selection based on chatMode from the chat input:
     - quick: legacy agent graph (fast, no tool loops)
@@ -252,8 +226,7 @@ async def _select_agent_graph_for_query(
 
     if chat_mode == "auto":
         # Auto-detect: use LLM to pick the right graph
-        selected = await _auto_select_graph(query_info, logger, llm)
-        return selected
+        return await _auto_select_graph(query_info, logger, llm)
 
     # Default: "auto" → LLM router decides
     logger.info("Agent graph route: legacy | chatMode=%s", chat_mode)
@@ -261,94 +234,277 @@ async def _select_agent_graph_for_query(
 
 
 async def _auto_select_graph(
-    query_info: Dict[str, Any],
+    query_info: dict[str, Any],
     logger: Logger,
     llm: BaseChatModel,
-):
+) -> CompiledStateGraph:
     """
     Auto-select graph using an LLM call to classify the query into one of
-    three agent types: quick, verification, or deep.
-    Falls back to 'verification' if parsing fails.
+    three agent types: quick, react, or deep.
+    Falls back to 'react' if parsing fails.
     """
-    from langchain_core.messages import HumanMessage
 
-    tool_names = _extract_tool_names_for_routing(query_info)
-    apps = sorted({
-        name.split(".", 1)[0]
-        for name in tool_names
-        if isinstance(name, str) and "." in name
-    })
-    user_query = query_info.get("query", "")
-    domains_str = ", ".join(apps) if apps else "none"
+    from langchain_core.messages import HumanMessage, SystemMessage
 
-    prompt = (
-        "You are a query router. Classify the user query into exactly one agent type "
-        "based on the structural complexity of the work required.\n\n"
+    user_query = query_info.get("query", "").strip()
+    if not user_query:
+        return modern_agent_graph
 
-        "## Agent Types\n\n"
+    capability_block, n_knowledge, indexed_connectors, kb_sources, tools_data = (
+        _build_agent_capability_context(query_info)
+    )
+    context_block = _build_routing_context(query_info)
 
-        "**quick**: The task requires ZERO or exactly ONE tool call with no dependency resolution. "
-        "This covers anything answerable from general knowledge, simple greetings, "
-        "or a single straightforward read/write operation where the parameters are obvious "
-        "from the query itself.\n\n"
+    structured_llm = llm.with_structured_output(RouteDecision)
 
-        "**verification**: The task requires MULTIPLE tool calls that form a SEQUENTIAL chain — "
-        "the output of one step feeds as input to the next. This includes multi-step workflows "
-        "even if they span different services, as long as the steps depend on each other in a "
-        "linear sequence (A → B → C). Also use this when a single tool call requires a "
-        "preceding lookup to resolve a parameter (e.g. finding an ID before using it).\n\n"
+    system_prompt = (
+        "You are a routing agent. Classify the user request into exactly one "
+        "execution tier: quick, react, or deep.\n\n"
 
-        "**deep**: The task requires PARALLEL independent work streams, BULK processing of many items, "
-        "or SYNTHESIS across multiple unrelated data sources. The defining characteristic is that "
-        "the work CANNOT be serialized into one sequential chain — it needs fan-out to gather data "
-        "from independent sources, batch processing of large volumes, or aggregation/comparison "
-        "across separate result sets to produce a combined output.\n\n"
+        + capability_block
+        + context_block
+        + "## quick\n"
+        "Every action and every parameter can be fully determined right now "
+        "from the query and context, before anything runs. The request itself "
+        "is the final action — retrieving, searching, displaying, or acting on "
+        "something where the goal is the retrieval or action itself, not "
+        "further processing of what comes back.\n\n"
 
-        "## Decision Rule\n"
-        "1. Count the minimum tool calls needed and check their dependency structure.\n"
-        "2. Zero or one independent call → quick\n"
-        "3. Multiple calls where each depends on the previous result → verification\n"
-        "4. Multiple INDEPENDENT calls that must be gathered and combined → deep\n\n"
+        "CRITICAL: For a request to be 'quick', ALL of the following must be true:\n"
+        "1. ALL required parameters for the final action are directly available "
+        "from the query text, conversation context, or system constants — NO "
+        "tool calls needed to obtain any parameter (IDs, keys, identifiers).\n"
+        "2. The query contains exactly ONE distinct action or question. If the "
+        "query asks about two or more separate topics, tasks, or actions "
+        "(e.g., 'How do I do X and also Y?'), it is NOT quick.\n\n"
 
-        f"Available tool domains: {domains_str}\n"
-        f"User query: {user_query}\n\n"
-        "Respond with exactly one word: quick, verification, or deep."
+        "## react\n"
+        "A fixed, predictable sequence of dependent steps where the chain "
+        "length is deterministic before execution starts, but at least one "
+        "step's parameters only become known from a prior step's result. The "
+        "intent implies: get something first, then do something with it — "
+        "where 'it' is one specific thing.\n\n"
+        "Key indicator: If the final action requires a parameter (ID, key, "
+        "identifier, or any structured value) that must be fetched/resolved "
+        "through a tool call, this is react. The dependency chain is: "
+        "resolve parameter → execute final action.\n\n"
+        "Also use react when the query has multiple related sub-tasks that "
+        "build on shared context.\n\n"
+        "**react is the safe default when routing is unclear.**\n\n"
+
+        "## deep\n"
+        "Reserved for tasks react cannot handle. Only two cases qualify:\n"
+        "(a) The intent requires getting a collection and then doing something "
+        "to EVERY item in it — the number of items is unknown before the "
+        "collection is retrieved. Wanting to SEE a collection is not this.\n"
+        "(b) The intent requires gathering information from ≥2 fully "
+        "independent sources and combining it into one unified answer.\n"
+        f"Configuration check: {n_knowledge} source(s) configured — deep "
+        f"is {'viable' if n_knowledge >= 2 else 'NOT viable (need ≥2)'}.\n\n"
+
+        "## What counts as a known vs unknown parameter\n"
+        "Known (does NOT require a prior tool call):\n"
+        "  • Any search term, keyword, or topic that appears in the query text "
+        "itself — the user's words ARE the search input.\n"
+        "  • Any ID, name, key, or value explicitly stated in the query or "
+        "conversation history.\n"
+        "  • Which tool or knowledge source to use — this is an internal agent "
+        "routing decision, NOT a parameter the query must supply.\n\n"
+        "Unknown (DOES require a prior tool call):\n"
+        "  • An ID, key, or identifier that is not present anywhere in the "
+        "query or conversation and must be obtained from a tool's response "
+        "before the final action can execute.\n\n"
+
+        "## Decision\n"
+        "Answer these in order. Stop at the first match.\n\n"
+
+        "Q1: Is this a single question or action, AND are ALL required "
+        "parameters known (per the definitions above) — with NO tool calls "
+        "needed to obtain them? → **quick**\n\n"
+
+        "Q2: Does the request require a fixed sequence where at least one "
+        "parameter for the final action must come from a prior tool's result? "
+        "→ **react**\n\n"
+
+        "Q3: Does the request imply acting on every item in a collection "
+        "whose size is only known at runtime, or combining ≥2 fully "
+        f"independent sources ({n_knowledge} configured)? → **deep**\n\n"
+
+        "Q4: Does the query contain multiple distinct sub-questions, topics, "
+        "or actions? → NOT quick; use react (if topics are related or "
+        "sequential) or deep (if fully independent and targeting different "
+        "sources).\n\n"
+
+        "Default → **react**\n\n"
+
+        "For follow-ups ('yes', 'ok', 'do it', 'give all', 'show more', "
+        "'proceed') — infer the full intent from the prior conversation "
+        "above, then apply the decision tree to that inferred intent.\n\n"
+
+        f"Query: {user_query}"
     )
 
+    route_map = {
+        "quick": agent_graph,
+        "react": modern_agent_graph,
+        "deep": deep_agent_graph,
+    }
+
     try:
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        raw = response.content.strip().lower().strip(".,!\"' ")
+        invoke_config = {"callbacks": [_opik_tracer]} if _opik_tracer else {}
 
-        route_map = {
-            "quick": agent_graph,
-            "verification": modern_agent_graph,
-            "deep": deep_agent_graph,
-        }
-
-        for keyword, graph in route_map.items():
-            if keyword in raw:
-                logger.info(
-                    "Agent graph route: %s | LLM auto-select (domains=%s, query=%s)",
-                    keyword,
-                    domains_str,
-                    user_query[:80],
-                )
-                return graph
-
-        logger.warning(
-            "Agent graph route: verification (default) | LLM returned unparseable: %s",
-            raw[:100],
+        decision: RouteDecision = await structured_llm.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content="Classify."),
+            ],
+            config=invoke_config,
         )
-        return modern_agent_graph
+
+        route = decision.route
+        logger.info(
+            "Agent graph route: %s | (query=%s, reasoning=%s)",
+            route,
+            user_query[:80],
+            decision.reasoning[:120],
+        )
+        return route_map[route]
 
     except Exception as e:
         logger.warning(
-            "Agent graph route: verification (fallback) | LLM router failed: %s", e
+            "Agent graph route: react (fallback) | router failed: %s", e
         )
         return modern_agent_graph
 
+def _build_routing_context(query_info: dict[str, Any]) -> str:
+    """
+    Compact prior conversation context for resolving follow-ups.
+    Last 3 turns only. First line of bot responses only.
+    """
+    previous = query_info.get("previous_conversations", [])
+    if not previous:
+        return ""
 
-async def _get_user_document(user_id: str, graph_provider: IGraphDBProvider, logger: Logger) -> Dict[str, Any]:
+    recent = previous[-6:]
+    turns = []
+
+    for conv in recent:
+        role = conv.get("role", "")
+        content = str(conv.get("content", "")).strip()
+
+        if role == "user_query":
+            turns.append(f"User: {content[:200]}")
+        elif role == "bot_response":
+            first_line = content.split("\n")[0][:150]
+            turns.append(f"Assistant: {first_line}")
+
+    if not turns:
+        return ""
+
+    return (
+        "Prior conversation:\n"
+        + "\n".join(turns)
+        + "\n\n"
+    )
+
+
+def _build_agent_capability_context(
+    query_info: dict[str, Any],
+) -> tuple[str, int, list[dict], list[dict], list[dict]]:
+    """
+    Build a rich capability summary for the routing prompt.
+
+    Prefers fully-labeled data when available (chat_stream path supplies
+    query_info["knowledge"] and query_info["toolsets"]).  Falls back
+    gracefully to filter counts + bare tool-name strings when only the
+    lighter query_info structure is present (non-streaming chat / askAI).
+
+    Returns:
+        (capability_block, n_knowledge, indexed_connectors, kb_sources, tools_data)
+        where tools_data is a list of {"full_name": str, "desc": str} dicts.
+    """
+    from app.modules.agents.capability_summary import (
+        classify_knowledge_sources,
+        format_connector_filter_lines,
+    )
+
+    lines: list[str] = ["## Agent capabilities\n"]
+    indexed_connectors: list[dict] = []
+    kb_sources: list[dict] = []
+
+    # ── Knowledge sources ─────────────────────────────────────────────────────
+    agent_knowledge: list[dict] = query_info.get("knowledge") or []
+    connector_cfgs = query_info.get("connector_configs") or {}
+
+    if agent_knowledge:
+        kb_sources, indexed_connectors = classify_knowledge_sources(
+            agent_knowledge,
+            connector_configs=connector_cfgs if isinstance(connector_cfgs, dict) else None,
+        )
+        n_knowledge = len(kb_sources) + len(indexed_connectors)
+        lines.append(f"Knowledge sources ({n_knowledge} total):")
+        for c in indexed_connectors:
+            line = f"  • {c['label']} — app connector (type: {c['type_key']})"
+            fls = format_connector_filter_lines(c.get("filters"))
+            if fls:
+                line += "; " + "; ".join(fls)
+            lines.append(line)
+        for k in kb_sources:
+            cids = k.get("collection_ids", [])
+            scope = f", {len(cids)} scoped collection(s)" if cids else ""
+            lines.append(f"  • {k['label']} — knowledge base{scope}")
+    else:
+        # Fallback: derive counts from filters (NO_KB_SELECTED sentinel excluded)
+        filters = query_info.get("filters") or {}
+        n_connectors = len(filters.get("apps") or [])
+        n_kb = len([
+            x for x in (filters.get("kb") or [])
+            if x and x != "NO_KB_SELECTED"
+        ])
+        n_knowledge = n_connectors + n_kb
+        if n_knowledge:
+            lines.append(
+                f"Knowledge sources ({n_knowledge} total): "
+                f"{n_connectors} connector(s), {n_kb} KB collection(s)"
+            )
+        else:
+            lines.append("Knowledge sources: none configured")
+
+    lines.append("")
+
+    # ── Action tools ──────────────────────────────────────────────────────────
+    # Prefer toolsets (rich: fullName + description per tool).
+    # Fall back to the flat "tools" string list when toolsets are absent.
+    tools_data: list[dict] = []  # {"full_name": str, "desc": str}
+
+    toolsets: list[dict] = query_info.get("toolsets") or []
+    if toolsets:
+        for ts in toolsets:
+            for tool in ts.get("tools", []):
+                full_name = tool.get("fullName") or tool.get("name", "")
+                if not full_name:
+                    continue
+                desc = (tool.get("description") or "").strip()
+                tools_data.append({"full_name": full_name, "desc": desc})
+    else:
+        raw_tools: list = query_info.get("tools") or []
+        for t in raw_tools:
+            if isinstance(t, str) and t:
+                tools_data.append({"full_name": t, "desc": ""})
+
+    if tools_data:
+        lines.append(f"Action tools ({len(tools_data)} total):")
+        for td in tools_data:
+            entry = f"  • {td['full_name']}"
+            if td["desc"]:
+                entry += f" — {td['desc'][:100]}"
+            lines.append(entry)
+    else:
+        lines.append("Action tools: none configured")
+
+    return "\n".join(lines) + "\n\n", n_knowledge, indexed_connectors, kb_sources, tools_data
+
+async def _get_user_document(user_id: str, graph_provider: IGraphDBProvider, logger: Logger) -> dict[str, Any]:
     """Get user document with validation"""
     try:
         user = await graph_provider.get_user_by_user_id(user_id)
@@ -364,10 +520,10 @@ async def _get_user_document(user_id: str, graph_provider: IGraphDBProvider, log
         raise
     except Exception as e:
         logger.error(f"Error fetching user document: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve user information")
+        raise HTTPException(status_code=500, detail="Failed to retrieve user information") from e
 
 
-async def _get_org_info(user_info: Dict[str, Any], graph_provider: IGraphDBProvider, logger: Logger) -> Dict[str, Any]:
+async def _get_org_info(user_info: dict[str, Any], graph_provider: IGraphDBProvider, logger: Logger) -> dict[str, Any]:
     """Get organization information with validation"""
     try:
         org_doc = await graph_provider.get_document(user_info["orgId"], CollectionNames.ORGS.value)
@@ -387,10 +543,10 @@ async def _get_org_info(user_info: Dict[str, Any], graph_provider: IGraphDBProvi
         raise
     except Exception as e:
         logger.error(f"Error fetching organization info: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve organization information")
+        raise HTTPException(status_code=500, detail="Failed to retrieve organization information") from e
 
 
-async def _enrich_user_info(user_info: Dict[str, Any], user_doc: Dict[str, Any]) -> Dict[str, Any]:
+async def _enrich_user_info(user_info: dict[str, Any], user_doc: dict[str, Any]) -> dict[str, Any]:
     """Enrich user info with document data"""
     enriched = user_info.copy()
     enriched["userEmail"] = user_doc.get("email", "").strip()
@@ -404,14 +560,73 @@ async def _enrich_user_info(user_info: Dict[str, Any], user_doc: Dict[str, Any])
     return enriched
 
 
-def _validate_required_fields(data: Dict[str, Any], required_fields: List[str]) -> None:
+async def _enrich_user_info_for_service_account_agent_chat(
+    agent: dict[str, Any],
+    graph_provider: IGraphDBProvider,
+    logger: Logger,
+) -> dict[str, Any]:
+    """
+    Service-account agents are invoked with a synthetic JWT (e.g. Slack bot). Retrieval and
+    permission checks must use the agent creator's real userId — the same identity whose
+    knowledge access configured the agent — not the service principal.
+    """
+    creator_key = agent.get("createdBy")
+    if not creator_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Service account agent is missing createdBy; cannot resolve knowledge permissions.",
+        )
+    creator_doc = await graph_provider.get_document(
+        str(creator_key), CollectionNames.USERS.value
+    )
+    if not creator_doc:
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creator user not found; cannot resolve knowledge permissions.",
+        )
+    creator_user_id = creator_doc.get("userId")
+    if not creator_user_id:
+        logger.error(
+            "Service account agent creator %s has no userId field",
+            creator_key,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creator is missing userId; cannot resolve knowledge permissions.",
+        )
+    synthetic = {
+        "userId": str(creator_user_id),
+        "orgId": str(creator_doc.get("orgId") or "").strip(),
+        "email": (creator_doc.get("email") or "").strip(),
+    }
+    return await _enrich_user_info(synthetic, creator_doc)
+
+
+async def _load_service_account_agent_for_chat(
+    agent_id: str,
+    org_key: str,
+    graph_provider: IGraphDBProvider,
+    logger: Logger,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Fetch service-account agent, validate, and build creator-based user info for chat/stream."""
+    agent = await graph_provider.get_agent(agent_id, org_key)
+    if not agent or not agent.get("isServiceAccount"):
+        raise AgentNotFoundError(agent_id)
+    enriched_user_info = await _enrich_user_info_for_service_account_agent_chat(
+        agent, graph_provider, logger
+    )
+    perm = {"can_edit": False, "can_share": False, "role": "viewer"}
+    return agent, enriched_user_info, perm
+
+
+def _validate_required_fields(data: dict[str, Any], required_fields: list[str]) -> None:
     """Validate required fields in request data"""
     for field in required_fields:
         if not data.get(field) or not str(data.get(field)).strip():
             raise InvalidRequestError(f"'{field}' is required")
 
 
-def _parse_models(raw_models: List[Any], logger: Logger) -> tuple[List[str], bool]:
+def _parse_models(raw_models: list[Any], logger: Logger) -> tuple[list[str], bool]:
     """Parse and validate model entries"""
     model_entries = []
     has_reasoning_model = False
@@ -436,7 +651,168 @@ def _parse_models(raw_models: List[Any], logger: Logger) -> tuple[List[str], boo
     return model_entries, has_reasoning_model
 
 
-def _parse_toolsets(raw_toolsets: List[Any], logger: Logger) -> Dict[str, Dict[str, Any]]:
+_SUPPORTED_WEB_SEARCH_PROVIDERS = {"duckduckgo", "serper", "tavily"}
+
+
+def _parse_web_search(raw_web_search: Any) -> str | None:
+    """Normalize the agent-level web-search attachment to a provider string.
+
+    Accepts either:
+    - a dict like {"provider": "serper", ...}
+    - a provider string like "serper"
+
+    Returns the sanitized provider (lowercase), or None if invalid/missing.
+    """
+    if not raw_web_search:
+        return None
+
+    provider = ""
+    if isinstance(raw_web_search, dict):
+        provider = str(raw_web_search.get("provider", "")).strip().lower()
+    elif isinstance(raw_web_search, str):
+        provider = raw_web_search.strip().lower()
+
+    if not provider or provider not in _SUPPORTED_WEB_SEARCH_PROVIDERS:
+        return None
+    return provider
+
+
+def _format_web_search_for_response(raw_web_search: Any) -> dict[str, Any] | None:
+    """Normalize webSearch payloads to an API-friendly object shape."""
+    provider = _parse_web_search(raw_web_search)
+    if not provider:
+        return None
+
+    formatted: dict[str, Any] = {"provider": provider}
+    if isinstance(raw_web_search, dict):
+        provider_key = str(raw_web_search.get("providerKey", "")).strip()
+        provider_label = str(raw_web_search.get("providerLabel", "")).strip()
+        if provider_key:
+            formatted["providerKey"] = provider_key
+        if provider_label:
+            formatted["providerLabel"] = provider_label
+    return formatted
+
+
+def _is_web_search_enabled(selected_tools: list[str] | None) -> bool:
+    """Whether web_search should remain enabled for this request.
+
+    `selected_tools is None` means "all actions", so web_search stays enabled.
+    When an explicit tools list is provided, require a web_search entry.
+    """
+    if selected_tools is None:
+        return True
+
+    for tool in selected_tools:
+        tool_name = str(tool).strip().lower()
+        if tool_name == "web_search" or tool_name.startswith("web_search."):
+            return True
+    return False
+
+
+async def _resolve_default_web_search_config(
+    config_service: ConfigurationService,
+    logger: Logger,
+) -> dict[str, Any] | None:
+    """Auto-detect the default web search provider from org-level config.
+
+    Used by the assistant agent (agentIdPlaceholder) which doesn't have an
+    explicit webSearch attachment but should still offer the tool when the
+    org has a provider configured.
+    """
+    try:
+        web_search_config = await config_service.get_config(
+            config_node_constants.WEB_SEARCH.value,
+            default={},
+            use_cache=False,
+        )
+    except Exception as e:
+        logger.warning("Failed to load web search configuration for auto-detect: %s", e)
+        return None
+
+    providers = (
+        web_search_config.get("providers", [])
+        if isinstance(web_search_config, dict)
+        else []
+    )
+    if not isinstance(providers, list) or not providers:
+        return None
+
+    default_provider = next(
+        (p for p in providers if isinstance(p, dict) and p.get("isDefault")),
+        None,
+    )
+
+    # When providers exist but none carries isDefault=true, the Node.js layer has
+    # set DuckDuckGo as the active default (it clears all isDefault flags rather
+    # than inserting a DuckDuckGo entry into the array).
+    if not default_provider:
+        logger.debug("No explicit default web search provider; falling back to duckduckgo")
+        return {"provider": "duckduckgo", "configuration": {}}
+
+    provider = str(default_provider.get("provider", "")).strip().lower()
+    if not provider or provider not in _SUPPORTED_WEB_SEARCH_PROVIDERS:
+        return None
+
+    configuration = default_provider.get("configuration", {})
+    if not isinstance(configuration, dict):
+        configuration = {}
+
+    return {"provider": provider, "configuration": configuration}
+
+
+async def _resolve_web_search_tool_config(
+    provider: str | None,
+    config_service: ConfigurationService,
+    logger: Logger,
+) -> dict[str, Any] | None:
+    """Resolve provider-specific config for the web_search tool at runtime."""
+    if not provider:
+        return None
+
+    try:
+        web_search_config = await config_service.get_config(
+            config_node_constants.WEB_SEARCH.value,
+            default={},
+            use_cache=False,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to load web search configuration for provider '%s': %s",
+            provider,
+            str(e),
+        )
+        return {"provider": provider, "configuration": {}}
+
+    providers = (
+        web_search_config.get("providers", [])
+        if isinstance(web_search_config, dict)
+        else []
+    )
+    if not isinstance(providers, list):
+        providers = []
+
+    selected_provider = next(
+        (
+            entry
+            for entry in providers
+            if isinstance(entry, dict)
+            and str(entry.get("provider", "")).strip().lower() == provider
+        ),
+        None,
+    )
+
+    if not selected_provider:
+        return {"provider": provider, "configuration": {}}
+
+    configuration = selected_provider.get("configuration", {})
+    if not isinstance(configuration, dict):
+        configuration = {}
+
+    return {"provider": provider, "configuration": configuration}
+
+
+def _parse_toolsets(raw_toolsets: list[Any]) -> dict[str, dict[str, Any]]:
     """Parse toolsets with their tools.
 
     The key of the returned dict is the toolset name (lowercase).
@@ -488,7 +864,7 @@ def _parse_toolsets(raw_toolsets: List[Any], logger: Logger) -> Dict[str, Dict[s
     return toolsets_with_tools
 
 
-def _parse_knowledge_sources(raw_knowledge: List[Any], logger: Logger) -> Dict[str, Dict[str, Any]]:
+def _parse_knowledge_sources(raw_knowledge: list[Any]) -> dict[str, dict[str, Any]]:
     """Parse knowledge sources"""
     knowledge_sources = {}
 
@@ -518,14 +894,64 @@ def _parse_knowledge_sources(raw_knowledge: List[Any], logger: Logger) -> Dict[s
     return knowledge_sources
 
 
+def _filter_knowledge_by_enabled_sources(
+    agent_knowledge: list[dict[str, Any]],
+    filters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Filter agent_knowledge to only include entries matching enabled filters.
+
+    Keeps:
+    - App connectors whose connectorId is in filters["apps"]
+    - KB connectors whose recordGroups overlap with filters["kb"],
+      or KB connectors with no recordGroups (unrestricted KB)
+    """
+    enabled_apps = set(filters.get("apps", []))
+    enabled_kbs = set(filters.get("kb", []))
+
+    if not enabled_apps and not enabled_kbs:
+        return agent_knowledge
+
+    filtered: list[dict[str, Any]] = []
+    for k in agent_knowledge:
+        if not isinstance(k, dict):
+            continue
+
+        connector_id = k.get("connectorId", "")
+
+        # App connector — keep if in enabled apps
+        if connector_id in enabled_apps:
+            filtered.append(k)
+            continue
+
+        # KB connector — keep if its record groups overlap or it has none
+        if connector_id.startswith("knowledgeBase_") and enabled_kbs:
+            filters_data = k.get("filters", k.get("filtersParsed", {}))
+            if isinstance(filters_data, str):
+                try:
+                    filters_data = json.loads(filters_data)
+                except (json.JSONDecodeError, ValueError):
+                    filters_data = {}
+
+            record_groups = (
+                filters_data.get("recordGroups", [])
+                if isinstance(filters_data, dict) else []
+            )
+
+            if any(rg in enabled_kbs for rg in record_groups):
+                filtered.append(k)
+
+    return filtered
+
+
 async def _create_toolset_edges(
     agent_key: str,
-    toolsets_with_tools: Dict[str, Dict[str, Any]],
-    user_info: Dict[str, Any],
+    toolsets_with_tools: dict[str, dict[str, Any]],
+    user_info: dict[str, Any],
     user_key: str,
     graph_provider: IGraphDBProvider,
     logger: Logger
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Create toolset nodes and edges for agent using batch operations"""
     from app.agents.constants.toolset_constants import normalize_app_name
 
@@ -582,14 +1008,15 @@ async def _create_toolset_edges(
         return created_toolsets, [{"name": "all", "error": str(e)}]
 
     # Prepare agent -> toolset edges
-    agent_toolset_edges = []
-    for toolset_name, toolset_info in toolset_mapping.items():
-        agent_toolset_edges.append({
+    agent_toolset_edges = [
+        {
             "_from": f"{CollectionNames.AGENT_INSTANCES.value}/{agent_key}",
             "_to": f"{CollectionNames.AGENT_TOOLSETS.value}/{toolset_info['key']}",
             "createdAtTimestamp": time,
             "updatedAtTimestamp": time,
-        })
+        }
+        for toolset_info in toolset_mapping.values()
+    ]
 
     # Batch create agent -> toolset edges
     try:
@@ -602,7 +1029,7 @@ async def _create_toolset_edges(
     toolset_tool_edges = []
     tool_mapping = {}  # Map full_name to tool_key
 
-    for toolset_name, toolset_info in toolset_mapping.items():
+    for toolset_info in toolset_mapping.values():
         for tool_data in toolset_info["tools"]:
             tool_name = tool_data["name"]
             full_name = tool_data["fullName"]
@@ -653,7 +1080,7 @@ async def _create_toolset_edges(
             logger.error(f"Failed to create toolset-tool edges: {e}")
 
     # Build response with created toolsets and tools
-    for toolset_name, toolset_info in toolset_mapping.items():
+    for toolset_info in toolset_mapping.values():
         created_tools = []
         for tool_data in toolset_info["tools"]:
             full_name = tool_data["fullName"]
@@ -676,11 +1103,11 @@ async def _create_toolset_edges(
 
 async def _create_knowledge_edges(
     agent_key: str,
-    knowledge_sources: Dict[str, Dict[str, Any]],
+    knowledge_sources: dict[str, dict[str, Any]],
     user_key: str,
     graph_provider: IGraphDBProvider,
     logger: Logger
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Create knowledge nodes and edges for agent using batch operations"""
     created_knowledge = []
     time = get_epoch_timestamp_in_ms()
@@ -725,14 +1152,15 @@ async def _create_knowledge_edges(
         return created_knowledge
 
     # Prepare agent -> knowledge edges
-    agent_knowledge_edges = []
-    for connector_id, knowledge_info in knowledge_mapping.items():
-        agent_knowledge_edges.append({
+    agent_knowledge_edges = [
+        {
             "_from": f"{CollectionNames.AGENT_INSTANCES.value}/{agent_key}",
             "_to": f"{CollectionNames.AGENT_KNOWLEDGE.value}/{knowledge_info['key']}",
             "createdAtTimestamp": time,
             "updatedAtTimestamp": time,
-        })
+        }
+        for knowledge_info in knowledge_mapping.values()
+    ]
 
     # Batch create agent -> knowledge edges
     try:
@@ -741,17 +1169,19 @@ async def _create_knowledge_edges(
         logger.error(f"Failed to create agent-knowledge edges: {e}")
 
     # Build response
-    for connector_id, knowledge_info in knowledge_mapping.items():
-        created_knowledge.append({
+    created_knowledge.extend(
+        {
             "connectorId": connector_id,
             "key": knowledge_info["key"],
-            "filters": knowledge_info["filters"]
-        })
+            "filters": knowledge_info["filters"],
+        }
+        for knowledge_info in knowledge_mapping.values()
+    )
 
     return created_knowledge
 
 
-async def _enrich_agent_models(agent: Dict[str, Any], config_service: ConfigurationService, logger: Logger) -> None:
+async def _enrich_agent_models(agent: dict[str, Any], config_service: ConfigurationService, logger: Logger) -> None:
     """Enrich agent models with full configurations from etcd"""
     model_entries = agent.get("models", [])
 
@@ -759,7 +1189,7 @@ async def _enrich_agent_models(agent: Dict[str, Any], config_service: Configurat
         return
 
     try:
-        ai_models = await config_service.get_config(config_node_constants.AI_MODELS.value, use_cache=True)
+        ai_models = await config_service.get_config(config_node_constants.AI_MODELS.value, use_cache=False)
         llm_configs = ai_models.get("llm", []) if ai_models else []
 
         enriched_models = []
@@ -817,7 +1247,7 @@ async def _enrich_agent_models(agent: Dict[str, Any], config_service: Configurat
         logger.warning(f"Failed to enrich models: {e}")
 
 
-def _parse_request_body(body: bytes) -> Dict[str, Any]:
+def _parse_request_body(body: bytes) -> dict[str, Any]:
     """Parse and validate JSON request body"""
     if not body:
         raise InvalidRequestError("Request body is required")
@@ -825,7 +1255,7 @@ def _parse_request_body(body: bytes) -> Dict[str, Any]:
     try:
         return json.loads(body.decode('utf-8'))
     except json.JSONDecodeError as e:
-        raise InvalidRequestError(f"Invalid JSON: {str(e)}")
+        raise InvalidRequestError(f"Invalid JSON: {str(e)}") from e
 
 
 # ============================================================================
@@ -866,6 +1296,9 @@ async def askAI(request: Request, query_info: ChatQuery) -> JSONResponse:
         # Build and execute graph
         selected_graph = await _select_agent_graph_for_query(query_info.model_dump(), logger, services["llm"])
 
+        has_sql_connector = await has_sql_connector_configured(
+            graph_provider, enriched_user_info["userId"], enriched_user_info["orgId"]
+        )
         if selected_graph == deep_agent_graph:
             initial_state = build_deep_agent_state(
                 query_info.model_dump(),
@@ -877,6 +1310,9 @@ async def askAI(request: Request, query_info: ChatQuery) -> JSONResponse:
                 reranker_service,
                 config_service,
                 org_info,
+                query_info.modelName,
+                query_info.modelKey,
+                has_sql_connector=has_sql_connector,
             )
         else:
             graph_type = "react" if selected_graph == modern_agent_graph else "legacy"
@@ -889,8 +1325,11 @@ async def askAI(request: Request, query_info: ChatQuery) -> JSONResponse:
                 graph_provider,
                 reranker_service,
                 config_service,
+                query_info.modelName,
+                query_info.modelKey,
                 org_info,
                 graph_type,
+                has_sql_connector=has_sql_connector,
             )
 
         graph_to_use = selected_graph
@@ -943,25 +1382,29 @@ async def askAI(request: Request, query_info: ChatQuery) -> JSONResponse:
         raise
     except Exception as e:
         logger.error(f"Error in askAI: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 async def stream_response(
-    query_info: Dict[str, Any],
-    user_info: Dict[str, Any],
+    query_info: dict[str, Any],
+    user_info: dict[str, Any],
     llm: BaseChatModel,
     logger: Logger,
     retrieval_service: RetrievalService,
-    graph_provider,
+    graph_provider: IGraphDBProvider,
     reranker_service: RerankerService,
     config_service: ConfigurationService,
-    org_info: Dict[str, Any] = None,
-    agent: Dict[str, Any] = None,
+    org_info: dict[str, Any] = None,
+    modelName: str = None,
+    modelKey: str = None,
 ) -> AsyncGenerator[str, None]:
     """Stream agent response"""
     try:
-        selected_graph = await _select_agent_graph_for_query(query_info, logger, llm, agent=agent)
+        selected_graph = await _select_agent_graph_for_query(query_info, logger, llm)
 
+        has_sql_connector = await has_sql_connector_configured(
+            graph_provider, user_info["userId"], user_info["orgId"]
+        )
         if selected_graph == deep_agent_graph:
             graph_type = "deep"
             initial_state = build_deep_agent_state(
@@ -974,6 +1417,9 @@ async def stream_response(
                 reranker_service,
                 config_service,
                 org_info,
+                modelName,
+                modelKey,
+                has_sql_connector=has_sql_connector,
             )
         else:
             graph_type = "react" if selected_graph == modern_agent_graph else "legacy"
@@ -986,8 +1432,11 @@ async def stream_response(
                 graph_provider,
                 reranker_service,
                 config_service,
+                modelName,
+                modelKey,
                 org_info,
                 graph_type,
+                has_sql_connector=has_sql_connector,
             )
 
         config = {"recursion_limit": 50}
@@ -1037,6 +1486,8 @@ async def askAIStream(request: Request, query_info: ChatQuery) -> StreamingRespo
                 reranker_service,
                 config_service,
                 org_info,
+                query_info.modelName,
+                query_info.modelKey,
             ),
             media_type="text/event-stream",
             headers={
@@ -1049,7 +1500,7 @@ async def askAIStream(request: Request, query_info: ChatQuery) -> StreamingRespo
         raise
     except Exception as e:
         services["logger"].error(f"Error in askAIStream: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ============================================================================
@@ -1117,7 +1568,7 @@ async def create_agent_template(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         services["logger"].error(f"Error creating template: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
 
 @router.get("/template/list", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
@@ -1142,7 +1593,7 @@ async def get_agent_templates(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         services["logger"].error(f"Error getting templates: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.get("/template/{template_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
@@ -1170,7 +1621,7 @@ async def get_agent_template(request: Request, template_id: str) -> JSONResponse
         raise
     except Exception as e:
         services["logger"].error(f"Error getting template: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/share-template/{template_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -1202,7 +1653,7 @@ async def share_agent_template(request: Request, template_id: str) -> JSONRespon
         raise
     except Exception as e:
         services["logger"].error(f"Error sharing template: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/template/{template_id}/clone", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -1227,7 +1678,7 @@ async def clone_agent_template(request: Request, template_id: str) -> JSONRespon
         raise
     except Exception as e:
         services["logger"].error(f"Error cloning template: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.delete("/template/{template_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -1251,7 +1702,7 @@ async def delete_agent_template(request: Request, template_id: str) -> JSONRespo
         raise
     except Exception as e:
         services["logger"].error(f"Error deleting template: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.put("/template/{template_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -1276,7 +1727,7 @@ async def update_agent_template(request: Request, template_id: str) -> JSONRespo
         raise
     except Exception as e:
         services["logger"].error(f"Error updating template: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ============================================================================
@@ -1303,6 +1754,8 @@ async def create_agent(request: Request) -> JSONResponse:
         raw_models = body.get("models", [])
         model_entries, has_reasoning_model = _parse_models(raw_models, logger)
 
+
+
         if not model_entries:
             raise InvalidRequestError(
                 "At least one AI model is required. Please add a model to your configuration."
@@ -1314,11 +1767,15 @@ async def create_agent(request: Request) -> JSONResponse:
             )
 
         # Parse toolsets and knowledge BEFORE starting transaction
-        toolsets_with_tools = _parse_toolsets(body.get("toolsets", []), logger)
-        knowledge_sources = _parse_knowledge_sources(body.get("knowledge", []), logger)
+        toolsets_with_tools = _parse_toolsets(body.get("toolsets", []))
+        knowledge_sources = _parse_knowledge_sources(body.get("knowledge", []))
+        web_search_attachment = _parse_web_search(body.get("webSearch"))
 
         # Validate shareWithOrg + toolsets combination BEFORE starting transaction
-        share_with_org = body.get("shareWithOrg", False)
+        is_service_account = bool(body.get("isServiceAccount", False))
+        # Service account agents must always be org-wide so internal calls can access them
+        # without requiring individual user permission edges.
+        share_with_org = True if is_service_account else bool(body.get("shareWithOrg", False))
 
         # Create agent document
         agent_key = str(uuid.uuid4())
@@ -1331,7 +1788,9 @@ async def create_agent(request: Request) -> JSONResponse:
             "instructions": body.get("instructions", "").strip() or None,
             "models": model_entries,
             "tags": body.get("tags", []) or [],
+            "webSearch": web_search_attachment,
             "isActive": True,
+            "isServiceAccount": is_service_account,
             "createdBy": user_key,
             "updatedBy": None,
             "createdAtTimestamp": time,
@@ -1440,14 +1899,15 @@ async def create_agent(request: Request) -> JSONResponse:
                     await graph_provider.batch_upsert_nodes(toolset_nodes, CollectionNames.AGENT_TOOLSETS.value, transaction=transaction_id)
 
                 # Create agent -> toolset edges
-                agent_toolset_edges = []
-                for toolset_name, toolset_info in toolset_mapping.items():
-                    agent_toolset_edges.append({
+                agent_toolset_edges = [
+                    {
                         "_from": f"{CollectionNames.AGENT_INSTANCES.value}/{agent_key}",
                         "_to": f"{CollectionNames.AGENT_TOOLSETS.value}/{toolset_info['key']}",
                         "createdAtTimestamp": time,
                         "updatedAtTimestamp": time,
-                    })
+                    }
+                    for toolset_info in toolset_mapping.values()
+                ]
                 if agent_toolset_edges:
                     await graph_provider.batch_create_edges(agent_toolset_edges, CollectionNames.AGENT_HAS_TOOLSET.value, transaction=transaction_id)
 
@@ -1456,7 +1916,7 @@ async def create_agent(request: Request) -> JSONResponse:
                 tool_nodes = []
                 toolset_tool_edges = []
 
-                for toolset_name, toolset_info in toolset_mapping.items():
+                for toolset_info in toolset_mapping.values():
                     for tool_data in toolset_info["tools"]:
                         tool_name = tool_data["name"]
                         full_name = tool_data["fullName"]
@@ -1498,7 +1958,7 @@ async def create_agent(request: Request) -> JSONResponse:
                     await graph_provider.batch_create_edges(toolset_tool_edges, CollectionNames.TOOLSET_HAS_TOOL.value, transaction=transaction_id)
 
                 # Build response for created toolsets
-                for toolset_name, toolset_info in toolset_mapping.items():
+                for toolset_info in toolset_mapping.values():
                     created_tools = []
                     for tool_data in toolset_info["tools"]:
                         full_name = tool_data["fullName"]
@@ -1551,24 +2011,27 @@ async def create_agent(request: Request) -> JSONResponse:
                     await graph_provider.batch_upsert_nodes(knowledge_nodes, CollectionNames.AGENT_KNOWLEDGE.value, transaction=transaction_id)
 
                 # Create agent -> knowledge edges
-                agent_knowledge_edges = []
-                for connector_id, knowledge_info in knowledge_mapping.items():
-                    agent_knowledge_edges.append({
+                agent_knowledge_edges = [
+                    {
                         "_from": f"{CollectionNames.AGENT_INSTANCES.value}/{agent_key}",
                         "_to": f"{CollectionNames.AGENT_KNOWLEDGE.value}/{knowledge_info['key']}",
                         "createdAtTimestamp": time,
                         "updatedAtTimestamp": time,
-                    })
+                    }
+                    for knowledge_info in knowledge_mapping.values()
+                ]
                 if agent_knowledge_edges:
                     await graph_provider.batch_create_edges(agent_knowledge_edges, CollectionNames.AGENT_HAS_KNOWLEDGE.value, transaction=transaction_id)
 
                 # Build response for created knowledge
-                for connector_id, knowledge_info in knowledge_mapping.items():
-                    created_knowledge.append({
+                created_knowledge.extend(
+                    {
                         "connectorId": connector_id,
                         "key": knowledge_info["key"],
-                        "filters": knowledge_info["filters"]
-                    })
+                        "filters": knowledge_info["filters"],
+                    }
+                    for knowledge_info in knowledge_mapping.values()
+                )
 
                 logger.debug(f"Created {len(created_knowledge)} knowledge source(s) for agent: {agent_key}")
 
@@ -1590,7 +2053,7 @@ async def create_agent(request: Request) -> JSONResponse:
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to create agent: {str(e)}"
-            )
+            ) from e
 
         # Build response
         response_agent = {
@@ -1598,6 +2061,9 @@ async def create_agent(request: Request) -> JSONResponse:
             "toolsets": created_toolsets,
             "knowledge": created_knowledge,
         }
+        response_agent["webSearch"] = _format_web_search_for_response(
+            response_agent.get("webSearch"),
+        )
 
         status = "partial_success" if failed_toolsets else "success"
         message = f"Agent created with warnings: {len(failed_toolsets)} toolset(s) failed" if failed_toolsets else "Agent created successfully"
@@ -1616,7 +2082,78 @@ async def create_agent(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         logger.error(f"Error creating agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+@router.get("/{agent_id}/internal/service-account", dependencies=[Depends(authMiddleware)])
+async def get_agent_internal(request: Request, agent_id: str) -> JSONResponse:
+    """
+    Internal route: verify that an agent is a service account and return its
+    data.  Called by the Node.js gateway after hydrating a Slack scoped token
+    into a regular user JWT (the hydrated user is the org admin, who always has
+    access to any org-shared agent).
+
+    Returns 403 if the agent exists but is NOT a service account, 404 if not
+    found.  Service account agents are always org-wide by invariant, so the
+    standard get_agent() permission check will pass for the hydrated admin user.
+    """
+    try:
+        services = await get_services(request)
+
+        agent = await services["graph_provider"].get_agent(agent_id)
+        if not agent:
+            raise AgentNotFoundError(agent_id)
+
+        # Guard: this internal route is exclusively for service account agents.
+        if not agent.get("isServiceAccount"):
+            raise HTTPException(
+                status_code=403,
+                detail="This endpoint is only accessible for service account agents.",
+            )
+
+        await _enrich_agent_models(agent, services["config_service"], services["logger"])
+        agent.pop("modelsEnriched", None)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "message": "Agent retrieved successfully",
+                "isServiceAccount": True,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.get("/web-search-usage/{provider}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
+async def get_web_search_provider_usage(request: Request, provider: str) -> JSONResponse:
+    """Return agents in the org that use a specific web search provider."""
+    try:
+        services = await get_services(request)
+        user_context = _get_user_context(request)
+        org_key = user_context["orgId"]
+
+        provider = provider.strip().lower()
+        if provider not in _SUPPORTED_WEB_SEARCH_PROVIDERS:
+            return JSONResponse(
+                status_code=200,
+                content={"success": True, "agents": []},
+            )
+
+        agents = await services["graph_provider"].get_agents_by_web_search_provider(
+            org_key, provider
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={"success": True, "agents": agents},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
 
 @router.get("/{agent_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
 async def get_agent(request: Request, agent_id: str) -> JSONResponse:
@@ -1627,14 +2164,21 @@ async def get_agent(request: Request, agent_id: str) -> JSONResponse:
         org_key = user_context["orgId"]
 
         user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
 
+        perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+        if not perm:
+            raise AgentNotFoundError(agent_id)
+
+        agent = await services["graph_provider"].get_agent(agent_id, org_key)
         if not agent:
             raise AgentNotFoundError(agent_id)
+
+        agent.update(perm)
 
         # Enrich models with configurations
         await _enrich_agent_models(agent, services["config_service"], services["logger"])
         agent.pop("modelsEnriched", None)
+        agent["webSearch"] = _format_web_search_for_response(agent.get("webSearch"))
 
         return JSONResponse(
             status_code=200,
@@ -1648,36 +2192,81 @@ async def get_agent(request: Request, agent_id: str) -> JSONResponse:
         raise
     except Exception as e:
         services["logger"].error(f"Error getting agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.get("/", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
-async def get_agents(request: Request) -> JSONResponse:
-    """Get all agents"""
+async def get_agents(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    limit: int = Query(20, ge=1, le=200, description="Items per page"),
+    search: str | None = Query(None, description="Search by name/description/tags"),
+    sort_by: str = Query("updatedAtTimestamp", description="Field to sort by"),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$", description="Sort order"),
+    is_deleted: bool = Query(False, alias="isDeleted", description="When true, return only soft-deleted agents",),
+) -> JSONResponse:
+    """Get all agents with pagination and search"""
     try:
         services = await get_services(request)
         user_context = _get_user_context(request)
         org_key = user_context["orgId"]
 
         user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
-        agents = await services["graph_provider"].get_all_agents(user_doc["_key"], org_key)
+        user_key = user_doc["_key"]
 
-        if not agents:
-            raise HTTPException(status_code=404, detail="No agents found")
+        # Delegate pagination/search/sort to graph provider
+        result = await services["graph_provider"].get_all_agents(
+            user_key,
+            org_key,
+            page=page,
+            limit=limit,
+            search=search,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            is_deleted=is_deleted,
+        )
+
+        # Providers return either a simple list (backward-compat) or a dict with agents and totalItems
+        if isinstance(result, list):
+            agents = result
+            total_items = len(agents)
+        else:
+            agents = result.get("agents", [])
+            total_items = int(result.get("totalItems", len(agents)))
+
+        for agent in agents:
+            if isinstance(agent, dict):
+                agent["webSearch"] = _format_web_search_for_response(agent.get("webSearch"))
+
+        # Build pagination envelope
+        current_page = page
+        per_page = limit
+        total_pages = (total_items + per_page - 1) // per_page if per_page > 0 else 0
+        has_next = current_page < total_pages
+        has_prev = current_page > 1
+
+        # Avoid 404s; return empty list with valid pagination
 
         return JSONResponse(
             status_code=200,
             content={
-                "status": "success",
-                "message": "Agents retrieved successfully",
-                "agents": agents,
+                "success": True,
+                "agents": agents or [],
+                "pagination": {
+                    "currentPage": current_page,
+                    "limit": per_page,
+                    "totalItems": total_items,
+                    "totalPages": total_pages,
+                    "hasNext": has_next,
+                    "hasPrev": has_prev,
+                },
             }
         )
     except HTTPException:
         raise
     except Exception as e:
         services["logger"].error(f"Error getting agents: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.put("/{agent_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -1708,13 +2297,36 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                     "At least one reasoning model is required. Please add a reasoning model to your configuration."
                 )
 
-        # Check permissions
-        agent = await services["graph_provider"].get_agent(agent_id, user_key, org_key)
+        # Check permissions first, then fetch full agent data
+        perm = await services["graph_provider"].check_agent_permission(agent_id, user_key, org_key)
+        if not perm:
+            raise AgentNotFoundError(agent_id)
+
+        if not perm.get("can_edit", False):
+            raise PermissionDeniedError("edit this agent (only owner can edit)")
+
+        agent = await services["graph_provider"].get_agent(agent_id, org_key)
         if not agent:
             raise AgentNotFoundError(agent_id)
 
-        if not agent.get("can_edit", False):
-            raise PermissionDeniedError("edit this agent (only owner can edit)")
+        agent.update(perm)
+
+        # Guard: once an agent is marked as a service account it cannot be downgraded.
+        # Allowing the reverse would leave orphaned agent-scoped toolset credentials
+        # (stored under /services/toolsets/{instanceId}/{agentKey}) with no clear owner
+        # and would confuse the toolset-fetching logic on the frontend.
+        if "isServiceAccount" in body:
+            current_is_sa = bool(agent.get("isServiceAccount", False))
+            requested_is_sa = bool(body.get("isServiceAccount", False))
+            if current_is_sa and not requested_is_sa:
+                raise InvalidRequestError(
+                    "A service account agent cannot be converted back to a regular agent."
+                )
+            # When converting to a service account, ensure org-wide sharing is enabled.
+            # Service account agents must always have an ORG permission edge so that
+            # internal calls (e.g. from Slack) can access them via the org admin user.
+            if requested_is_sa and not current_is_sa:
+                body["shareWithOrg"] = True
 
         # Handle shareWithOrg flag changes
         if "shareWithOrg" in body:
@@ -1740,7 +2352,13 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                 logger.info(f"Created org permission edge for agent {agent_id}")
 
             elif not new_share_with_org and current_share_with_org:
-                # Turning OFF org sharing: delete the org permission edge using the standard delete_edge method
+                # Service account agents must always be org-shared — reject the request.
+                if bool(agent.get("isServiceAccount", False)):
+                    raise InvalidRequestError(
+                        "Cannot disable org-wide sharing for a service account agent. "
+                        "Service account agents must always be shared across the organisation."
+                    )
+                # Turning OFF org sharing: delete the org permission edge
                 await services["graph_provider"].delete_edge(
                     from_id=org_key,
                     from_collection=CollectionNames.ORGS.value,
@@ -1751,7 +2369,12 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                 logger.info(f"Deleted org permission edge for agent {agent_id}")
 
 
+        # Normalize webSearch attachment before persisting
+        if "webSearch" in body:
+            body["webSearch"] = _parse_web_search(body.get("webSearch"))
+
         # Update agent document
+        # Persist update (use original body to avoid changing storage format)
         result = await services["graph_provider"].update_agent(agent_id, body, user_key, org_key)
         if not result:
             raise HTTPException(status_code=500, detail="Failed to update agent")
@@ -1759,7 +2382,7 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
         # Update toolsets if provided in request (even if empty array - means delete all)
         if "toolsets" in body:
             # Parse toolsets first to validate before deletion
-            toolsets_with_tools = _parse_toolsets(body.get("toolsets", []), logger)
+            toolsets_with_tools = _parse_toolsets(body.get("toolsets", []))
 
             # Use transaction for atomic delete-then-create operation
             graph_provider = services["graph_provider"]
@@ -1893,7 +2516,7 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Failed to delete toolset nodes and edges: {str(e)}"
-                )
+                ) from e
 
             # Create new toolset nodes, tool nodes, and edges only if there are toolsets to create
             if toolsets_with_tools:
@@ -1915,14 +2538,14 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                     raise HTTPException(
                         status_code=500,
                         detail=f"Failed to create toolset edges: {str(e)}"
-                    )
+                    ) from e
             else:
                 logger.info(f"All toolsets removed for agent {agent_id}")
 
         # Update knowledge if provided in request (even if empty array - means delete all)
         if "knowledge" in body:
             # Parse knowledge sources first to validate before deletion
-            knowledge_sources = _parse_knowledge_sources(body.get("knowledge", []), logger)
+            knowledge_sources = _parse_knowledge_sources(body.get("knowledge", []))
 
             # Use transaction for atomic delete-then-create operation
             graph_provider = services["graph_provider"]
@@ -2008,7 +2631,7 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Failed to delete knowledge nodes and edges: {str(e)}"
-                )
+                ) from e
 
             # Create new knowledge nodes and edges only if there are knowledge sources to create
             if knowledge_sources:
@@ -2025,7 +2648,7 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
                     raise HTTPException(
                         status_code=500,
                         detail=f"Failed to create knowledge edges: {str(e)}"
-                    )
+                    ) from e
             else:
                 logger.info(f"All knowledge sources removed for agent {agent_id}")
 
@@ -2037,11 +2660,11 @@ async def update_agent(request: Request, agent_id: str) -> JSONResponse:
         raise
     except Exception as e:
         logger.error(f"Error updating agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 @router.delete("/{agent_id}", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
 async def delete_agent(request: Request, agent_id: str) -> JSONResponse:
-    """Delete an agent using a transaction to ensure atomicity"""
+    """Soft-delete an agent (tombstone) using a transaction to ensure atomicity."""
     txn_id = None
     services = None
     try:
@@ -2050,13 +2673,19 @@ async def delete_agent(request: Request, agent_id: str) -> JSONResponse:
         org_key = user_context["orgId"]
 
         user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
 
+        perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+        if not perm:
+            raise AgentNotFoundError(agent_id)
+
+        if not perm.get("can_delete", False):
+            raise PermissionDeniedError("delete this agent (only owner can delete)")
+
+        agent = await services["graph_provider"].get_agent(agent_id, org_key)
         if not agent:
             raise AgentNotFoundError(agent_id)
 
-        if not agent.get("can_delete", False):
-            raise PermissionDeniedError("delete this agent (only owner can delete)")
+        agent.update(perm)
 
         # Begin transaction for atomic deletion
         txn_id = await services["graph_provider"].begin_transaction(
@@ -2079,16 +2708,46 @@ async def delete_agent(request: Request, agent_id: str) -> JSONResponse:
         )
         services["logger"].debug(f"🔄 Started transaction {txn_id} for agent deletion")
 
-        # Use hard delete to completely remove agent and all related nodes/edges
-        result = await services["graph_provider"].hard_delete_agent(agent_id, transaction=txn_id)
-        if not result or result.get("agents_deleted", 0) == 0:
+        # Soft-delete: marks the agent instance deleted; related toolsets/tools/knowledge remain.
+        result = await services["graph_provider"].delete_agent(
+            agent_id, user_doc["_key"], org_key, transaction=txn_id
+        )
+        if not result:
             if txn_id is not None:
                 await services["graph_provider"].rollback_transaction(txn_id)
             raise HTTPException(status_code=500, detail="Failed to delete agent")
 
         # Commit transaction on success
         await services["graph_provider"].commit_transaction(txn_id)
-        services["logger"].info(f"✅ Successfully deleted agent {agent_id} in transaction {txn_id}")
+        services["logger"].info(f"✅ Successfully soft-deleted agent {agent_id} in transaction {txn_id}")
+
+        # For service account agents, stop in-process toolset token refresh tasks only.
+        # Credential paths under /services/toolsets/{instanceId}/{agentKey} stay in ETCD.
+        if agent.get("isServiceAccount"):
+            try:
+                refresh_service = None
+                try:
+                    from app.connectors.core.base.token_service.startup_service import (
+                        startup_service,
+                    )
+                    refresh_service = startup_service.get_toolset_token_refresh_service()
+                except Exception:
+                    pass
+                if refresh_service:
+                    config_service = services["config_service"]
+                    all_keys = await config_service.list_keys_in_directory("/services/toolsets/")
+                    for key in all_keys:
+                        # Path format: /services/toolsets/{instanceId}/{ownerId}
+                        parts = key.strip("/").split("/")
+                        if len(parts) >= 4 and parts[3] == agent_id:
+                            refresh_service.cancel_refresh_task(key)
+                            services["logger"].info(
+                                f"Cancelled toolset token refresh for service account agent path: {key}"
+                            )
+            except Exception as e:
+                services["logger"].warning(
+                    f"Failed to cancel toolset refresh tasks for deleted service account agent {agent_id}: {e}"
+                )
 
         return JSONResponse(
             status_code=200,
@@ -2096,13 +2755,13 @@ async def delete_agent(request: Request, agent_id: str) -> JSONResponse:
                 "status": "success",
                 "message": "Agent deleted successfully",
                 "deleted": {
-                    "agents": result.get("agents_deleted", 0),
-                    "toolsets": result.get("toolsets_deleted", 0),
-                    "tools": result.get("tools_deleted", 0),
-                    "knowledge": result.get("knowledge_deleted", 0),
-                    "edges": result.get("edges_deleted", 0)
-                }
-            }
+                    "agents": 1,
+                    "toolsets": 0,
+                    "tools": 0,
+                    "knowledge": 0,
+                    "edges": 0,
+                },
+            },
         )
     except HTTPException:
         if txn_id is not None and services is not None:
@@ -2122,7 +2781,7 @@ async def delete_agent(request: Request, agent_id: str) -> JSONResponse:
                 services["logger"].warning(f"⚠️ Failed to rollback transaction {txn_id}: {rb_err}")
         if services is not None:
             services["logger"].error(f"Error deleting agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ============================================================================
@@ -2142,12 +2801,12 @@ async def share_agent(request: Request, agent_id: str) -> JSONResponse:
         team_ids = body.get("teamIds", [])
 
         user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
 
-        if not agent:
+        perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+        if not perm:
             raise AgentNotFoundError(agent_id)
 
-        if not agent.get("can_share", False):
+        if not perm.get("can_share", False):
             raise PermissionDeniedError("share this agent")
 
         result = await services["graph_provider"].share_agent(agent_id, user_doc["_key"], org_key, user_ids, team_ids)
@@ -2162,7 +2821,7 @@ async def share_agent(request: Request, agent_id: str) -> JSONResponse:
         raise
     except Exception as e:
         services["logger"].error(f"Error sharing agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/{agent_id}/unshare", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -2178,12 +2837,12 @@ async def unshare_agent(request: Request, agent_id: str) -> JSONResponse:
         team_ids = body.get("teamIds", [])
 
         user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], services["logger"])
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
 
-        if not agent:
+        perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+        if not perm:
             raise AgentNotFoundError(agent_id)
 
-        if not agent.get("can_share", False):
+        if not perm.get("can_share", False):
             raise PermissionDeniedError("unshare this agent")
 
         result = await services["graph_provider"].unshare_agent(agent_id, user_doc["_key"], org_key, user_ids, team_ids)
@@ -2198,7 +2857,7 @@ async def unshare_agent(request: Request, agent_id: str) -> JSONResponse:
         raise
     except Exception as e:
         services["logger"].error(f"Error unsharing agent: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.get("/{agent_id}/permissions", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_READ))])
@@ -2227,7 +2886,7 @@ async def get_agent_permissions(request: Request, agent_id: str) -> JSONResponse
         raise
     except Exception as e:
         services["logger"].error(f"Error getting permissions: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.put("/{agent_id}/permissions", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_WRITE))])
@@ -2260,7 +2919,7 @@ async def update_agent_permission(request: Request, agent_id: str) -> JSONRespon
         raise
     except Exception as e:
         services["logger"].error(f"Error updating permission: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ============================================================================
@@ -2281,23 +2940,35 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
         user_context = _get_user_context(request)
         org_key = user_context["orgId"]
 
-
-        # Get user and org info
-        user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
-        enriched_user_info = await _enrich_user_info(user_context, user_doc)
         org_info = await _get_org_info(user_context, services["graph_provider"], logger)
 
-        # Get agent
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
+        agent = await services["graph_provider"].get_agent(agent_id, org_key)
         if not agent:
             raise AgentNotFoundError(agent_id)
+        is_service_account = agent.get("isServiceAccount", False)
+
+        if is_service_account:
+            enriched_user_info = await _enrich_user_info_for_service_account_agent_chat(
+                agent, graph_provider, logger
+            )
+            perm = {"can_edit": False, "can_share": False, "role": "viewer"}
+        else:
+            # Standard user path: look up the user document and verify permissions.
+            user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
+            enriched_user_info = await _enrich_user_info(user_context, user_doc)
+            perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+            if not perm:
+                raise AgentNotFoundError(agent_id)
+
+        agent.update(perm)
+
+        agent_knowledge = agent.get("knowledge", [])
 
         # Build filters from knowledge array (new format)
         filters = chat_query.filters.copy() if chat_query.filters else {}
 
         if not chat_query.filters:
             # Extract knowledge sources from agent's knowledge array
-            agent_knowledge = agent.get("knowledge", [])
             knowledge_connector_ids = []
             kb_record_groups = []
 
@@ -2337,6 +3008,22 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
         if agent.get("connectors"):
             filters["connectors"] = agent.get("connectors", [])
 
+        _chat_conn_ids = [
+            k["connectorId"] for k in agent_knowledge
+            if isinstance(k, dict) and k.get("connectorId")
+            and not str(k["connectorId"]).startswith("knowledgeBase_")
+        ]
+        connector_configs = await fetch_connector_configs(config_service, _chat_conn_ids)
+        web_search_provider = _parse_web_search(agent.get("webSearch"))
+        web_search_tool_config = await _resolve_web_search_tool_config(
+            web_search_provider,
+            config_service,
+            logger,
+        )
+        if not _is_web_search_enabled(chat_query.tools):
+            web_search_provider = None
+            web_search_tool_config = None
+
         # Build query info
         query_info = {
             "query": chat_query.query,
@@ -2348,13 +3035,22 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
             "retrievalMode": chat_query.retrievalMode,
             "filters": filters,
             "tools": chat_query.tools if chat_query.tools is not None else agent.get("tools"),
+            "knowledge": agent_knowledge,
+            "connector_configs": connector_configs,
             "systemPrompt": agent.get("systemPrompt"),
             "instructions": agent.get("instructions"),
             "timezone": chat_query.timezone,
             "currentTime": chat_query.currentTime,
+            "conversationId": chat_query.conversationId,
+            "is_service_account": is_service_account,
+            "webSearch": web_search_provider,
+            "webSearchConfig": web_search_tool_config,
         }
-        selected_graph = await _select_agent_graph_for_query(query_info, logger, llm, agent=agent)
+        selected_graph = await _select_agent_graph_for_query(query_info, logger, llm)
 
+        has_sql_connector = await has_sql_connector_configured(
+            graph_provider, enriched_user_info["userId"], enriched_user_info["orgId"]
+        )
         if selected_graph == deep_agent_graph:
             initial_state = build_deep_agent_state(
                 query_info,
@@ -2366,6 +3062,9 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
                 reranker_service,
                 config_service,
                 org_info,
+                chat_query.modelName,
+                chat_query.modelKey,
+                has_sql_connector=has_sql_connector,
             )
         else:
             graph_type = "react" if selected_graph == modern_agent_graph else "legacy"
@@ -2378,8 +3077,11 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
                 graph_provider,
                 reranker_service,
                 config_service,
+                chat_query.modelName,
+                chat_query.modelKey,
                 org_info,
                 graph_type,
+                has_sql_connector=has_sql_connector,
             )
 
         graph_to_use = selected_graph
@@ -2405,7 +3107,7 @@ async def chat(request: Request, agent_id: str, chat_query: ChatQuery) -> JSONRe
         raise
     except Exception as e:
         logger.error(f"Error in chat: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/{agent_id}/chat/stream", dependencies=[Depends(require_scopes(OAuthScopes.AGENT_EXECUTE))])
@@ -2428,15 +3130,44 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
         body = _parse_request_body(await request.body())
         chat_query = ChatQuery(**body)
 
-        # Get user and org info first (needed to fetch agent)
-        user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
-        enriched_user_info = await _enrich_user_info(user_context, user_doc)
+        _MAX_TOOLS = 128
+        if chat_query.tools is not None and len(chat_query.tools) > _MAX_TOOLS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many tools: maximum {_MAX_TOOLS} tools are allowed per request.",
+            )
+
         org_info = await _get_org_info(user_context, services["graph_provider"], logger)
 
-        # Get agent before LLM init so we can fall back to its model config
-        agent = await services["graph_provider"].get_agent(agent_id, user_doc["_key"], org_key)
-        if not agent:
-            raise AgentNotFoundError(agent_id)
+        if agent_id == "agentIdPlaceholder":
+            toolset_registry = getattr(request.app.state, "toolset_registry", None)
+            agent = await get_assistant_agent(user_context["userId"], org_key, config_service, graph_provider, toolset_registry, logger)
+            user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
+            enriched_user_info = await _enrich_user_info(user_context, user_doc)
+            perm = {"can_edit": False, "can_share": False, "role": "viewer"}
+            is_service_account = False
+
+        else:
+            agent = await services["graph_provider"].get_agent(agent_id, org_key)
+            if not agent:
+                raise AgentNotFoundError(agent_id)
+            is_service_account = agent.get("isServiceAccount", False)
+
+            if is_service_account:
+                enriched_user_info = await _enrich_user_info_for_service_account_agent_chat(
+                    agent, graph_provider, logger
+                )
+                perm = {"can_edit": False, "can_share": False, "role": "viewer"}
+                logger.debug(f"loaded service account agent. enriched_user_info: {enriched_user_info}")
+            else:
+                # Standard user path: look up the user document and verify permissions.
+                user_doc = await _get_user_document(user_context["userId"], services["graph_provider"], logger)
+                enriched_user_info = await _enrich_user_info(user_context, user_doc)
+                perm = await services["graph_provider"].check_agent_permission(agent_id, user_doc["_key"], org_key)
+                if not perm:
+                    raise AgentNotFoundError(agent_id)
+
+        agent.update(perm)
 
         # Determine model key/name: prefer explicit query params, then agent's first model
         model_key = chat_query.modelKey
@@ -2458,19 +3189,25 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
                 logger.info(f"Using agent's first model for LLM: modelKey={model_key}, modelName={model_name}")
 
         # Get LLM for chat
-        llm = (await get_llm_for_chat(
+        llm_result = (await get_llm_for_chat(
             services["config_service"],
             model_key,
             model_name,
             chat_query.chatMode
-        ))[0]
+        ))
 
-        if not llm:
+        if not llm_result:
             raise LLMInitializationError()
+
+        llm = llm_result[0]
+        llm_config = llm_result[1]
+
+        if not llm_config.get("isReasoning", False):
+            raise ReasoningModelRequiredError()
 
         # Get and filter toolsets
         agent_toolsets = agent.get("toolsets", [])
-        if chat_query.tools:
+        if chat_query.tools is not None:
             enabled_tools_set = set(chat_query.tools)
             filtered_toolsets = []
             for toolset in agent_toolsets:
@@ -2485,22 +3222,29 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
             agent_toolsets = filtered_toolsets
 
         # ============================================================================
-        # LOAD TOOLSET CONFIGS FOR EXECUTING USER (SECURITY-CRITICAL)
+        # LOAD TOOLSET CONFIGS (SECURITY-CRITICAL)
         # ============================================================================
-        # Load toolset configs from ETCD using the EXECUTING user's ID, not the owner's.
+        # For normal agents: load toolset configs using the EXECUTING user's ID.
         # This ensures that when a shared agent is executed, the credentials of the
         # user making the request are used — not the agent creator's credentials.
+        #
+        # For service account agents: load toolset configs using the AGENT KEY.
+        # The agent has its own credentials stored at /services/toolsets/{instanceId}/{agentKey}
+        # These credentials are shared across all users who use this agent.
         #
         # SECURITY MODEL:
         # 1. Toolset nodes in graph DB contain ONLY: instanceId, name, displayName, tools
         # 2. NO userId is stored in toolset nodes (prevents credential leakage)
-        # 3. User credentials fetched from: /services/toolsets/{instanceId}/{userId}
-        # 4. userId ALWAYS comes from authenticated request context (not stored in DB)
-        # 5. instanceId is the UUID of the admin-created toolset instance
+        # 3. User credentials: /services/toolsets/{instanceId}/{userId}
+        # 4. Agent credentials: /services/toolsets/{instanceId}/{agentKey}
+        # 5. The lookup key comes from authenticated request context (user) or agent key
         # ============================================================================
 
+        is_service_account = bool(agent.get("isServiceAccount", False))
         executing_user_id = user_context["userId"]
-        toolset_configs: dict = {}  # SENSITIVE: Contains user credentials
+        # For service account agents, credentials are keyed by agentKey not userId
+        credential_lookup_id = agent_id if is_service_account else executing_user_id
+        toolset_configs: dict = {}  # SENSITIVE: Contains user/agent credentials
 
         # Filter to toolsets that actually have a name or instanceId before the concurrent fetch
         named_toolsets = [t for t in agent_toolsets if t.get("instanceId") or t.get("name")]
@@ -2513,12 +3257,13 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
 
                 Uses instanceId (admin-created instance) if available, otherwise falls
                 back to the legacy toolset name for backward compatibility.
+                For service account agents, uses agentKey as the credential owner.
                 """
                 instance_id = toolset.get("instanceId")
                 toolset_name = toolset.get("name", "")
                 lookup_key = instance_id
                 try:
-                    etcd_path = get_toolset_config_path(lookup_key, executing_user_id)
+                    etcd_path = get_toolset_config_path(lookup_key, credential_lookup_id)
                     config = await services["config_service"].get_config(etcd_path)
                     return toolset, config
                 except Exception as exc:
@@ -2547,17 +3292,19 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
                 elif config:
                     # Config saved but authentication not completed (e.g. OAuth flow pending)
                     unauthenticated_toolset_display_names.append(display_name)
+                    cred_owner = f"agent '{agent_id}'" if is_service_account else f"user '{executing_user_id}'"
                     logger.warning(
                         f"Toolset '{toolset_name}' (instance='{instance_id}') is configured but not "
-                        f"authenticated for user '{executing_user_id}'. User needs to complete the auth flow."
+                        f"authenticated for {cred_owner}. Auth flow needs to be completed."
                     )
                 else:
                     # No config found at all
                     missing_toolset_display_names.append(display_name)
+                    cred_owner = f"agent '{agent_id}'" if is_service_account else f"user '{executing_user_id}'"
                     logger.warning(
-                        f"Toolset config not found for user '{executing_user_id}' / "
+                        f"Toolset config not found for {cred_owner} / "
                         f"toolset '{toolset_name}' (instance='{instance_id}'). "
-                        "User needs to configure this integration."
+                        "Credentials need to be configured."
                     )
 
             # Hard-block if ANY toolset is either unconfigured or unauthenticated
@@ -2570,13 +3317,21 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
                     unauth_list = ", ".join(f"'{n}'" for n in unauthenticated_toolset_display_names)
                     problem_parts.append(f"not authenticated: {unauth_list}")
 
-                error_message = (
-                    f"This agent requires the following toolset(s) to be set up — "
-                    f"{'; '.join(problem_parts)}. "
-                    "Please connect your account(s) in Settings → Toolsets before using this agent."
-                )
+                if is_service_account:
+                    error_message = (
+                        f"This service account agent requires the following toolset(s) to be configured — "
+                        f"{'; '.join(problem_parts)}. "
+                        "Please configure the agent's toolset credentials in the Agent Builder → Manage Credentials."
+                    )
+                else:
+                    error_message = (
+                        f"This agent requires the following toolset(s) to be set up — "
+                        f"{'; '.join(problem_parts)}. "
+                        "Please connect your account(s) in Settings → Toolsets before using this agent."
+                    )
                 logger.info(
-                    f"Blocking agent {agent_id} execution for user '{executing_user_id}': "
+                    f"Blocking agent {agent_id} execution "
+                    f"({'service account' if is_service_account else f'user {executing_user_id!r}'}): "
                     f"toolset issue(s) — {'; '.join(problem_parts)}"
                 )
 
@@ -2648,16 +3403,38 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
                 filters["kb"] = kb_record_groups
             logger.info(f"Filters: {filters}")
 
-        # Narrow agent_knowledge to only the connectors present in filters["apps"]
-        # so the query_info knowledge list stays consistent with the resolved filters.
-        enabled_apps_set = set(filters.get("apps", []))
-        if enabled_apps_set:
-            agent_knowledge = [
-                k for k in agent_knowledge
-                if isinstance(k, dict) and k.get("connectorId") in enabled_apps_set
-            ]
+        # Apply NO_KB sentinel BEFORE filtering agent_knowledge. If we filter first while
+        # kb is still [], _filter_knowledge_by_enabled_sources early-returns the full list
+        # (both enabled sets empty); injecting kb afterward left knowledge out of sync with filters.
+        if not filters.get("kb") and agent_id != "agentIdPlaceholder":
+            filters["kb"] = [NO_KB_SELECTED_FILTER]
+
+        agent_knowledge = _filter_knowledge_by_enabled_sources(agent_knowledge, filters)
 
         logger.info(f"Filters: {filters}")
+
+        _stream_conn_ids = [
+            k["connectorId"] for k in agent_knowledge
+            if isinstance(k, dict) and k.get("connectorId")
+            and not str(k["connectorId"]).startswith("knowledgeBase_")
+        ]
+        connector_configs = await fetch_connector_configs(config_service, _stream_conn_ids)
+        web_search_provider = _parse_web_search(agent.get("webSearch"))
+        web_search_tool_config = None
+        if web_search_provider:
+            web_search_tool_config = await _resolve_web_search_tool_config(
+                web_search_provider,
+                config_service,
+                logger,
+            )
+        elif agent_id == "agentIdPlaceholder":
+            web_search_tool_config = await _resolve_default_web_search_config(
+                config_service,
+                logger,
+            )
+        if not _is_web_search_enabled(chat_query.tools):
+            web_search_provider = None
+            web_search_tool_config = None
 
         # Build query info
         query_info = {
@@ -2675,7 +3452,15 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
             "currentTime": chat_query.currentTime,
             "toolsets": agent_toolsets,
             "knowledge": agent_knowledge,
+            "connector_configs": connector_configs,
             "toolsetConfigs": toolset_configs,
+            "conversationId": chat_query.conversationId,
+            "is_service_account": is_service_account,
+            "isPlaceholderAgent": agent_id == "agentIdPlaceholder",
+            "modelName": model_name,
+            "modelKey": model_key,
+            "webSearch": web_search_provider,
+            "webSearchConfig": web_search_tool_config,
         }
 
         return StreamingResponse(
@@ -2689,7 +3474,8 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
                 reranker_service,
                 config_service,
                 org_info,
-                agent=agent,
+                modelName=model_name,
+                modelKey=model_key,
             ),
             media_type="text/event-stream",
             headers={
@@ -2702,4 +3488,131 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
         raise
     except Exception as e:
         logger.error(f"Error in chat_stream: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+async def get_assistant_agent(
+    user_id: str,
+    org_id: str,
+    config_service: ConfigurationService,
+    graph_provider: IGraphDBProvider,
+    toolset_registry: ToolsetRegistry,
+    logger: Logger,
+) -> dict:
+    """
+    Get the assistant agent with all authenticated toolsets and accessible connectors.
+
+    Args:
+        user_id: User ID
+        org_id: Organization ID
+        config_service: Configuration service for etcd access
+        graph_provider: Graph provider instance
+        toolset_registry: Toolset registry instance
+        logger: Logger instance
+
+    Returns:
+        Dictionary containing assistant agent configuration with toolsets and knowledge sources
+    """
+    from app.api.routes.toolsets import get_authenticated_toolsets
+
+    # Get authenticated toolsets using the helper method
+    try:
+        authenticated_toolsets_list = await get_authenticated_toolsets(
+            user_id=user_id,
+            org_id=org_id,
+            config_service=config_service,
+            registry=toolset_registry,
+        )
+    except Exception as e:
+        logger.error(f"Error fetching authenticated toolsets: {e}", exc_info=True)
+        authenticated_toolsets_list = []
+
+    # Get all accessible connectors for knowledge sources
+    knowledge_sources = []
+
+    try:
+        # Get active connector instances accessible to the user
+        user = await graph_provider.get_user_by_user_id(user_id=user_id)
+        if not user:
+            logger.error(f"User not found: {user_id}")
+            return {}
+        # Same `user_id` the graph expects as in kb_service (User id / document key).
+        user_key = user.get("id") or user.get("_key")
+
+        # One knowledge entry per accessible KB record group, matching normal agent shape.
+        try:
+            page_size = 500
+            skip = 0
+            while True:
+                kbs, total, _ = await graph_provider.list_user_knowledge_bases(
+                    user_id=user_key,
+                    org_id=org_id,
+                    skip=skip,
+                    limit=page_size,
+                )
+                for kb in kbs:
+                    kb_id = kb.get("id")
+                    if not kb_id:
+                        continue
+                    title = (kb.get("name") or "").strip() or "Untitled"
+                    one_group = {
+                        "recordGroups": [kb_id],
+                        "records": [],
+                    }
+                    kn: dict[str, Any] = {
+                        "connectorId": f"knowledgeBase_{org_id}",
+                        "name": title,
+                        "displayName": title,
+                        "type": Connectors.KNOWLEDGE_BASE.value,
+                        "filters": one_group,
+                        "filtersParsed": {
+                            "recordGroups": [kb_id],
+                            "records": [],
+                        },
+                    }
+                    knowledge_sources.append(kn)
+                if not kbs or skip + len(kbs) >= total:
+                    break
+                skip += page_size
+        except Exception as e:
+            logger.error(
+                f"Error listing org knowledge bases for assistant: {e}", exc_info=True
+            )
+
+        connectors = await graph_provider.get_user_apps(
+            user_id=user_key,
+        )
+        for connector in connectors:
+            connector_id = connector.get("id", "") or connector.get("_key", "")
+            connector_name = connector.get("name", "")
+            connector_type = connector.get("type", "")
+
+            if connector_type == Connectors.KNOWLEDGE_BASE.value:
+                continue
+            # Build knowledge source entry
+            knowledge_entry = {
+                "connectorId": connector_id,
+                "name": connector_name,
+                "displayName": connector_name,
+                "type": connector_type,
+                "filtersParsed": {
+                    "recordGroups": [],
+                    "records": []
+                }
+            }
+            knowledge_sources.append(knowledge_entry)
+    except Exception as e:
+        logger.error(f"Error fetching knowledge sources: {e}", exc_info=True)
+        knowledge_sources = []
+
+    # Return assistant agent configuration
+    return {
+        "systemPrompt": "You are a helpful AI assistant with access to various tools and knowledge sources. Use them to help users accomplish their tasks efficiently.",
+        "models": [],
+        "startMessage": "Hello! I'm your AI assistant. I have access to your connected tools and knowledge bases. How can I help you today?",
+        "name": "assistant",
+        "description": "AI assistant with access to all your authenticated tools and knowledge sources",
+        "isActive": True,
+        "tags": ["assistant", "general-purpose"],
+        "toolsets": authenticated_toolsets_list,
+        "knowledge": knowledge_sources,
+    }

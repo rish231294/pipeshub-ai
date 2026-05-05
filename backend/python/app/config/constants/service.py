@@ -10,11 +10,15 @@ class config_node_constants(Enum):
     QDRANT = "/services/qdrant"
     REDIS = "/services/redis"
     AI_MODELS = "/services/aiModels"
+    WEB_SEARCH = "/services/webSearch"
     KAFKA = "/services/kafka"
+    REDIS_STREAMS = "/services/redis-streams"
+    MESSAGE_BROKER = "/services/message-broker"
     ENDPOINTS = "/services/endpoints"
     SECRET_KEYS = "/services/secretKeys"
     STORAGE = "/services/storage"
     MIGRATIONS = "/services/migrations"
+    DEPLOYMENT = "/services/deployment"
 
     # Non-service paths
     # LOG_LEVEL = "/logLevel"
@@ -73,7 +77,7 @@ class DefaultEndpoints(Enum):
     QUERY_ENDPOINT = "http://localhost:8000"
     NODEJS_ENDPOINT = "http://localhost:3000"
     FRONTEND_ENDPOINT = "http://localhost:3001"
-    STORAGE_ENDPOINT = "http://localhost:3000"
+    STORAGE_ENDPOINT = "http://localhost:3000"  # noqa: PIE796
 
 class Routes(Enum):
     """Constants for routes"""
@@ -92,7 +96,10 @@ class Routes(Enum):
     STORAGE_PLACEHOLDER = "/api/v1/document/internal/placeholder"
     STORAGE_DIRECT_UPLOAD = "/api/v1/document/internal/{documentId}/directUpload"
     STORAGE_UPLOAD = "/api/v1/document/internal/upload"
+    STORAGE_UPLOAD_NEXT_VERSION = "/api/v1/document/internal/{documentId}/uploadNextVersion"
     STORAGE_DOWNLOAD = "/api/v1/document/internal/{documentId}/download"
+    STORAGE_DOWNLOAD_EXTERNAL = "/api/v1/document/{documentId}/download"
+    STORAGE_BUFFER = "/api/v1/document/internal/{documentId}/buffer"
 
 
 class WebhookConfig(Enum):
@@ -107,21 +114,60 @@ class WebhookConfig(Enum):
 class KafkaConfig(Enum):
     """Constants for kafka configuration"""
 
+    # Producer client IDs
     CLIENT_ID_RECORDS = "record-processor"
     CLIENT_ID_MAIN = "enterprise-search"
     CLIENT_ID_LLM = "llm-configuration"
     CLIENT_ID_ENTITY = "entity-producer"
+    CLIENT_ID_MESSAGING_PRODUCER = "messaging_producer_client"
+
+    # Consumer client IDs
+    CLIENT_ID_ENTITY_CONSUMER = "entity_consumer_client"
+    CLIENT_ID_SYNC_CONSUMER = "sync_consumer_client"
+    CLIENT_ID_RECORDS_CONSUMER = "records_consumer_client"
+    CLIENT_ID_AICONFIG_CONSUMER = "aiconfig_consumer_client"
+
+    # Consumer group IDs
+    GROUP_ID_ENTITY = "entity_consumer_group"
+    GROUP_ID_SYNC = "sync_consumer_group"
+    GROUP_ID_RECORDS = "records_consumer_group"
+    GROUP_ID_AICONFIG = "aiconfig_consumer_group"
 
 
 class CeleryConfig(Enum):
     """Constants for celery configuration"""
 
     TASK_SERIALIZER = "json"
-    RESULT_SERIALIZER = "json"
+    RESULT_SERIALIZER = "json"  # noqa: PIE796
     ACCEPT_CONTENT = ["json"]
     TIMEZONE = "UTC"
     ENABLE_UTC = True
     SCHEDULE = {"syncStartTime": "23:00", "syncPauseTime": "05:00"}
+
+
+class KVStoreType(str, Enum):
+    """Supported key-value store backends."""
+
+    REDIS = "redis"
+    ETCD = "etcd"
+
+
+class RedisEnv(str, Enum):
+    """Environment variable names for Redis configuration."""
+
+    KV_STORE_TYPE = "KV_STORE_TYPE"
+    HOST = "REDIS_HOST"
+    PORT = "REDIS_PORT"
+    PASSWORD = "REDIS_PASSWORD"
+    DB = "REDIS_DB"
+
+
+class RedisDefaults(str, Enum):
+    """Default values for Redis configuration."""
+
+    HOST = "localhost"
+    PORT = "6379"
+    DB = "0"
 
 
 class RedisConfig(Enum):

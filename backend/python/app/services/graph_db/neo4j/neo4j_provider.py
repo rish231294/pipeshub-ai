@@ -5,20 +5,21 @@ Minimal implementation of IGraphDBProvider using Neo4j for testing OneDrive conn
 Maps ArangoDB concepts (collections, _key, edges) to Neo4j concepts (labels, properties, relationships).
 """
 
+from __future__ import annotations
+
 import asyncio
-import traceback
 import hashlib
 import json
 import os
 import re
 import time
+import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from logging import Logger
 from typing import Any, Optional
 
 from fastapi import Request
-
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.arangodb import (
     RECORD_TYPE_COLLECTION_MAPPING,
@@ -43,17 +44,25 @@ from app.models.entities import (
     AppRole,
     AppUser,
     AppUserGroup,
+    ArtifactRecord,
     CommentRecord,
+    DealRecord,
     FileRecord,
     LinkRecord,
     MailRecord,
+    MeetingRecord,
+    Person,
+    ProductRecord,
     ProjectRecord,
     Record,
     RecordGroup,
     TicketRecord,
     User,
     WebpageRecord,
+    SQLTableRecord,
+    SQLViewRecord,
 )
+from app.models.permission import EntityType
 from app.schema.node_schema_registry import NODE_SCHEMA_REGISTRY, get_required_fields
 from app.schema.node_validator import NodeSchemaValidator
 from app.services.graph_db.common.utils import build_connector_stats_response
@@ -90,7 +99,7 @@ class Neo4jProvider(IGraphDBProvider):
         """
         self.logger = logger
         self.config_service = config_service
-        self.client: Optional[Neo4jClient] = None
+        self.client: Neo4jClient | None = None
         self.validator = NodeSchemaValidator()
 
     # ==================== Connection Management ====================
@@ -281,8 +290,8 @@ class Neo4jProvider(IGraphDBProvider):
                     "examples": tool.examples,
                     "tags": tool.tags,
                     "ctag": ctag,
-                    "created_at": existing_tool.get("created_at") if existing_tool else datetime.utcnow().isoformat(),
-                    "updated_at": datetime.utcnow().isoformat()
+                    "created_at": existing_tool.get("created_at") if existing_tool else datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat()
                 }
                 tools_to_upsert.append(tool_node)
 
@@ -291,7 +300,7 @@ class Neo4jProvider(IGraphDBProvider):
                     "id": tool.app_name,
                     "connector_name": tool.app_name,
                     "ctag": ctag,
-                    "last_updated": datetime.utcnow().isoformat()
+                    "last_updated": datetime.now(timezone.utc).isoformat()
                 }
                 ctags_to_upsert.append(ctag_node)
 
@@ -441,14 +450,6 @@ class Neo4jProvider(IGraphDBProvider):
         indexes.append(
             "CREATE INDEX record_md5_checksum IF NOT EXISTS "
             "FOR (n:Record) ON (n.md5Checksum)"
-        )
-
-        # COMPOSITE: virtualRecordId + orgId (batch fetch after Qdrant search)
-        # Pattern: MATCH (r:Record) WHERE r.virtualRecordId IN $ids AND r.orgId = $orgId
-        # Used in: get_records_by_virtual_record_ids
-        indexes.append(
-            "CREATE INDEX record_virtual_id_org IF NOT EXISTS "
-            "FOR (n:Record) ON (n.virtualRecordId, n.orgId)"
         )
 
         # ==================== USER INDEXES (High Priority) ====================
@@ -732,8 +733,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         document_key: str,
         collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get a document by its key from a collection.
 
@@ -773,7 +774,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_all_documents(
         self,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Get all documents from a collection.
@@ -817,8 +818,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         nodes: list[dict],
         collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[bool]:
+        transaction: str | None = None
+    ) -> bool | None:
         """
         Batch upsert nodes.
 
@@ -874,7 +875,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         keys: list[str],
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Delete multiple nodes by their keys.
@@ -918,7 +919,7 @@ class Neo4jProvider(IGraphDBProvider):
         key: str,
         collection: str,
         node_updates: dict,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Update a single node.
@@ -964,7 +965,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         edges: list[dict],
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Batch create edges/relationships.
@@ -1056,7 +1057,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_create_entity_relations(
         self,
         edges: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Batch create entity relation edges - FULLY ASYNC.
@@ -1167,8 +1168,8 @@ class Neo4jProvider(IGraphDBProvider):
         to_id: str,
         to_collection: str,
         collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get an edge between two nodes.
 
@@ -1226,7 +1227,7 @@ class Neo4jProvider(IGraphDBProvider):
         to_id: str,
         to_collection: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Delete an edge"""
         try:
@@ -1252,12 +1253,90 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Delete edge failed: {str(e)}")
             raise
 
+    async def batch_delete_edges(
+        self,
+        edges: list[dict],
+        collection: str,
+        transaction: str | None = None
+    ) -> int:
+        """Batch delete edges between node pairs."""
+        try:
+            if not edges:
+                return 0
+
+            relationship_type = edge_collection_to_relationship(collection)
+
+            edge_data = []
+            for edge in edges:
+                if "_from" in edge and "_to" in edge:
+                    from_collection, from_key = self._parse_arango_id(edge["_from"])
+                    to_collection, to_key = self._parse_arango_id(edge["_to"])
+                elif "from_id" in edge and "to_id" in edge:
+                    from_key = edge["from_id"]
+                    to_key = edge["to_id"]
+                    from_collection = edge.get("from_collection", "")
+                    to_collection = edge.get("to_collection", "")
+                else:
+                    self.logger.warning(
+                        f"Skipping invalid edge (missing _from/_to or from_id/to_id): {edge}"
+                    )
+                    continue
+
+                if not from_key or not to_key or not from_collection or not to_collection:
+                    self.logger.warning(
+                        f"Skipping invalid edge (missing required fields): {edge}"
+                    )
+                    continue
+
+                edge_data.append(
+                    {
+                        "from_id": from_key,
+                        "to_id": to_key,
+                        "from_label": collection_to_label(from_collection),
+                        "to_label": collection_to_label(to_collection),
+                    }
+                )
+
+            if not edge_data:
+                return 0
+
+            from collections import defaultdict
+
+            grouped_edges = defaultdict(list)
+            for edge in edge_data:
+                key = (edge["from_label"], edge["to_label"])
+                grouped_edges[key].append(
+                    {"from_id": edge["from_id"], "to_id": edge["to_id"]}
+                )
+
+            total_deleted = 0
+            for (from_label, to_label), group_edges in grouped_edges.items():
+                query = f"""
+                UNWIND $edges AS edge
+                MATCH (from:{from_label} {{id: edge.from_id}})-[r:{relationship_type}]->(to:{to_label} {{id: edge.to_id}})
+                DELETE r
+                RETURN count(r) AS deleted
+                """
+
+                results = await self.client.execute_query(
+                    query,
+                    parameters={"edges": group_edges},
+                    txn_id=transaction,
+                )
+                total_deleted += results[0]["deleted"] if results else 0
+
+            return total_deleted
+
+        except Exception as e:
+            self.logger.error(f"❌ Batch delete edges failed: {str(e)}")
+            raise
+
     async def delete_edges_from(
         self,
         from_id: str,
         from_collection: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Delete all edges from a node"""
         try:
@@ -1287,7 +1366,7 @@ class Neo4jProvider(IGraphDBProvider):
         to_id: str,
         to_collection: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Delete all edges to a node"""
         try:
@@ -1317,7 +1396,7 @@ class Neo4jProvider(IGraphDBProvider):
         from_id: str,
         from_collection: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Delete edges from a node to group nodes"""
         try:
@@ -1348,7 +1427,7 @@ class Neo4jProvider(IGraphDBProvider):
         from_collection: str,
         edge_collection: str,
         to_collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Delete edges between a node and nodes in a specific collection"""
         try:
@@ -1379,7 +1458,7 @@ class Neo4jProvider(IGraphDBProvider):
         keys: list[str],
         collection: str,
         graph_name: str = "knowledgeGraph",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Delete nodes and all their connected edges"""
         try:
@@ -1411,7 +1490,7 @@ class Neo4jProvider(IGraphDBProvider):
         to_key: str,
         edge_updates: dict,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Update an edge"""
         try:
@@ -1445,9 +1524,9 @@ class Neo4jProvider(IGraphDBProvider):
     async def execute_query(
         self,
         query: str,
-        bind_vars: Optional[dict] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[list[dict]]:
+        bind_vars: dict | None = None,
+        transaction: str | None = None
+    ) -> list[dict] | None:
         """
         Execute a Cypher query.
 
@@ -1473,8 +1552,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         collection: str,
         filters: dict[str, Any],
-        return_fields: Optional[list[str]] = None,
-        transaction: Optional[str] = None
+        return_fields: list[str] | None = None,
+        transaction: str | None = None
     ) -> list[dict]:
         """Get nodes by field filters"""
         try:
@@ -1542,7 +1621,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         collection: str,
         status: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Get all documents with a specific indexing status.
@@ -1587,8 +1666,8 @@ class Neo4jProvider(IGraphDBProvider):
         collection: str,
         field_name: str,
         field_values: list[Any],
-        return_fields: Optional[list[str]] = None,
-        transaction: Optional[str] = None
+        return_fields: list[str] | None = None,
+        transaction: str | None = None
     ) -> list[dict]:
         """Get nodes where field value is in list"""
         try:
@@ -1629,8 +1708,9 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         collection: str,
         field_name: str,
+        *,
         field_value: str | int | bool | None,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> int:
         """Remove nodes matching field value"""
         try:
@@ -1659,7 +1739,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_id: str,
         edge_collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get all edges pointing to a node"""
         try:
@@ -1696,13 +1776,13 @@ class Neo4jProvider(IGraphDBProvider):
                 # Find collection name from label (reverse lookup)
                 from_collection = ""
                 to_collection = ""
-                for coll, lbl_enum in COLLECTION_TO_LABEL.items():
-                    if lbl_enum.value in from_labels:
+                for coll, lbl in COLLECTION_TO_LABEL.items():
+                    if lbl in from_labels:
                         from_collection = coll
                         break
 
-                for coll, lbl_enum in COLLECTION_TO_LABEL.items():
-                    if lbl_enum.value in to_labels:
+                for coll, lbl in COLLECTION_TO_LABEL.items():
+                    if lbl in to_labels:
                         to_collection = coll
                         break
 
@@ -1725,7 +1805,7 @@ class Neo4jProvider(IGraphDBProvider):
         edge_collection: str,
         target_collection: str,
         direction: str = "inbound",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get related nodes through an edge collection"""
         try:
@@ -1769,7 +1849,7 @@ class Neo4jProvider(IGraphDBProvider):
         target_collection: str,
         field_name: str,
         direction: str = "inbound",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get specific field from related nodes"""
         try:
@@ -1807,8 +1887,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         external_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[Record]:
+        transaction: str | None = None
+    ) -> Record | None:
         """Get record by external ID"""
         try:
             query = """
@@ -1838,8 +1918,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         external_id: str,
         connector_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """Get record key by external ID"""
         try:
             query = """
@@ -1863,8 +1943,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_records_by_virtual_record_id(
         self,
         virtual_record_id: str,
-        accessible_record_ids: Optional[list[str]] = None,
-        transaction: Optional[str] = None
+        accessible_record_ids: list[str] | None = None,
+        transaction: str | None = None
     ) -> list[str]:
         """
         Get all record keys that have the given virtualRecordId.
@@ -1929,29 +2009,61 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_record_by_path(
         self,
         connector_id: str,
-        path: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        path: list[str],
+        external_record_group_id: str,
+        transaction: str | None = None
+    ) -> dict | None:
         """Get record by path"""
         try:
-            query = """
-            MATCH (f:File {path: $path})
-            RETURN f
-            LIMIT 1
-            """
+            head = """
+            WITH $rawParts as parts
 
+            // Anchor: RecordGroup
+            MATCH (rg:RecordGroup)-[:BELONGS_TO*1..]->(:App {id: $appId})
+            WHERE rg.externalGroupId = $recordGroupId
+
+            // Anchor: root node — uses index on recordName
+            MATCH (n0:Record)-[:BELONGS_TO]->(rg)
+            WHERE n0.recordName = parts[0]
+            AND n0.externalParentId IS NULL
+            AND n0.recordType = "FILE"
+            AND n0.mimeType = "text/directory"
+
+            // Walk step by step — each hop filtered BEFORE expanding next level
+
+            """.strip()
+            step_count = len(path) 
+            step_blocks:list[str] = []
+            for i in range(1,step_count):
+                prev_node = f"n{i-1}"
+                curr_node = f"n{i}"
+                rel_var = f"r{i}"
+                step_blocks.append(
+                        f"""MATCH ({prev_node})-[{rel_var}:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->({curr_node}:Record)
+                WHERE {curr_node}.recordName = parts[{i}]"""
+                    )
+
+            final_node = "n0" if step_count==0 else f"n{step_count - 1}"
+
+            return_case = f"return {final_node} as result"
+            parts_to_join = [head]
+            if step_blocks:
+                parts_to_join.append("\n\n".join(step_blocks))
+            parts_to_join.append(return_case)
+
+            query = "\n\n".join(parts_to_join).strip()
             results = await self.client.execute_query(
                 query,
-                parameters={"path": path},
-                txn_id=transaction
+                parameters={"appId":connector_id,
+                            "recordGroupId":external_record_group_id,
+                            "rawParts":path,
+                            },
+                txn_id=transaction,
             )
 
             if results:
-                file_dict = dict(results[0]["f"])
-                return self._neo4j_to_arango_node(file_dict, CollectionNames.FILES.value)
-
+                return results[0]["result"]
             return None
-
         except Exception as e:
             self.logger.error(f"❌ Get record by path failed: {str(e)}")
             return None
@@ -1961,9 +2073,9 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         connector_id: str,
         status_filters: list[str],
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[Record]:
         """Get records by indexing status"""
         try:
@@ -2008,7 +2120,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Get records by status failed: {str(e)}")
             return []
 
-    def _create_typed_record_from_neo4j(self, record_dict: dict, type_doc: Optional[dict]) -> Record:
+    def _create_typed_record_from_neo4j(self, record_dict: dict, type_doc: dict | None) -> Record:
         """
         Factory method to create properly typed Record instances from Neo4j data.
         Uses centralized RECORD_TYPE_COLLECTION_MAPPING to determine which types have type collections.
@@ -2025,7 +2137,7 @@ class Neo4jProvider(IGraphDBProvider):
         # Check if this record type has a type collection
         if not type_doc or record_type not in RECORD_TYPE_COLLECTION_MAPPING:
             # No type collection or no type doc - use base Record
-            return Record.from_arango_base_record(record_dict)
+            raise ValueError(f"No type collection or no type doc, record type:{record_type} or type doc:{type_doc}")
 
         try:
             # Determine which collection this type uses
@@ -2046,19 +2158,34 @@ class Neo4jProvider(IGraphDBProvider):
                 return CommentRecord.from_arango_record(type_doc, record_dict)
             elif collection == CollectionNames.LINKS.value:
                 return LinkRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.MEETINGS.value:
+                return MeetingRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.PRODUCTS.value:
+                return ProductRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.DEALS.value:
+                return DealRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.ARTIFACTS.value:
+                return ArtifactRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.SQL_TABLES.value:
+                return SQLTableRecord.from_arango_record(type_doc, record_dict)
+            elif collection == CollectionNames.SQL_VIEWS.value:
+                return SQLViewRecord.from_arango_record(type_doc, record_dict)
             else:
-                # Unknown collection - fallback to base Record
-                return Record.from_arango_base_record(record_dict)
+                raise ValueError(f"Invalid record type: {record_type}")
         except Exception as e:
-            self.logger.warning(f"Failed to create typed record for {record_type}, falling back to base Record: {str(e)}")
-            return Record.from_arango_base_record(record_dict)
+            self.logger.warning(
+                f"Failed to create typed record for {record_type}: {str(e)}"
+            )
+            raise ValueError(
+                f"Failed to create typed record for {record_type}"
+            ) from e
 
     async def get_records_by_parent(
         self,
         connector_id: str,
         parent_external_record_id: str,
-        record_type: Optional[str] = None,
-        transaction: Optional[str] = None
+        record_type: str | None = None,
+        transaction: str | None = None
     ) -> list[Record]:
         """Get all child records for a parent record by parent_external_record_id"""
         try:
@@ -2107,10 +2234,10 @@ class Neo4jProvider(IGraphDBProvider):
         connector_id: str,
         org_id: str,
         depth: int,
-        user_key: Optional[str] = None,
-        limit: Optional[int] = None,
+        user_key: str | None = None,
+        limit: int | None = None,
         offset: int = 0,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[Record]:
         """
         Get all records belonging to a record group up to a specified depth.
@@ -2120,7 +2247,7 @@ class Neo4jProvider(IGraphDBProvider):
 
         Args:
             record_group_id: Record group ID
-            connector_id: Connector ID (all records in group are from same connector)
+            connector_id: Connector ID filter (records matching this connectorId are returned)
             org_id: Organization ID (for security filtering)
             depth: Depth for traversing children and nested record groups (-1 = unlimited,
                    0 = only direct records, 1 = direct + 1 level nested, etc.)
@@ -2129,7 +2256,9 @@ class Neo4jProvider(IGraphDBProvider):
             transaction: Optional transaction ID
 
         Returns:
-            List[Record]: List of properly typed Record instances
+            List[Record]: List of properly typed Record instances. Origin is not
+            hard-filtered here; both CONNECTOR and UPLOAD records can be returned
+            when they match connectorId/org/permission constraints.
         """
         try:
             self.logger.info(
@@ -2205,7 +2334,6 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE record.connectorId = $connector_id
                 AND record.isDeleted <> true
                 AND (record.orgId = $org_id OR record.orgId IS NULL)
-                AND record.origin = 'CONNECTOR'
 
                 WITH collect(DISTINCT record) AS candidateRecords{user_with}
                 UNWIND candidateRecords AS record
@@ -2233,7 +2361,7 @@ class Neo4jProvider(IGraphDBProvider):
                 AND (record.orgId = $org_id OR record.orgId IS NULL)
 
                 WITH DISTINCT record
-                OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(typeDoc)
+                MATCH (record)-[:IS_OF_TYPE]->(typeDoc)
                 WHERE typeDoc.isFile = true OR NOT typeDoc:File
                 WITH record, typeDoc
                 ORDER BY record.id
@@ -2302,10 +2430,10 @@ class Neo4jProvider(IGraphDBProvider):
         connector_id: str,
         org_id: str,
         depth: int,
-        user_key: Optional[str] = None,
-        limit: Optional[int] = None,
+        user_key: str | None = None,
+        limit: int | None = None,
         offset: int = 0,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[Record]:
         """
         Get all child records of a parent record (folder) up to a specified depth.
@@ -2444,8 +2572,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         issue_key: str,
-        transaction: Optional[str] = None
-    ) -> Optional[Record]:
+        transaction: str | None = None
+    ) -> Record | None:
         """
         Get Jira issue record by issue key (e.g., PROJ-123) by searching weburl pattern.
 
@@ -2516,8 +2644,8 @@ class Neo4jProvider(IGraphDBProvider):
         thread_id: str,
         org_id: str,
         user_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[Record]:
+        transaction: str | None = None
+    ) -> Record | None:
         """Get record by conversation index"""
         try:
             query = """
@@ -2552,14 +2680,57 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Get record by conversation index failed: {str(e)}")
             return None
 
+    async def get_record_path(
+        self,
+        record_id: str,
+        transaction: str | None = None
+    ) -> str | None:
+        """ Get path of a record """
+        try:
+            query ="""
+            // PROFILE
+            MATCH path = (start_record:Record {id: $record_id})<-[:RECORD_RELATION*0..100]-(ancestor)
+
+            // 1. Edge Filter: Ensure the edge acts as a parent-child link
+            WHERE all(r IN relationships(path) WHERE r.relationshipType = 'PARENT_CHILD')
+
+            // 2. Node Filter: Ensure it follows the strict canonical path
+            AND all(i IN range(0, length(path)-1) 
+                    WHERE nodes(path)[i].externalParentId = nodes(path)[i+1].externalRecordId)
+
+            // 3. Grab the longest valid path up to the root as above query returns all path lengths incrementally from 0,1,2,3 .....
+            WITH nodes(path) AS path_nodes
+            ORDER BY size(path_nodes) DESC
+            LIMIT 1
+
+            // 4. Extract names (root first) and concatenate into a file path
+            WITH [node IN reverse(path_nodes) 
+                WHERE node.recordName IS NOT NULL AND node.recordName <> "" | node.recordName] AS clean_path
+            RETURN reduce(s = "", name IN clean_path | 
+                CASE WHEN s = "" THEN name ELSE s + '/' + name END
+            ) AS file_path
+            """
+            results = await self.client.execute_query(
+                query,
+                parameters={"record_id": record_id},
+                txn_id=transaction
+            )
+
+            if results:
+                return results[0]["file_path"]
+
+            return None
+        except Exception as e:
+            self.logger.error(f"❌ Get record path failed: {str(e)}")
+            return None
     # ==================== Record Group Operations ====================
 
     async def get_record_group_by_external_id(
         self,
         connector_id: str,
         external_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[RecordGroup]:
+        transaction: str | None = None
+    ) -> RecordGroup | None:
         """Get record group by external ID"""
         try:
             query = """
@@ -2587,26 +2758,26 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_record_group_by_id(
         self,
-        id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        record_group_id: str,
+        transaction: str | None = None
+    ) -> dict | None:
         """Get record group by ID"""
-        return await self.get_document(id, CollectionNames.RECORD_GROUPS.value, transaction)
+        return await self.get_document(record_group_id, CollectionNames.RECORD_GROUPS.value, transaction)
 
     async def get_file_record_by_id(
         self,
-        id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[FileRecord]:
+        record_id: str,
+        transaction: str | None = None
+    ) -> FileRecord | None:
         """Get file record by ID"""
         try:
             # Get file node
-            file = await self.get_document(id, CollectionNames.FILES.value, transaction)
+            file = await self.get_document(record_id, CollectionNames.FILES.value, transaction)
             if not file:
                 return None
 
             # Get record node
-            record = await self.get_document(id, CollectionNames.RECORDS.value, transaction)
+            record = await self.get_document(record_id, CollectionNames.RECORDS.value, transaction)
             if not record:
                 return None
 
@@ -2621,8 +2792,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_user_by_email(
         self,
         email: str,
-        transaction: Optional[str] = None
-    ) -> Optional[User]:
+        transaction: str | None = None
+    ) -> User | None:
         """Get user by email"""
         try:
             query = """
@@ -2653,8 +2824,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         source_user_id: str,
         connector_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[User]:
+        transaction: str | None = None
+    ) -> User | None:
         """Get user by source ID"""
         try:
             query = """
@@ -2684,7 +2855,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_user_by_user_id(
         self,
         user_id: str
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """Get user by user ID"""
         try:
             query = """
@@ -2711,7 +2882,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_users(
         self,
         org_id: str,
-        active: bool = True
+        *,
+        active: bool = True,
     ) -> list[dict]:
         """Get all users in an organization"""
         try:
@@ -2741,8 +2913,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         email: str,
         connector_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[AppUser]:
+        transaction: str | None = None
+    ) -> AppUser | None:
         """Get app user by email"""
         try:
             query = """
@@ -2811,8 +2983,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         external_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[AppUserGroup]:
+        transaction: str | None = None
+    ) -> AppUserGroup | None:
         """Get user group by external ID"""
         try:
             query = """
@@ -2842,7 +3014,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         org_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[AppUserGroup]:
         """Get all user groups for a connector"""
         try:
@@ -2873,8 +3045,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         external_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[AppRole]:
+        transaction: str | None = None
+    ) -> AppRole | None:
         """Get app role by external ID"""
         try:
             query = """
@@ -2904,8 +3076,9 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_all_orgs(
         self,
+        *,
         active: bool = True,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> list[dict]:
         """Get all organizations"""
         try:
@@ -2963,8 +3136,8 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_departments(
         self,
-        org_id: Optional[str] = None,
-        transaction: Optional[str] = None
+        org_id: str | None = None,
+        transaction: str | None = None
     ) -> list[str]:
         """
         Get all departments that either have no org_id or match the given org_id.
@@ -3007,9 +3180,9 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_key: str,
         md5_checksum: str,
-        record_type: Optional[str] = None,
-        size_in_bytes: Optional[int] = None,
-        transaction: Optional[str] = None
+        record_type: str | None = None,
+        size_in_bytes: int | None = None,
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Find duplicate records based on MD5 checksum.
@@ -3084,8 +3257,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def find_next_queued_duplicate(
         self,
         record_id: str,
-        transaction: Optional[str] = None,
-    ) -> Optional[dict]:
+        transaction: str | None = None,
+    ) -> dict | None:
         """
         Find the next QUEUED duplicate record with the same md5 hash.
         Works with all record types by querying the RECORDS collection directly.
@@ -3178,8 +3351,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         new_indexing_status: str,
-        virtual_record_id: Optional[str] = None,
-        transaction: Optional[str] = None,
+        virtual_record_id: str | None = None,
+        transaction: str | None = None,
     ) -> int:
         """
         Find all QUEUED duplicate records with the same md5 hash and update their status.
@@ -3313,7 +3486,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         source_key: str,
         target_key: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Copy all relationships (edges) from source document to target document.
@@ -3397,16 +3570,22 @@ class Neo4jProvider(IGraphDBProvider):
             )
             return False
 
-    async def get_user_apps(self, user_id: str) -> list:
-        """Get all apps associated with a user"""
+    async def get_user_apps(self, user_id: str, transaction: str | None = None) -> list:
+        """Get all apps associated with a user: direct User->App and via User->Team->App."""
         try:
             query = """
-            MATCH (user:User {id: $user_id})-[:USER_APP_RELATION]->(app:App)
-            RETURN app
+            MATCH (user:User {id: $user_id})
+            OPTIONAL MATCH (user)-[:USER_APP_RELATION]->(app1:App)
+            OPTIONAL MATCH (user)-[:PERMISSION {type: 'USER'}]->(team:Teams)-[:USER_APP_RELATION]->(app2:App)
+            WITH collect(DISTINCT app1) + collect(DISTINCT app2) AS app_list
+            UNWIND app_list AS app
+            WITH app WHERE app IS NOT NULL
+            RETURN DISTINCT app
             """
             results = await self.client.execute_query(
                 query,
-                parameters={"user_id": user_id}
+                parameters={"user_id": user_id},
+                txn_id=transaction,
             )
 
             apps = []
@@ -3432,383 +3611,15 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"Failed to get user app ids: {str(e)}")
             raise
 
-    async def get_accessible_records(
-        self, user_id: str, org_id: str, filters: dict = None
-    ) -> list:
-        """
-        Get all records accessible to a user based on their permissions and apply filters.
-
-        Args:
-            user_id (str): The userId field value in users collection
-            org_id (str): The org_id to filter anyone collection
-            filters (dict): Optional filters for departments, categories, languages, topics etc.
-                Format: {
-                    'departments': [dept_ids],
-                    'categories': [cat_ids],
-                    'subcategories1': [subcat1_ids],
-                    'subcategories2': [subcat2_ids],
-                    'subcategories3': [subcat3_ids],
-                    'languages': [language_ids],
-                    'topics': [topic_ids],
-                    'kb': [kb_ids],
-                    'apps': [connector_ids]
-                }
-        """
-        self.logger.info(
-            f"Getting accessible records for user {user_id} in org {org_id} with filters {filters}"
-        )
-
-        try:
-            user = await self.get_user_by_user_id(user_id)
-            if not user:
-                self.logger.warning(f"User not found for userId: {user_id}")
-                return None
-
-            user_key = user.get('id') or user.get('_key')
-            # Get user's accessible app connector ids
-            user_apps_ids = await self._get_user_app_ids(user_key)
-
-            # Extract filters
-            kb_ids = filters.get("kb") if filters else None
-            connector_ids = filters.get("apps") if filters else None
-
-            # Determine filter case
-            has_kb_filter = kb_ids is not None and len(kb_ids) > 0
-            has_app_filter = connector_ids is not None and len(connector_ids) > 0
-
-            self.logger.info(
-                f"🔍 Filter analysis - KB filter: {has_kb_filter} (IDs: {kb_ids}), "
-                f"App filter: {has_app_filter} (Connector IDs: {connector_ids})"
-            )
-
-            # Build a simplified Cypher query
-            # Collect all accessible records in one go
-            query = """
-            MATCH (userDoc:User {userId: $userId})
-
-            // Collect all accessible records from different paths
-            CALL {
-                WITH userDoc
-                // User -> Direct Records
-                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(r:Record)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records1
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> Group -> Records (via BELONGS_TO)
-                OPTIONAL MATCH (userDoc)-[:BELONGS_TO]->(g:Group)-[:PERMISSION]->(r:Record)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records2
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> Group -> Records (via PERMISSION)
-                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(g:Group)-[:PERMISSION]->(r:Record)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records3
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> Organization -> Records
-                OPTIONAL MATCH (userDoc)-[:BELONGS_TO]->(o:Organization)-[:PERMISSION]->(r:Record)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records4
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> Organization -> RecordGroup -> Records
-                OPTIONAL MATCH (userDoc)-[:BELONGS_TO]->(o:Organization)-[:PERMISSION]->(rg:RecordGroup)
-                OPTIONAL MATCH (r:Record)-[:INHERIT_PERMISSIONS*0..2]->(rg)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records5
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> Group/Role -> RecordGroup -> Records
-                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(gr)
-                WHERE gr:Group OR gr:Role
-                OPTIONAL MATCH (gr)-[:PERMISSION]->(rg:RecordGroup)
-                OPTIONAL MATCH (r:Record)-[:INHERIT_PERMISSIONS*0..5]->(rg)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records6
-            }
-
-            CALL {
-                WITH userDoc
-                // User -> RecordGroup -> Records
-                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(rg:RecordGroup)
-                OPTIONAL MATCH (r:Record)-[:INHERIT_PERMISSIONS*0..5]->(rg)
-                WHERE r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids)
-                RETURN collect(DISTINCT r) AS records7
-            }
-
-            CALL {
-                // Anyone records
-                OPTIONAL MATCH (anyone:Anyone {organization: $orgId})
-                OPTIONAL MATCH (r:Record)
-                WHERE r.id = anyone.file_key
-                  AND (r.origin = "UPLOAD" OR (r.origin = "CONNECTOR" AND r.connectorId IN $user_apps_ids))
-                RETURN collect(DISTINCT r) AS records8
-            }
-
-            WITH userDoc, records1 + records2 + records3 + records4 + records5 + records6 + records7 + records8 AS directAndGroupRecords
-            """
-
-            query_parts = [query]
-
-            # Now handle the 4 cases based on filters
-
-            # Case 1: Both KB and App filters applied
-            if has_kb_filter and has_app_filter:
-                self.logger.info("🔍 Case 1: Both KB and App filters applied")
-
-                # Get KB records with filter
-                query_parts.append("""
-                CALL {
-                    WITH userDoc
-                    // Direct user-KB permissions
-                    OPTIONAL MATCH (userDoc)-[:PERMISSION]->(kb:RecordGroup)
-                    WHERE kb.id IN $kb_ids
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS directKbRecords
-                }
-
-                CALL {
-                    WITH userDoc
-                    // Team-based KB permissions
-                    OPTIONAL MATCH (userDoc)-[ute:PERMISSION]->(team:Teams)
-                    WHERE ute.type = "USER"
-                    OPTIONAL MATCH (team)-[tke:PERMISSION]->(kb:RecordGroup)
-                    WHERE tke.type = "TEAM" AND kb.id IN $kb_ids
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS teamKbRecords
-                }
-
-                WITH directKbRecords + teamKbRecords AS kbRecords, directAndGroupRecords
-                WITH kbRecords, [r IN directAndGroupRecords WHERE r.connectorId IN $connector_ids] AS appFilteredRecords
-                WITH kbRecords + appFilteredRecords AS allAccessibleRecords
-                """)
-
-            # Case 2: Only KB filter applied
-            elif has_kb_filter and not has_app_filter:
-                self.logger.info("🔍 Case 2: Only KB filter applied")
-
-                # Get only filtered KB records
-                query_parts.append("""
-                CALL {
-                    WITH userDoc
-                    // Direct user-KB permissions with filter
-                    OPTIONAL MATCH (userDoc)-[:PERMISSION]->(kb:RecordGroup)
-                    WHERE kb.id IN $kb_ids
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS directKbRecords
-                }
-
-                CALL {
-                    WITH userDoc
-                    // Team-based KB permissions with filter
-                    OPTIONAL MATCH (userDoc)-[ute:PERMISSION]->(team:Teams)
-                    WHERE ute.type = "USER"
-                    OPTIONAL MATCH (team)-[tke:PERMISSION]->(kb:RecordGroup)
-                    WHERE tke.type = "TEAM" AND kb.id IN $kb_ids
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS teamKbRecords
-                }
-
-                WITH directKbRecords + teamKbRecords AS allAccessibleRecords
-                """)
-
-            # Case 3: Only App filter applied
-            elif not has_kb_filter and has_app_filter:
-                self.logger.info("🔍 Case 3: Only App filter applied")
-
-                # Get app-filtered records from direct, group, org, and anyone
-                query_parts.append("""
-                WITH [r IN directAndGroupRecords WHERE r.connectorId IN $connector_ids] AS allAccessibleRecords
-                """)
-
-            # Case 4: No KB or App filters - return all accessible records
-            else:
-                self.logger.info("🔍 Case 4: No KB or App filters - returning all accessible records")
-
-                # Get all KB records
-                query_parts.append("""
-                CALL {
-                    WITH userDoc
-                    // Direct user-KB permissions
-                    OPTIONAL MATCH (userDoc)-[:PERMISSION]->(kb:RecordGroup)
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS directKbRecords
-                }
-
-                CALL {
-                    WITH userDoc
-                    // Team-based KB permissions
-                    OPTIONAL MATCH (userDoc)-[ute:PERMISSION]->(team:Teams)
-                    WHERE ute.type = "USER"
-                    OPTIONAL MATCH (team)-[tke:PERMISSION]->(kb:RecordGroup)
-                    WHERE tke.type = "TEAM"
-                    OPTIONAL MATCH (r:Record)-[:BELONGS_TO]->(kb)
-                    RETURN collect(DISTINCT r) AS teamKbRecords
-                }
-
-                WITH directKbRecords + teamKbRecords + directAndGroupRecords AS allAccessibleRecords
-                """)
-
-            # Add additional filter conditions (departments, categories, etc.)
-            filter_conditions = []
-            if filters:
-                if filters.get("departments"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_DEPARTMENT]->(dept:Department)
-                        WHERE dept.departmentName IN $departmentNames
-                    }
-                    """)
-
-                if filters.get("categories"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_CATEGORY]->(cat:Category)
-                        WHERE cat.name IN $categoryNames
-                    }
-                    """)
-
-                if filters.get("subcategories1"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_CATEGORY]->(subcat:Category)
-                        WHERE subcat.name IN $subcat1Names
-                    }
-                    """)
-
-                if filters.get("subcategories2"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_CATEGORY]->(subcat:Category)
-                        WHERE subcat.name IN $subcat2Names
-                    }
-                    """)
-
-                if filters.get("subcategories3"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_CATEGORY]->(subcat:Category)
-                        WHERE subcat.name IN $subcat3Names
-                    }
-                    """)
-
-                if filters.get("languages"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_LANGUAGE]->(lang:Language)
-                        WHERE lang.name IN $languageNames
-                    }
-                    """)
-
-                if filters.get("topics"):
-                    filter_conditions.append("""
-                    EXISTS {
-                        MATCH (record)-[:BELONGS_TO_TOPIC]->(topic:Topic)
-                        WHERE topic.name IN $topicNames
-                    }
-                    """)
-
-            # Apply additional filters if any
-            if filter_conditions:
-                query_parts.append("""
-                UNWIND allAccessibleRecords AS record
-                WITH record
-                WHERE record IS NOT NULL
-                  AND """ + " AND ".join(filter_conditions) + """
-                RETURN DISTINCT record
-                """)
-            else:
-                query_parts.append("""
-                UNWIND allAccessibleRecords AS record
-                WITH record
-                WHERE record IS NOT NULL
-                RETURN DISTINCT record
-                """)
-
-            # Combine all query parts
-            query = "\n".join(query_parts)
-
-            # Prepare parameters
-            parameters = {
-                "userId": user_id,
-                "orgId": org_id,
-                "user_apps_ids": user_apps_ids,
-            }
-
-            # Add conditional parameters
-            if has_kb_filter:
-                parameters["kb_ids"] = kb_ids
-
-            if has_app_filter:
-                parameters["connector_ids"] = connector_ids
-
-            # Add filter parameters
-            if filters:
-                if filters.get("departments"):
-                    parameters["departmentNames"] = filters["departments"]
-                if filters.get("categories"):
-                    parameters["categoryNames"] = filters["categories"]
-                if filters.get("subcategories1"):
-                    parameters["subcat1Names"] = filters["subcategories1"]
-                if filters.get("subcategories2"):
-                    parameters["subcat2Names"] = filters["subcategories2"]
-                if filters.get("subcategories3"):
-                    parameters["subcat3Names"] = filters["subcategories3"]
-                if filters.get("languages"):
-                    parameters["languageNames"] = filters["languages"]
-                if filters.get("topics"):
-                    parameters["topicNames"] = filters["topics"]
-
-            # Execute query
-            self.logger.debug(f"🔍 Executing query with parameters keys: {list(parameters.keys())}")
-            results = await self.client.execute_query(query, parameters=parameters)
-
-            # Process results
-            record_list = []
-            if results:
-                for r in results:
-                    if r.get("record"):
-                        record_dict = dict(r["record"])
-                        record_list.append(self._neo4j_to_arango_node(record_dict, CollectionNames.RECORDS.value))
-
-            record_count = len(record_list)
-            self.logger.info(f"✅ Query completed - found {record_count} accessible records")
-
-            if has_kb_filter:
-                self.logger.info(f"✅ KB filtering applied for {len(kb_ids)} KBs")
-            if has_app_filter:
-                self.logger.info(f"✅ App filtering applied for {len(connector_ids)} connector IDs")
-            if not has_kb_filter and not has_app_filter:
-                self.logger.info("✅ No KB/App filters - returned all accessible records")
-
-            return record_list
-
-        except Exception as e:
-            self.logger.error(f"❌ Get accessible records failed: {str(e)}")
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return []
-
     async def _get_virtual_ids_for_connector(
         self,
         user_id: str,
         org_id: str,
         connector_id: str,
         metadata_filters: dict[str, list[str]] | None = None
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """
-        Get virtualRecordIds for a specific connector with all permission paths.
+        Get a mapping of virtualRecordId -> recordId for a specific connector with all permission paths.
 
         Args:
             user_id: The userId field value
@@ -3817,7 +3628,7 @@ class Neo4jProvider(IGraphDBProvider):
             metadata_filters: Optional metadata filters (departments, categories, etc.)
 
         Returns:
-            List of virtualRecordIds accessible for this connector
+            Dict mapping virtualRecordId -> recordId for accessible records in this connector
         """
         start_time = time.time()
         try:
@@ -3897,7 +3708,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records1
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records1
             }}
 
             CALL {{
@@ -3907,7 +3718,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records2
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records2
             }}
 
             CALL {{
@@ -3917,7 +3728,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records3
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records3
             }}
 
             CALL {{
@@ -3927,7 +3738,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records4
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records4
             }}
 
             CALL {{
@@ -3939,7 +3750,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records5
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records5
             }}
 
             CALL {{
@@ -3953,7 +3764,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records6
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records6
             }}
 
             CALL {{
@@ -3965,7 +3776,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records7
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records7
             }}
 
             CALL {{
@@ -3976,15 +3787,15 @@ class Neo4jProvider(IGraphDBProvider):
                   AND r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS records8
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records8
             }}
 
-            // Union all virtualRecordIds and filter out nulls
-            WITH records1 + records2 + records3 + records4 + records5 + records6 + records7 + records8 AS allVirtualIds
-            UNWIND allVirtualIds AS virtualId
-            WITH virtualId
-            WHERE virtualId IS NOT NULL
-            RETURN DISTINCT virtualId
+            // Union all pairs and filter out nulls
+            WITH records1 + records2 + records3 + records4 + records5 + records6 + records7 + records8 AS allPairs
+            UNWIND allPairs AS pair
+            WITH pair
+            WHERE pair IS NOT NULL AND pair.virtualId IS NOT NULL AND pair.recordId IS NOT NULL
+            RETURN pair.virtualId AS virtualId, pair.recordId AS recordId
             """
 
             # Prepare parameters
@@ -4015,19 +3826,24 @@ class Neo4jProvider(IGraphDBProvider):
             # Execute query
             results = await self.client.execute_query(query, parameters=parameters)
 
-            # Extract virtualRecordIds
-            virtual_ids = [r["virtualId"] for r in results if r.get("virtualId")]
+            # Build virtualRecordId -> recordId map (first seen wins for dedup)
+            virtual_id_to_record_id: dict[str, str] = {}
+            for r in results:
+                vid = r.get("virtualId")
+                rid = r.get("recordId")
+                if vid and rid and vid not in virtual_id_to_record_id:
+                    virtual_id_to_record_id[vid] = rid
 
             elapsed_time = time.time() - start_time
             self.logger.info(
-                f"✅ Connector {connector_id}: Found {len(virtual_ids)} virtualRecordIds in {elapsed_time:.3f}s"
+                f"✅ Connector {connector_id}: Found {len(virtual_id_to_record_id)} virtualRecordIds in {elapsed_time:.3f}s"
             )
-            return virtual_ids
+            return virtual_id_to_record_id
 
         except Exception as e:
             self.logger.error(f"❌ Failed to get virtual IDs for connector {connector_id}: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return []
+            return {}
 
     async def _get_kb_virtual_ids(
         self,
@@ -4035,9 +3851,9 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         kb_ids: list[str] | None = None,
         metadata_filters: dict[str, list[str]] | None = None
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """
-        Get virtualRecordIds from Knowledge Bases (RecordGroups).
+        Get a mapping of virtualRecordId -> recordId from Knowledge Bases (RecordGroups).
 
         Args:
             user_id: The userId field value
@@ -4046,7 +3862,7 @@ class Neo4jProvider(IGraphDBProvider):
             metadata_filters: Optional metadata filters
 
         Returns:
-            List of virtualRecordIds from KBs
+            Dict mapping virtualRecordId -> recordId for accessible KB records
         """
         start_time = time.time()
         try:
@@ -4132,7 +3948,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.indexingStatus = $completedStatus
                   AND r.origin = "UPLOAD"
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS directKbRecords
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS directKbRecords
             }}
 
             CALL {{
@@ -4146,15 +3962,15 @@ class Neo4jProvider(IGraphDBProvider):
                 WHERE r.indexingStatus = $completedStatus
                   AND r.origin = "UPLOAD"
                   {metadata_filter_clause}
-                RETURN collect(DISTINCT r.virtualRecordId) AS teamKbRecords
+                RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS teamKbRecords
             }}
 
-            // Union all virtualRecordIds and filter out nulls
-            WITH directKbRecords + teamKbRecords AS allVirtualIds
-            UNWIND allVirtualIds AS virtualId
-            WITH virtualId
-            WHERE virtualId IS NOT NULL
-            RETURN DISTINCT virtualId
+            // Union all pairs and filter out nulls
+            WITH directKbRecords + teamKbRecords AS allPairs
+            UNWIND allPairs AS pair
+            WITH pair
+            WHERE pair IS NOT NULL AND pair.virtualId IS NOT NULL AND pair.recordId IS NOT NULL
+            RETURN pair.virtualId AS virtualId, pair.recordId AS recordId
             """
 
             # Prepare parameters
@@ -4187,35 +4003,37 @@ class Neo4jProvider(IGraphDBProvider):
             # Execute query
             results = await self.client.execute_query(query, parameters=parameters)
 
-            # Extract virtualRecordIds
-            virtual_ids = [r["virtualId"] for r in results if r.get("virtualId")]
+            # Build virtualRecordId -> recordId map (first seen wins for dedup)
+            virtual_id_to_record_id: dict[str, str] = {}
+            for r in results:
+                vid = r.get("virtualId")
+                rid = r.get("recordId")
+                if vid and rid and vid not in virtual_id_to_record_id:
+                    virtual_id_to_record_id[vid] = rid
 
             elapsed_time = time.time() - start_time
             kb_filter_info = f" (filtered: {len(kb_ids)} KBs)" if kb_ids else " (all KBs)"
             self.logger.info(
-                f"✅ KB query{kb_filter_info}: Found {len(virtual_ids)} virtualRecordIds in {elapsed_time:.3f}s"
+                f"✅ KB query{kb_filter_info}: Found {len(virtual_id_to_record_id)} virtualRecordIds in {elapsed_time:.3f}s"
             )
-            return virtual_ids
+            return virtual_id_to_record_id
 
         except Exception as e:
             self.logger.error(f"❌ Failed to get KB virtual IDs: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return []
+            return {}
 
     async def get_accessible_virtual_record_ids(
         self,
         user_id: str,
         org_id: str,
         filters: dict[str, list[str]] | None = None
-    ) -> list[str]:
+    ) -> dict[str, str]:
         """
-        Get all virtual record ids accessible to a user based on their permissions and apply filters.
+        Get a mapping of virtualRecordId -> recordId for all records accessible to a user.
 
-        OPTIMIZED VERSION:
-        - Returns only virtualRecordIds (not full records)
-        - Filters by indexingStatus = COMPLETED
-        - Applies KB/app filters during traversal (not post-filter)
-        - Parallelizes per-connector queries
+        Each virtualRecordId maps to the specific recordId that the user has permission to access.
+        This prevents cross-connector leakage where multiple connectors share the same virtualRecordId.
 
         Args:
             user_id (str): The userId field value in users collection
@@ -4234,7 +4052,7 @@ class Neo4jProvider(IGraphDBProvider):
                 }
 
         Returns:
-            List[str]: List of virtualRecordIds
+            Dict[str, str]: Mapping of virtualRecordId -> recordId
         """
         start_time = time.time()
         self.logger.info(
@@ -4246,7 +4064,7 @@ class Neo4jProvider(IGraphDBProvider):
             user = await self.get_user_by_user_id(user_id)
             if not user:
                 self.logger.warning(f"User not found for userId: {user_id}")
-                return []
+                return {}
 
             user_key = user.get('id') or user.get('_key')
             user_apps_ids = await self._get_user_app_ids(user_key)
@@ -4354,76 +4172,75 @@ class Neo4jProvider(IGraphDBProvider):
             # Step 5: Execute all tasks in parallel
             if not tasks:
                 self.logger.warning("No tasks to execute")
-                return []
+                return {}
 
             self.logger.info(f"Executing {len(tasks)} parallel queries...")
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Step 6: Union and deduplicate virtualRecordIds
-            all_virtual_ids = []
+            # Step 6: Merge all virtualRecordId -> recordId dicts (first seen wins)
+            virtual_id_to_record_id: dict[str, str] = {}
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     self.logger.error(f"Task {i} failed: {str(result)}")
                     continue
                 if result:
-                    all_virtual_ids.extend(result)
-
-            # Deduplicate
-            unique_virtual_ids = list(set(all_virtual_ids))
+                    for vid, rid in result.items():
+                        if vid not in virtual_id_to_record_id:
+                            virtual_id_to_record_id[vid] = rid
 
             total_time = time.time() - start_time
 
             self.logger.info(
-                f"✅ Found {len(unique_virtual_ids)} unique virtualRecordIds "
-                f"from {len(all_virtual_ids)} total results in {total_time:.3f}s"
+                f"✅ Found {len(virtual_id_to_record_id)} unique virtualRecordIds "
+                f"in {total_time:.3f}s"
             )
 
-            return unique_virtual_ids
+            return virtual_id_to_record_id
 
         except Exception as e:
             self.logger.error(f"❌ Get accessible virtual record IDs failed: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
-            return []
+            return {}
 
-    async def get_records_by_virtual_record_ids(
+    async def get_records_by_record_ids(
         self,
-        virtual_record_ids: list[str],
+        record_ids: list[str],
         org_id: str
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """
-        Batch fetch full record documents by their virtualRecordIds.
+        Batch fetch full record documents by their record IDs (node id property).
 
-        This is used after Qdrant search to fetch only the records that were actually returned,
-        instead of fetching all accessible records upfront.
+        This is used after Qdrant search to fetch the specific records that the user
+        has permission to access, using the permission-verified record IDs from the
+        accessible virtual ID map.
 
         Args:
-            virtual_record_ids: List of virtualRecordIds to fetch
+            record_ids: List of record id values to fetch
             org_id: Organization ID for additional filtering
 
         Returns:
-            List of full record dictionaries
+            List[Dict[str, Any]]: List of full record dictionaries
         """
         try:
-            if not virtual_record_ids:
+            if not record_ids:
                 return []
 
-            self.logger.debug(f"Fetching {len(virtual_record_ids)} records by virtualRecordIds")
+            self.logger.debug(f"Fetching {len(record_ids)} records by record IDs")
 
             query = """
             MATCH (r:Record)
-            WHERE r.virtualRecordId IN $virtual_record_ids
+            WHERE r.id IN $record_ids
               AND r.orgId = $org_id
             RETURN r
             """
 
             parameters = {
-                "virtual_record_ids": virtual_record_ids,
+                "record_ids": record_ids,
                 "org_id": org_id
             }
 
             results = await self.client.execute_query(query, parameters=parameters)
 
-            # Convert to Arango format
             records = []
             if results:
                 for result in results:
@@ -4431,11 +4248,11 @@ class Neo4jProvider(IGraphDBProvider):
                         record_dict = dict(result["r"])
                         records.append(self._neo4j_to_arango_node(record_dict, CollectionNames.RECORDS.value))
 
-            self.logger.debug(f"✅ Fetched {len(records)} records")
+            self.logger.debug(f"✅ Fetched {len(records)} records by record IDs")
             return records
 
         except Exception as e:
-            self.logger.error(f"❌ Failed to fetch records by virtualRecordIds: {str(e)}")
+            self.logger.error(f"❌ Failed to fetch records by record IDs: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
@@ -4444,7 +4261,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_records(
         self,
         records: list[Record],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert records (base + specific type + IS_OF_TYPE edge)"""
         try:
@@ -4491,7 +4308,7 @@ class Neo4jProvider(IGraphDBProvider):
         from_record_id: str,
         to_record_id: str,
         relation_type: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Create a relation edge between two records"""
         edge = {
@@ -4510,10 +4327,212 @@ class Neo4jProvider(IGraphDBProvider):
             transaction=transaction
         )
 
+    async def batch_upsert_record_relations(
+        self,
+        edges: list[dict],
+        transaction: Optional[str] = None
+    ) -> bool:
+        """
+        Batch upsert record relation edges.
+
+        Uses MERGE to avoid duplicates - matches on from, to, relationshipType, and constraintName.
+        This allows multiple edges between the same record pair with different
+        relation types (e.g., FOREIGN_KEY and DEPENDS_ON) or different constraint names
+        (e.g., two FKs from the same table to the same target table).
+
+        Args:
+            edges: List of edge documents with from_id, to_id, relationshipType, and optionally constraintName
+            transaction: Optional transaction ID
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if not edges:
+                return True
+
+            self.logger.info("Batch upserting record relation edges")
+
+            edge_data = []
+            for edge in edges:
+                from_key = edge.get("from_id") or edge.get("_from", "").split("/")[-1]
+                to_key = edge.get("to_id") or edge.get("_to", "").split("/")[-1]
+                relationship_type = edge.get("relationshipType", "")
+                props = {k: v for k, v in edge.items() if k not in [
+                    "from_id", "to_id", "from_collection", "to_collection", "_from", "_to"
+                ]}
+                constraint_name = edge.get("constraintName") or ""
+                edge_data.append({
+                    "from_key": from_key,
+                    "to_key": to_key,
+                    "relationshipType": relationship_type,
+                    "constraintName": constraint_name,
+                    "props": props
+                })
+
+            query = """
+            UNWIND $edges AS edge
+            MATCH (from:Record {id: edge.from_key})
+            MATCH (to:Record {id: edge.to_key})
+            MERGE (from)-[r:RECORD_RELATION {relationshipType: edge.relationshipType, constraintName: edge.constraintName}]->(to)
+            SET r += edge.props
+            RETURN count(r) AS upserted
+            """
+
+            await self.client.execute_query(
+                query,
+                parameters={"edges": edge_data},
+                txn_id=transaction
+            )
+
+            self.logger.info(f"Successfully upserted {len(edge_data)} record relation edges.")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Batch record relation upsert failed: {str(e)}")
+            raise
+
+    async def get_child_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """
+        Get record IDs of all records that have an edge pointing TO this record
+        with the given relation type.
+
+        Args:
+            record_id: Record ID
+            relation_type: Edge relation type
+            transaction: Optional transaction ID
+
+        Returns:
+            List of dicts with record_id and FK metadata.
+        """
+        try:
+            query = """
+            MATCH (child:Record)-[r:RECORD_RELATION]->(parent:Record {id: $record_id})
+            WHERE r.relationshipType = $relation_type
+            RETURN child.id AS record_id,
+                   COALESCE(r.childTableName, '') AS childTable,
+                   COALESCE(r.sourceColumn, '') AS sourceColumn,
+                   COALESCE(r.targetColumn, '') AS targetColumn
+            """
+
+            results = await self.client.execute_query(
+                query,
+                parameters={"record_id": record_id, "relation_type": relation_type},
+                txn_id=transaction
+            )
+
+            output = []
+            for record in results:
+                output.append({
+                    "record_id": record["record_id"],
+                    "childTable": record.get("childTable", ""),
+                    "sourceColumn": record.get("sourceColumn", ""),
+                    "targetColumn": record.get("targetColumn", ""),
+                })
+            return output
+
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get child record IDs by relation type for record %s: %s",
+                record_id, str(e),
+            )
+            return []
+
+    async def get_virtual_record_ids_for_record_ids(
+        self,
+        record_ids: list[str],
+        transaction: Optional[str] = None
+    ) -> dict[str, str]:
+        """
+        Resolve record IDs to virtualRecordIds. Used to fetch blob for child records by id.
+
+        Args:
+            record_ids: List of record IDs
+            transaction: Optional transaction ID
+
+        Returns:
+            Dict mapping record_id -> virtual_record_id
+        """
+        if not record_ids:
+            return {}
+        try:
+            query = """
+            MATCH (r:Record)
+            WHERE r.id IN $record_ids AND r.virtualRecordId IS NOT NULL
+            RETURN r.id AS record_id, r.virtualRecordId AS virtualRecordId
+            """
+            results = await self.client.execute_query(
+                query,
+                parameters={"record_ids": list(record_ids)},
+                txn_id=transaction
+            )
+            return {row["record_id"]: row["virtualRecordId"] for row in (results or [])}
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get virtual_record_ids for record_ids: %s", str(e)
+            )
+            return {}
+
+    async def get_parent_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """
+        Get record IDs of all records that this record has an edge pointing TO
+        with the given relation type.
+
+        Args:
+            record_id: Record ID
+            relation_type: Edge relation type
+            transaction: Optional transaction ID
+
+        Returns:
+            List of dicts with record_id and FK metadata.
+        """
+        try:
+            query = """
+            MATCH (child:Record {id: $record_id})-[r:RECORD_RELATION]->(parent:Record)
+            WHERE r.relationshipType = $relation_type
+            RETURN parent.id AS record_id,
+                   COALESCE(r.parentTableName, '') AS parentTable,
+                   COALESCE(r.sourceColumn, '') AS sourceColumn,
+                   COALESCE(r.targetColumn, '') AS targetColumn
+            """
+
+            results = await self.client.execute_query(
+                query,
+                parameters={"record_id": record_id, "relation_type": relation_type},
+                txn_id=transaction
+            )
+
+            output = []
+            for record in results:
+                output.append({
+                    "record_id": record["record_id"],
+                    "parentTable": record.get("parentTable", ""),
+                    "sourceColumn": record.get("sourceColumn", ""),
+                    "targetColumn": record.get("targetColumn", ""),
+                })
+            return output
+
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get parent record IDs by relation type for record %s: %s",
+                record_id, str(e),
+            )
+            return []
+
     async def batch_upsert_record_groups(
         self,
         record_groups: list[RecordGroup],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert record groups"""
         try:
@@ -4531,7 +4550,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         record_group_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Create BELONGS_TO edge from record to record group"""
         edge = {
@@ -4553,7 +4572,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         child_id: str,
         parent_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Create BELONGS_TO edge from child record group to parent record group"""
         edge = {
@@ -4575,7 +4594,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         record_group_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Create INHERIT_PERMISSIONS edge from record to record group"""
         edge = {
@@ -4597,7 +4616,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         record_group_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Delete INHERIT_PERMISSIONS edge from record to record group."""
         await self.delete_edge(
@@ -4613,7 +4632,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         permissions: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert record permissions"""
         try:
@@ -4643,7 +4662,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_file_permissions(
         self,
         file_key: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get file permissions"""
         try:
@@ -4660,8 +4679,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_key: str,
         collection: str = CollectionNames.PERMISSION.value,
-        transaction: Optional[str] = None
-    ) -> Optional[User]:
+        transaction: str | None = None
+    ) -> User | None:
         """Get first user with permission to node"""
         try:
             query = """
@@ -4697,7 +4716,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_key: str,
         collection: str = CollectionNames.PERMISSION.value,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[User]:
         """Get users with permission to node"""
         try:
@@ -4732,8 +4751,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_record_owner_source_user_email(
         self,
         record_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """Get record owner source user email"""
         try:
             query = """
@@ -4759,7 +4778,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_file_parents(
         self,
         file_key: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get parent file external IDs"""
         try:
@@ -4786,8 +4805,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         key: str,
         collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get sync point by syncPointKey"""
         try:
             label = collection_to_label(collection)
@@ -4819,7 +4838,7 @@ class Neo4jProvider(IGraphDBProvider):
         sync_point_key: str,
         sync_point_data: dict,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Upsert sync point by syncPointKey"""
         try:
@@ -4859,7 +4878,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         key: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Remove sync point by syncPointKey"""
         try:
@@ -4885,7 +4904,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_app_users(
         self,
         users: list[AppUser],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert app users with org and app relations"""
         try:
@@ -4973,10 +4992,241 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Batch upsert app users failed: {str(e)}")
             raise
 
+    async def ensure_all_team_with_users(self, org_id: str) -> None:
+        """
+        Ensure the org's 'All' team exists and every active org user has a PERMISSION edge.
+
+        Creates team node with id=all_{org_id} if missing, fetches all active users,
+        and adds PERMISSION edges for users not already in the team.
+        Oldest user (by createdAtTimestamp) gets OWNER; subsequent users get READER.
+
+        Idempotent, runs without transaction, safe to call multiple times.
+        """
+        try:
+            team_id = f"all_{org_id}"
+            ts = get_epoch_timestamp_in_ms()
+
+            # 1. Create team node only if it doesn't exist
+            existing_team = await self.get_document(team_id, CollectionNames.TEAMS.value)
+            if not existing_team:
+                team_node = {
+                    "id": team_id,
+                    "name": "All",
+                    "description": "All organization members",
+                    "createdBy": "system",
+                    "orgId": org_id,
+                    "createdAtTimestamp": ts,
+                    "updatedAtTimestamp": ts,
+                }
+                await self.batch_upsert_nodes([team_node], CollectionNames.TEAMS.value)
+                self.logger.info(f"Created 'All' team for org {org_id}")
+
+            # 2. Get all active users sorted by createdAtTimestamp ascending
+            users = await self.get_users(org_id, active=True)
+            if not users:
+                self.logger.debug(f"No active users found for org {org_id}")
+                return
+
+            users_sorted = sorted(users, key=lambda u: u.get("createdAtTimestamp", 0))
+            self.logger.info(f"📊 Found {len(users_sorted)} active users for org {org_id}")
+
+            # 3. Get current team members to determine if team is empty
+            team_with_users = await self.get_team_with_users(team_id=team_id, user_key=None)
+            existing_member_count = len((team_with_users or {}).get("members", []))
+            owner_assigned = existing_member_count > 0
+
+            self.logger.info(f"📊 All team for org {org_id}: existing_member_count={existing_member_count}, owner_assigned={owner_assigned}")
+            if team_with_users and team_with_users.get("members"):
+                self.logger.info(
+                    "📊 Existing members: %s",
+                    [
+                        f"{m.get('userEmail') or '?'}:{m.get('role') or '?'}"
+                        for m in team_with_users.get("members", [])
+                    ],
+                )
+
+            # 4. Add each user without a PERMISSION edge
+            for user in users_sorted:
+                user_key = user.get("id")
+                if not user_key:
+                    continue
+
+                # Check if edge already exists
+                query = """
+                MATCH (u:Users {id: $user_key})-[r:PERMISSION]->(t:Teams {id: $team_id})
+                RETURN r
+                LIMIT 1
+                """
+                result = await self.client.execute_query(
+                    query,
+                    parameters={"user_key": user_key, "team_id": team_id}
+                )
+                if result:
+                    continue
+
+                role = "OWNER" if not owner_assigned else "READER"
+                self.logger.info(f"📊 Assigning role {role} to user {user_key} (owner_assigned={owner_assigned})")
+
+                if not owner_assigned:
+                    owner_assigned = True
+                    try:
+                        await self.update_node(
+                            team_id,
+                            CollectionNames.TEAMS.value,
+                            {"createdBy": user_key, "updatedAtTimestamp": ts},
+                        )
+                        self.logger.info(f"✅ Updated team createdBy to {user_key}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to update createdBy for team {team_id}: {e}")
+
+                permission_edge = {
+                    "from_id": user_key,
+                    "from_collection": CollectionNames.USERS.value,
+                    "to_id": team_id,
+                    "to_collection": CollectionNames.TEAMS.value,
+                    "type": "USER",
+                    "role": role,
+                    "createdAtTimestamp": ts,
+                    "updatedAtTimestamp": ts,
+                }
+                await self.batch_create_edges(
+                    [permission_edge], CollectionNames.PERMISSION.value
+                )
+                self.logger.info(f"✅ Added user {user_key} to All team with role {role}")
+
+        except Exception as e:
+            self.logger.error(f"ensure_all_team_with_users failed for org {org_id}: {e}", exc_info=True)
+            raise
+
+    async def add_user_to_all_team(self, org_id: str, user_key: str) -> None:
+        """
+        Add a specific user to the org's 'All' team with a PERMISSION edge.
+
+        Ensures All team exists, checks if user already has PERMISSION edge,
+        and adds it if missing. First user in team gets OWNER, subsequent get READER.
+
+        Idempotent, safe to call multiple times for same user.
+        """
+        try:
+            team_id = f"all_{org_id}"
+            ts = get_epoch_timestamp_in_ms()
+
+            # 1. Create team node only if it doesn't exist
+            existing_team = await self.get_document(team_id, CollectionNames.TEAMS.value)
+            if not existing_team:
+                team_node = {
+                    "id": team_id,
+                    "name": "All",
+                    "description": "All organization members",
+                    "createdBy": "system",
+                    "orgId": org_id,
+                    "createdAtTimestamp": ts,
+                    "updatedAtTimestamp": ts,
+                }
+                await self.batch_upsert_nodes([team_node], CollectionNames.TEAMS.value)
+                self.logger.info(f"Created 'All' team for org {org_id}")
+
+            # 2. Check if this user already has a PERMISSION edge
+            check_edge_query = """
+            MATCH (u:Users {id: $user_key})-[r:PERMISSION]->(t:Teams {id: $team_id})
+            RETURN r
+            LIMIT 1
+            """
+            existing_edge = await self.client.execute_query(
+                check_edge_query,
+                parameters={"user_key": user_key, "team_id": team_id}
+            )
+            if existing_edge:
+                self.logger.debug(f"User {user_key} already has PERMISSION edge to All team")
+                return
+
+            # 3. Check if team has any existing members to determine role
+            count_query = """
+            MATCH ()-[r:PERMISSION]->(t:Teams {id: $team_id})
+            RETURN count(r) as count
+            """
+            count_result = await self.client.execute_query(
+                count_query,
+                parameters={"team_id": team_id}
+            )
+
+            member_count = count_result[0].get("count", 0) if count_result else 0
+            role = "OWNER" if member_count == 0 else "READER"
+
+            self.logger.info(f"Assigning role {role} to user {user_key} (existing members: {member_count})")
+
+            # 4. If assigning first OWNER, update team.createdBy
+            if role == "OWNER":
+                try:
+                    await self.update_node(
+                        team_id,
+                        CollectionNames.TEAMS.value,
+                        {"createdBy": user_key, "updatedAtTimestamp": ts},
+                    )
+                    self.logger.info(f"Updated team createdBy to {user_key}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to update createdBy for team {team_id}: {e}")
+
+            # 5. Create PERMISSION edge
+            permission_edge = {
+                "from_id": user_key,
+                "from_collection": CollectionNames.USERS.value,
+                "to_id": team_id,
+                "to_collection": CollectionNames.TEAMS.value,
+                "type": "USER",
+                "role": role,
+                "createdAtTimestamp": ts,
+                "updatedAtTimestamp": ts,
+            }
+            await self.batch_create_edges(
+                [permission_edge], CollectionNames.PERMISSION.value
+            )
+            self.logger.info(f"Added user {user_key} to All team with role {role}")
+
+        except Exception as e:
+            self.logger.error(f"add_user_to_all_team failed for org {org_id}, user {user_key}: {e}", exc_info=True)
+            raise
+
+    async def ensure_team_app_edge(
+        self,
+        connector_id: str,
+        org_id: str,
+        transaction: Optional[str] = None
+    ) -> None:
+        """
+        Ensure the org's "All" team has an edge to the app in userAppRelation.
+        Idempotent: creates (Teams all_{org_id})-[:USER_APP_RELATION]->(App) if not present.
+
+        Team membership is ensured elsewhere (All team migration, user-added Kafka flow).
+        """
+        try:
+            team_id = f"all_{org_id}"
+            ts = get_epoch_timestamp_in_ms()
+            query = """
+            MATCH (t:Teams {id: $team_id})
+            MERGE (a:App {id: $connector_id})
+            MERGE (t)-[r:USER_APP_RELATION]->(a)
+            ON CREATE SET r.sourceUserId = $team_id, r.syncState = 'NOT_STARTED', r.lastSyncUpdate = $ts,
+                r.createdAtTimestamp = $ts, r.updatedAtTimestamp = $ts
+            """
+            await self.client.execute_query(
+                query,
+                parameters={
+                    "team_id": team_id,
+                    "connector_id": connector_id,
+                    "ts": ts,
+                },
+                txn_id=transaction
+            )
+            self.logger.debug(f"Ensured team->app edge: Teams {team_id} -> App {connector_id}")
+        except Exception as e:
+            self.logger.error(f"ensure_team_app_edge failed: {e}", exc_info=True)
+            raise
+
     async def batch_upsert_user_groups(
         self,
         user_groups: list[AppUserGroup],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert user groups"""
         try:
@@ -4993,7 +5243,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_app_roles(
         self,
         app_roles: list[AppRole],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert app roles"""
         try:
@@ -5010,7 +5260,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_orgs(
         self,
         orgs: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert organizations"""
         try:
@@ -5030,7 +5280,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_domains(
         self,
         domains: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert domains"""
         try:
@@ -5050,7 +5300,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_anyone(
         self,
         anyone: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert anyone entities"""
         try:
@@ -5070,7 +5320,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_anyone_with_link(
         self,
         anyone_with_link: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert anyone with link"""
         try:
@@ -5090,7 +5340,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def batch_upsert_anyone_same_org(
         self,
         anyone_same_org: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Batch upsert anyone same org"""
         try:
@@ -5131,8 +5381,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_entity_id_by_email(
         self,
         email: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """Get entity ID (user or group) by email"""
         try:
             query = """
@@ -5158,7 +5408,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def bulk_get_entity_ids_by_email(
         self,
         emails: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict[str, tuple[str, str, str]]:
         """Bulk get entity IDs for multiple emails"""
         try:
@@ -5215,7 +5465,7 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         file_key: str,
         permissions: list[dict],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Process and upsert file permissions"""
         try:
@@ -5340,8 +5590,9 @@ class Neo4jProvider(IGraphDBProvider):
     async def delete_records_and_relations(
         self,
         record_key: str,
+        *,
         hard_delete: bool = False,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> None:
         """Delete a record and all its relations"""
         try:
@@ -5368,6 +5619,7 @@ class Neo4jProvider(IGraphDBProvider):
                 Neo4jLabel.WEBPAGES.value,
                 Neo4jLabel.COMMENTS.value,
                 Neo4jLabel.TICKETS.value,
+                Neo4jLabel.ARTIFACTS.value,
             ]
 
             for label in type_labels:
@@ -5392,7 +5644,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         user_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """Main entry point for record deletion. KB records require OWNER, WRITER, or FILEORGANIZER."""
         try:
@@ -5492,7 +5744,7 @@ class Neo4jProvider(IGraphDBProvider):
         connector_id: str,
         external_id: str,
         user_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Delete a record by external ID"""
         try:
@@ -5512,7 +5764,7 @@ class Neo4jProvider(IGraphDBProvider):
         connector_id: str,
         external_id: str,
         user_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """Remove a user's access to a record"""
         try:
@@ -5537,7 +5789,7 @@ class Neo4jProvider(IGraphDBProvider):
 
     # ==================== Connector Deletion Helper Methods ====================
 
-    async def _collect_connector_entities(self, connector_id: str, transaction: Optional[str] = None) -> dict:
+    async def _collect_connector_entities(self, connector_id: str, transaction: str | None = None) -> dict:
         """Collect all entity IDs for a connector."""
         if not self.client:
             raise RuntimeError("Neo4j client not connected")
@@ -5613,45 +5865,49 @@ class Neo4jProvider(IGraphDBProvider):
         node_ids: list[str],
         edge_collections: list[str]
     ) -> tuple[int, list[str]]:
-        """Delete all relationships connected to nodes."""
+        """Delete relationships of the given types connected to nodes. Requires a non-empty edge_collections list (same as Arango: empty list = nothing to delete)."""
         if not node_ids:
+            return (0, [])
+
+        if not edge_collections:
             return (0, [])
 
         if not self.client:
             raise RuntimeError("Neo4j client not connected")
 
-        query = """
-        UNWIND $node_ids AS node_id_str
-        WITH split(node_id_str, '/')[1] AS node_id
-        MATCH (n {id: node_id})-[r]-()
+        node_keys = [sid.split("/", 1)[1] for sid in node_ids if "/" in sid]
+        if not node_keys:
+            return (0, [])
+
+        rel_types = [edge_collection_to_relationship(ec) for ec in edge_collections]
+        rel_pattern = "|".join(rel_types)
+        query = f"""
+        MATCH (n)
+        WHERE n.id IN $node_keys
+        MATCH (n)-[r:{rel_pattern}]-()
         DELETE r
-        RETURN count(DISTINCT r) AS deleted_count
+        RETURN count(r) AS deleted_count
         """
+        parameters = {"node_keys": node_keys}
 
         try:
-            total_deleted = 0
-            total_batches = (len(node_ids) + EDGE_DELETE_BATCH_SIZE - 1) // EDGE_DELETE_BATCH_SIZE
-
-            for i in range(0, len(node_ids), EDGE_DELETE_BATCH_SIZE):
-                batch_node_ids = node_ids[i:i + EDGE_DELETE_BATCH_SIZE]
-                results = await self.client.execute_query(
-                    query,
-                    parameters={"node_ids": batch_node_ids},
-                    txn_id=transaction
-                )
-                deleted_in_batch = results[0]["deleted_count"] if results else 0
-                total_deleted += deleted_in_batch
-
-            self.logger.info(
-                f"✅ Deleted {total_deleted} relationships for {len(node_ids)} nodes in {total_batches} batch(es)"
+            results = await self.client.execute_query(
+                query,
+                parameters=parameters,
+                txn_id=transaction
             )
-            return (total_deleted, [])
+
+            deleted_count = sum(row.get("deleted_count", 0) for row in results) if results else 0
+
+            self.logger.info(f"✅ Deleted {deleted_count} relationships for {len(node_ids)} nodes")
+
+            return (deleted_count, [])
 
         except Exception as e:
             self.logger.error(f"❌ Failed to delete relationships: {str(e)}")
             return (0, edge_collections)
 
-    async def _collect_isoftype_targets(self, transaction: Optional[str], connector_id: str) -> tuple[list[dict], bool]:
+    async def _collect_isoftype_targets(self, transaction: str | None, connector_id: str) -> tuple[list[dict], bool]:
         """Collect isOfType target nodes using connectorId directly."""
         if not connector_id:
             return ([], True)
@@ -5662,9 +5918,9 @@ class Neo4jProvider(IGraphDBProvider):
         query = """
         MATCH (record:Record {connectorId: $connector_id})-[:IS_OF_TYPE]->(typeNode)
         WITH DISTINCT typeNode, labels(typeNode) AS nodeLabels
-        WHERE any(label IN nodeLabels WHERE label IN ['File', 'Mail', 'Webpage', 'Comment', 'Ticket', 'Link', 'Project'])
+        WHERE any(label IN nodeLabels WHERE label IN ['File', 'Mail', 'Webpage', 'Comment', 'Ticket', 'Link', 'Project', 'Meeting'])
         RETURN {
-          collection: head([label IN nodeLabels WHERE label IN ['File', 'Mail', 'Webpage', 'Comment', 'Ticket', 'Link', 'Project']]),
+          collection: head([label IN nodeLabels WHERE label IN ['File', 'Mail', 'Webpage', 'Comment', 'Ticket', 'Link', 'Project', 'Meeting']]),
           key: typeNode.id,
           full_id: typeNode.id
         } AS target
@@ -5841,7 +6097,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def delete_sync_points_by_connector_id(
         self,
         connector_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[int, bool]:
         """
         Delete all sync points for a given connector.
@@ -5859,11 +6115,45 @@ class Neo4jProvider(IGraphDBProvider):
             collection=CollectionNames.SYNC_POINTS.value
         )
 
+    async def delete_connector_sync_edges(
+        self,
+        connector_id: str,
+        transaction: str | None = None
+    ) -> tuple[int, bool]:
+        """Delete only sync-created edges for this connector. Leaves nodes and isOfType intact."""
+        try:
+            collected = await self._collect_connector_entities(connector_id, transaction)
+            node_ids = collected.get("all_node_ids") or []
+            if not node_ids:
+                self.logger.info(f"No connector entities found for {connector_id}, nothing to delete")
+                return (0, True)
+
+            sync_edge_collections = [
+                CollectionNames.BELONGS_TO.value,
+                CollectionNames.RECORD_RELATIONS.value,
+                CollectionNames.PERMISSION.value,
+                CollectionNames.INHERIT_PERMISSIONS.value,
+                CollectionNames.USER_APP_RELATION.value,
+                CollectionNames.ENTITY_RELATIONS.value,
+                CollectionNames.ANYONE.value,
+            ]
+            deleted_count, failed = await self._delete_all_edges_for_nodes(
+                transaction or "", node_ids, sync_edge_collections
+            )
+            if failed:
+                self.logger.warning(f"Failed to delete some sync edges for connector {connector_id}")
+                return (deleted_count, False)
+            self.logger.info(f"Deleted {deleted_count} sync edges for connector {connector_id}")
+            return (deleted_count, True)
+        except Exception as e:
+            self.logger.error(f"Error deleting connector sync edges for {connector_id}: {e}", exc_info=True)
+            return (0, False)
+
     async def delete_connector_instance(
         self,
         connector_id: str,
         org_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict[str, Any]:
         """
         Delete a connector instance and all its related data with single-transaction atomicity.
@@ -5915,6 +6205,7 @@ class Neo4jProvider(IGraphDBProvider):
                 CollectionNames.WEBPAGES.value,
                 CollectionNames.COMMENTS.value,
                 CollectionNames.TICKETS.value,
+                CollectionNames.MEETINGS.value,
                 CollectionNames.LINKS.value,
                 CollectionNames.PROJECTS.value,
                 CollectionNames.APPS.value,
@@ -6023,7 +6314,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_key_by_external_file_id(
         self,
         external_file_id: str
-    ) -> Optional[str]:
+    ) -> str | None:
         """Get internal key by external file ID"""
         try:
             query = """
@@ -6046,8 +6337,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_key_by_external_message_id(
         self,
         external_message_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """
         Get internal key by external message ID.
 
@@ -6097,7 +6388,7 @@ class Neo4jProvider(IGraphDBProvider):
         record_id: str,
         relation_type: str,
         edge_collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Get related records connected via a specific relation type.
@@ -6109,11 +6400,11 @@ class Neo4jProvider(IGraphDBProvider):
             transaction (Optional[str]): Optional transaction ID
 
         Returns:
-            List[Dict]: List of related records with messageId, id/key, and relationType
+            List[Dict]: List of related records with messageId, id/key, and relationshipType
         """
         try:
             self.logger.info(
-                f"🚀 Getting related records for {record_id} with relation type {relation_type}"
+                f"🚀 Getting related records for {record_id} with relationship type {relation_type}"
             )
 
             # Map edge collection to Neo4j relationship type
@@ -6121,12 +6412,12 @@ class Neo4jProvider(IGraphDBProvider):
 
             query = f"""
             MATCH (source:Record {{id: $record_id}})-[r:{rel_type}]->(target:Record)
-            WHERE r.relationType = $relation_type
+            WHERE r.relationshipType = $relation_type
             RETURN {{
                 messageId: target.externalRecordId,
                 _key: target.id,
                 id: target.id,
-                relationType: r.relationType
+                relationshipType: r.relationshipType
             }} AS result
             """
 
@@ -6160,8 +6451,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_key: str,
         collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """
         Get messageIdHeader field from a mail record by its key.
 
@@ -6215,7 +6506,7 @@ class Neo4jProvider(IGraphDBProvider):
         message_id_header: str,
         exclude_key: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[str]:
         """
         Find all mail records with the same messageIdHeader, excluding a specific key.
@@ -6277,8 +6568,8 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         user_id: str,
         collection: str,
-        edge_collection: Optional[str] = None,
-        transaction: Optional[str] = None
+        edge_collection: str | None = None,
+        transaction: str | None = None
     ) -> bool:
         """
         Check if connector instance name is unique based on scope.
@@ -6356,7 +6647,7 @@ class Neo4jProvider(IGraphDBProvider):
         node_ids: list[str],
         updates: dict[str, Any],
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Batch update multiple nodes with the same updates.
@@ -6412,13 +6703,14 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_connector_instances_with_filters(
         self,
         collection: str,
-        scope: Optional[str] = None,
-        user_id: Optional[str] = None,
+        scope: str | None = None,
+        user_id: str | None = None,
+        *,
         is_admin: bool = False,
-        search: Optional[str] = None,
+        search: str | None = None,
         page: int = 1,
         limit: int = 20,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> tuple[list[dict], int]:
         """
         Get connector instances with filters, pagination, and access control.
@@ -6519,9 +6811,10 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         collection: str,
         scope: str,
-        user_id: Optional[str] = None,
+        user_id: str | None = None,
+        *,
         is_admin: bool = False,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> int:
         """
         Count connector instances by scope with access control.
@@ -6577,7 +6870,7 @@ class Neo4jProvider(IGraphDBProvider):
         user_id: str,
         team_scope: str,
         personal_scope: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Get connector instances by scope and user (for _get_all_connector_instances).
@@ -6627,8 +6920,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_record_by_id(
         self,
         record_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get a record by its internal ID with associated type document (file/mail/etc.).
 
@@ -6680,8 +6973,8 @@ class Neo4jProvider(IGraphDBProvider):
         user_id: str,
         org_id: str,
         record_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Check record access and return record details if accessible.
 
@@ -6727,7 +7020,7 @@ class Neo4jProvider(IGraphDBProvider):
                 self.logger.warning(f"⚠️ Record not found: {record_id}")
                 return None
 
-            # Build comprehensive access query matching BaseArangoService
+            # Build comprehensive access query
             # Check all access paths: direct, group, record group, nested record groups, org, KB, anyone
             access_query = """
             MATCH (u:User {id: $user_key})
@@ -7005,8 +7298,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_account_type(
         self,
         org_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
+        transaction: str | None = None
+    ) -> str | None:
         """
         Get account type for an organization.
 
@@ -7048,7 +7341,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         org_id: str,
         connector_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """
         Get connector statistics for a specific connector.
@@ -7073,6 +7366,7 @@ class Neo4jProvider(IGraphDBProvider):
                 MATCH (r)-[:IS_OF_TYPE]->(f:File)
                 WHERE f.isFile = false
             }
+            AND coalesce(r.isInternal, false) = false
             RETURN r.recordType AS recordType, r.indexingStatus AS indexingStatus, count(*) AS cnt
             """
 
@@ -7103,8 +7397,9 @@ class Neo4jProvider(IGraphDBProvider):
         """
         Reindex a single record with permission checks and event publishing.
         Depth comes from caller: 0 = only this record (record-details, collections/KB);
-        >0 = include children (e.g. all-records tree uses 100). KB (UPLOAD) records use
-        record-events and ignore depth; connector records use sync-events with depth.
+        >0 = include children (e.g. all-records tree uses 100).
+        - KB (UPLOAD): depth > 0 uses sync-events; depth == 0 uses record-events.
+        - CONNECTOR: uses sync-events and honors depth.
 
         Args:
             record_id: Record ID to reindex
@@ -7206,24 +7501,40 @@ class Neo4jProvider(IGraphDBProvider):
                     "reason": f"Unsupported record origin: {origin}"
                 }
 
-            # Reset indexing status to QUEUED before reindexing
-            await self._reset_indexing_status_to_queued(record_id)
+            # Reset indexing status to QUEUED before reindexing (skips isInternal in bulk helper)
+            await self.reset_indexing_status_to_queued_for_record_ids([record_id])
 
             # Create event data for router to publish
             try:
-                # KB records should always use record-events, not sync-events
-                # They don't need connector-based batch reindexing
-                if origin == OriginTypes.UPLOAD.value:
-                    # Get file record for KB reindex event payload
-                    # KB uploads are always FILE records
+                if origin == OriginTypes.UPLOAD.value and depth > 0:
+                    # KB folder reindex with children: use sync-events (same as connectors)
+                    # Consumer will find children via get_records_by_parent_record(depth)
+                    connector_for_event = connector_name.replace(" ", "").lower() if connector_name else "kb"
+                    event_type = f"{connector_for_event}.reindex"
+
+                    payload = {
+                        "orgId": org_id,
+                        "recordId": record_id,
+                        "depth": depth,
+                        "connectorId": connector_id,
+                        "connector": connector_for_event,
+                        "userKey": user_key
+                    }
+
+                    event_data = {
+                        "eventType": event_type,
+                        "topic": "sync-events",
+                        "payload": payload
+                    }
+                elif origin == OriginTypes.UPLOAD.value:
+                    # Single KB file reindex: use record-events
                     file_record = None
                     if record.get("recordType") == "FILE":
                         file_record = await self.get_document(record_id, CollectionNames.FILES.value)
 
-                    # Create reindex event payload for KB records
                     payload = await self._create_reindex_event_payload(record, file_record, user_id, request, record_id=record_id)
                     event_data = {
-                        "eventType": "newRecord",  # Use newRecord for KB reindex (same as single record reindex)
+                        "eventType": "newRecord",
                         "topic": "record-events",
                         "payload": payload
                     }
@@ -7475,6 +7786,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         user_key: str,
+        *,
         check_drive_inheritance: bool = True,
     ) -> dict:
         """
@@ -7670,8 +7982,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         user_email: str,
         service_type: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get user's sync state for a specific service"""
         try:
             query = """
@@ -7706,8 +8018,8 @@ class Neo4jProvider(IGraphDBProvider):
         user_email: str,
         state: str,
         service_type: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Update user's sync state for a specific service"""
         try:
             updated_timestamp = get_epoch_timestamp_in_ms()
@@ -7747,8 +8059,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_drive_sync_state(
         self,
         drive_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get drive's sync state"""
         try:
             query = """
@@ -7777,8 +8089,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         drive_id: str,
         state: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Update drive's sync state"""
         try:
             updated_timestamp = get_epoch_timestamp_in_ms()
@@ -7817,9 +8129,9 @@ class Neo4jProvider(IGraphDBProvider):
         resource_id: str,
         user_email: str,
         token: str,
-        expiration: Optional[str] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        expiration: str | None = None,
+        transaction: str | None = None
+    ) -> dict | None:
         """Store page token for a channel/resource"""
         try:
             created_timestamp = get_epoch_timestamp_in_ms()
@@ -7861,11 +8173,11 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_page_token_db(
         self,
-        channel_id: Optional[str] = None,
-        resource_id: Optional[str] = None,
-        user_email: Optional[str] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        channel_id: str | None = None,
+        resource_id: str | None = None,
+        user_email: str | None = None,
+        transaction: str | None = None
+    ) -> dict | None:
         """Get page token for specific channel/resource/user"""
         try:
             label = collection_to_label(CollectionNames.PAGE_TOKENS.value)
@@ -7915,7 +8227,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         collection_name: str,
         document_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Check if a document exists in a collection"""
         try:
@@ -7944,7 +8256,7 @@ class Neo4jProvider(IGraphDBProvider):
         from_key: str,
         to_key: str,
         edge_collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Check if an edge exists between two nodes"""
         try:
@@ -7972,7 +8284,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         org_id: str,
         connector_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get failed records along with their active users who have permissions"""
         try:
@@ -8007,7 +8319,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         org_id: str,
         connector_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get all failed records for an organization and connector"""
         try:
@@ -8031,7 +8343,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_data: dict,
         permission_edge: dict,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """Create a knowledge base with permissions"""
         try:
@@ -8067,8 +8379,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def _get_kb_context_for_record(
         self,
         record_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get KB context for a record."""
         try:
             self.logger.info(f"🔍 Finding KB context for record {record_id}")
@@ -8103,17 +8415,36 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         user_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[str]:
-        """Get user's permission role on a knowledge base"""
+        transaction: str | None = None
+    ) -> str | None:
+        """Get user's effective role on a KB: max(direct user edge, team-derived), same idea as Arango."""
         try:
             self.logger.info(f"🔍 Checking permissions for user {user_id} on KB {kb_id}")
 
-            # Check for direct user permission first
+            # Direct user->KB and user->team->KB both contribute; return highest-priority role (not direct-only).
             query = """
-            MATCH (u:User {id: $user_id})-[r:PERMISSION {type: "USER"}]->(kb:RecordGroup {id: $kb_id})
-            RETURN r.role AS role
+            MATCH (u:User {id: $user_id})
+            MATCH (kb:RecordGroup {id: $kb_id})
+            OPTIONAL MATCH (u)-[d:PERMISSION {type: "USER"}]->(kb)
+            WITH u, kb, d.role AS direct_role
+            OPTIONAL MATCH (u)-[ut:PERMISSION {type: "USER"}]->(team:Teams)-[tb:PERMISSION {type: "TEAM"}]->(kb)
+            WITH direct_role, collect(DISTINCT ut.role) AS team_roles
+            WITH CASE WHEN direct_role IS NOT NULL THEN [direct_role] ELSE [] END +
+                 [x IN team_roles WHERE x IS NOT NULL] AS candidates
+            UNWIND candidates AS cand
+            WITH DISTINCT cand AS role
+            WHERE role IS NOT NULL
+            WITH role,
+                 CASE role
+                   WHEN 'OWNER' THEN 4
+                   WHEN 'WRITER' THEN 3
+                   WHEN 'READER' THEN 2
+                   WHEN 'COMMENTER' THEN 1
+                   ELSE 0
+                 END AS priority
+            ORDER BY priority DESC
             LIMIT 1
+            RETURN role AS role
             """
 
             results = await self.client.execute_query(
@@ -8124,36 +8455,8 @@ class Neo4jProvider(IGraphDBProvider):
 
             if results:
                 role = results[0].get("role")
-                self.logger.info(f"✅ Found direct permission: user {user_id} has role '{role}' on KB {kb_id}")
+                self.logger.info(f"✅ Effective KB role for user {user_id} on KB {kb_id}: '{role}'")
                 return role
-
-            # If no direct permission, check via teams (Neo4j label is "Teams")
-            team_query = """
-            MATCH (u:User {id: $user_id})-[r1:PERMISSION {type: "USER"}]->(team:Teams)
-            MATCH (team)-[r2:PERMISSION {type: "TEAM"}]->(kb:RecordGroup {id: $kb_id})
-            WITH r1.role AS team_role,
-                 CASE r1.role
-                     WHEN "OWNER" THEN 4
-                     WHEN "WRITER" THEN 3
-                     WHEN "READER" THEN 2
-                     WHEN "COMMENTER" THEN 1
-                     ELSE 0
-                 END AS priority
-            ORDER BY priority DESC
-            RETURN team_role
-            LIMIT 1
-            """
-
-            team_results = await self.client.execute_query(
-                team_query,
-                parameters={"user_id": user_id, "kb_id": kb_id},
-                txn_id=transaction
-            )
-
-            if team_results:
-                team_role = team_results[0].get("team_role")
-                self.logger.info(f"✅ Found team-based permission: user {user_id} has role '{team_role}' on KB {kb_id} via teams")
-                return team_role
 
             self.logger.warning(f"⚠️ No permission found for user {user_id} on KB {kb_id}")
             return None
@@ -8166,8 +8469,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         user_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get knowledge base with user permissions"""
         try:
             # First check user permissions (includes team-based access)
@@ -8247,11 +8550,11 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         skip: int,
         limit: int,
-        search: Optional[str] = None,
-        permissions: Optional[list[str]] = None,
+        search: str | None = None,
+        permissions: list[str] | None = None,
         sort_by: str = "name",
         sort_order: str = "asc",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[list[dict], int, dict]:
         """
         List knowledge bases with pagination, search, and filtering.
@@ -8566,8 +8869,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         updates: dict,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Update knowledge base details"""
         try:
             self.logger.info(f"🚀 Updating knowledge base {kb_id}")
@@ -8604,8 +8907,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get folder by ID and validate it belongs to the specified KB in a single query.
         This combines validate_folder_in_kb() and get_folder_record_by_id() for better performance.
@@ -8654,9 +8957,9 @@ class Neo4jProvider(IGraphDBProvider):
         kb_id: str,
         folder_name: str,
         org_id: str,
-        parent_folder_id: Optional[str] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        parent_folder_id: str | None = None,
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Create folder with proper RECORDS document and IS_OF_TYPE edge.
 
@@ -8828,8 +9131,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get contents of a folder"""
         try:
             query = """
@@ -8875,7 +9178,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         folder_id: str,
         updates: dict,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """
         Update folder details in both FILES and RECORDS collections.
@@ -8988,7 +9291,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_id: str,
-        transaction: Optional[str] = None,
+        transaction: str | None = None,
     ) -> dict:
         """Delete a folder with ALL nested content."""
         try:
@@ -9201,9 +9504,9 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_name: str,
-        parent_folder_id: Optional[str] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        parent_folder_id: str | None = None,
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Find a folder by name within a specific parent (KB root or folder).
 
@@ -9253,7 +9556,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Validate that a folder exists in a knowledge base"""
         try:
@@ -9279,7 +9582,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         kb_id: str,
         folder_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Validate that a folder exists and belongs to a knowledge base"""
         return await self.validate_folder_exists_in_kb(kb_id, folder_id, transaction)
@@ -9324,14 +9627,14 @@ class Neo4jProvider(IGraphDBProvider):
         user_id: str,
         org_id: str,
         files: list[dict],
-        parent_folder_id: Optional[str] = None,  # None = KB root, str = specific folder
+        parent_folder_id: str | None = None,  # None = KB root, str = specific folder
     ) -> dict:
         """
         Upload records/files to a knowledge base.
         - KB root upload (parent_folder_id=None)
         - Folder upload (parent_folder_id=folder_id)
 
-        This method follows the same structure as BaseArangoService:
+        This method follows the same structure as ArangoHTTPProvider:
         1. Validate user permissions and target location
         2. Analyze folder structure relative to upload target
         3. Execute upload in single transaction
@@ -9391,7 +9694,7 @@ class Neo4jProvider(IGraphDBProvider):
         kb_id: str,
         user_id: str,
         org_id: str,
-        parent_folder_id: Optional[str] = None
+        parent_folder_id: str | None = None
     ) -> dict:
         """Unified validation for all upload scenarios"""
         try:
@@ -9915,40 +10218,53 @@ class Neo4jProvider(IGraphDBProvider):
             )
             return {}
 
-
-
-    async def _reset_indexing_status_to_queued(self, record_id: str) -> None:
+    async def reset_indexing_status_to_queued_for_record_ids(self, record_ids: list[str]) -> None:
         """
-        Reset indexing status to QUEUED before sending update/reindex events.
-        Only resets if status is not already QUEUED or EMPTY.
+        Bulk-fetch records, then batch upsert indexingStatus=QUEUED where appropriate.
+        Skips missing ids, isInternal records, and docs already QUEUED or EMPTY.
         """
+        unique_ids = [rid for rid in dict.fromkeys(record_ids) if isinstance(rid, str) and rid]
+        if not unique_ids:
+            return
+        coll = CollectionNames.RECORDS.value
+        skip_status = frozenset({ProgressStatus.EMPTY.value, ProgressStatus.QUEUED.value})
         try:
-            # Get the record
-            record = await self.get_document(record_id, CollectionNames.RECORDS.value)
-            if not record:
-                self.logger.warning(f"Record {record_id} not found for status reset")
+            label = collection_to_label(coll)
+            query = f"""
+            MATCH (n:{label})
+            WHERE n.id IN $ids
+            RETURN n
+            """
+            results = await self.client.execute_query(
+                query,
+                parameters={"ids": unique_ids},
+                txn_id=None,
+            )
+            if not results:
                 return
 
-            current_status = record.get("indexingStatus")
+            to_upsert: list[dict] = []
+            for row in results:
+                node_data = dict(row["n"])
+                record = self._neo4j_to_arango_node(node_data, coll)
+                rid = record.get("id") or record.get("_key")
+                if not rid:
+                    continue
+                if record.get("isInternal"):
+                    continue
+                if record.get("indexingStatus") in skip_status:
+                    continue
+                to_upsert.append({"id": rid, "indexingStatus": ProgressStatus.QUEUED.value})
 
-            # Only reset if not already QUEUED or EMPTY
-            if current_status in [ProgressStatus.QUEUED.value, ProgressStatus.EMPTY.value]:
-                self.logger.debug(f"Record {record_id} already has status {current_status}, skipping reset")
-                return
-
-            # Update indexing status to QUEUED
-            doc = {
-                "id": record_id,
-                "indexingStatus": ProgressStatus.QUEUED.value,
-            }
-
-            await self.batch_upsert_nodes([doc], CollectionNames.RECORDS.value)
-            self.logger.debug(f"✅ Reset record {record_id} status from {current_status} to QUEUED")
+            if to_upsert:
+                await self.batch_upsert_nodes(to_upsert, coll)
+                self.logger.debug(
+                    "✅ Reset %s record(s) indexing status to QUEUED", len(to_upsert)
+                )
         except Exception as e:
-            # Log but don't fail the main operation if status update fails
-            self.logger.error(f"❌ Failed to reset record {record_id} to QUEUED: {str(e)}")
+            self.logger.error(f"❌ Failed bulk reset records to QUEUED: {str(e)}")
 
-    async def _create_reindex_event_payload(self, record: dict, file_record: Optional[dict], user_id: Optional[str] = None, request: Optional["Request"] = None, record_id: Optional[str] = None) -> dict:
+    async def _create_reindex_event_payload(self, record: dict, file_record: dict | None, user_id: str | None = None, request: Optional[Request] = None, record_id: str | None = None) -> dict:
         """Create reindex event payload"""
         try:
             # Handle both translated (_key -> id) and untranslated document formats
@@ -10025,8 +10341,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_ids: list[str],
         kb_id: str,
-        folder_id: Optional[str] = None,
-        transaction: Optional[str] = None,
+        folder_id: str | None = None,
+        transaction: str | None = None,
     ) -> dict:
         """Delete multiple records."""
         try:
@@ -10218,7 +10534,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def _create_deleted_record_event_payload(
         self,
         record: dict,
-        file_record: Optional[dict] = None
+        file_record: dict | None = None
     ) -> dict:
         """Create deleted record event payload matching Node.js format"""
         try:
@@ -10245,7 +10561,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def delete_knowledge_base(
         self,
         kb_id: str,
-        transaction: Optional[str] = None,
+        transaction: str | None = None,
     ) -> dict:
         """
         Delete a knowledge base with ALL nested content
@@ -10500,7 +10816,7 @@ class Neo4jProvider(IGraphDBProvider):
         user_ids: list[str],
         team_ids: list[str],
         role: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """Create permissions for users and teams on a knowledge base"""
         try:
@@ -10557,7 +10873,7 @@ class Neo4jProvider(IGraphDBProvider):
         user_ids: list[str],
         team_ids: list[str],
         new_role: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """Optimistically update permissions for users and teams on a knowledge base"""
         try:
@@ -10664,7 +10980,7 @@ class Neo4jProvider(IGraphDBProvider):
         kb_id: str,
         user_ids: list[str],
         team_ids: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """Remove permissions for users and teams from a knowledge base"""
         try:
@@ -10701,7 +11017,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def list_kb_permissions(
         self,
         kb_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """List all permissions for a knowledge base with entity details"""
         try:
@@ -10769,18 +11085,18 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         skip: int,
         limit: int,
-        search: Optional[str] = None,
-        record_types: Optional[list[str]] = None,
-        origins: Optional[list[str]] = None,
-        connectors: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
-        permissions: Optional[list[str]] = None,
-        date_from: Optional[int] = None,
-        date_to: Optional[int] = None,
+        search: str | None = None,
+        record_types: list[str] | None = None,
+        origins: list[str] | None = None,
+        connectors: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        permissions: list[str] | None = None,
+        date_from: int | None = None,
+        date_to: int | None = None,
         sort_by: str = "createdAtTimestamp",
         sort_order: str = "desc",
         source: str = "all",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[list[dict], int, dict]:
         """
         List all records the user can access directly via belongs_to_kb edges.
@@ -11154,17 +11470,17 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         skip: int,
         limit: int,
-        search: Optional[str] = None,
-        record_types: Optional[list[str]] = None,
-        origins: Optional[list[str]] = None,
-        connectors: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
-        date_from: Optional[int] = None,
-        date_to: Optional[int] = None,
+        search: str | None = None,
+        record_types: list[str] | None = None,
+        origins: list[str] | None = None,
+        connectors: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        date_from: int | None = None,
+        date_to: int | None = None,
         sort_by: str = "createdAtTimestamp",
         sort_order: str = "desc",
-        folder_id: Optional[str] = None,
-        transaction: Optional[str] = None
+        folder_id: str | None = None,
+        transaction: str | None = None
     ) -> tuple[list[dict], int, dict]:
         """
         List all records in a specific KB through folder structure for better folder-based filtering.
@@ -11445,14 +11761,14 @@ class Neo4jProvider(IGraphDBProvider):
         skip: int,
         limit: int,
         level: int = 1,
-        search: Optional[str] = None,
-        record_types: Optional[list[str]] = None,
-        origins: Optional[list[str]] = None,
-        connectors: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
+        search: str | None = None,
+        record_types: list[str] | None = None,
+        origins: list[str] | None = None,
+        connectors: list[str] | None = None,
+        indexing_status: list[str] | None = None,
         sort_by: str = "name",
         sort_order: str = "asc",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """
         Get KB root contents with folders_first pagination and level order traversal
@@ -11678,14 +11994,14 @@ class Neo4jProvider(IGraphDBProvider):
         skip: int,
         limit: int,
         level: int = 1,
-        search: Optional[str] = None,
-        record_types: Optional[list[str]] = None,
-        origins: Optional[list[str]] = None,
-        connectors: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
+        search: str | None = None,
+        record_types: list[str] | None = None,
+        origins: list[str] | None = None,
+        connectors: list[str] | None = None,
+        indexing_status: list[str] | None = None,
         sort_by: str = "name",
         sort_order: str = "asc",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict:
         """
         Get folder contents with folders_first pagination and level order traversal.
@@ -11886,7 +12202,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_id: str,
         edge_collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Get all edges originating from a node.
@@ -11931,7 +12247,7 @@ class Neo4jProvider(IGraphDBProvider):
                 target_labels = result.get("target_labels", [])
                 target_id = result.get("target_id")
 
-                # Determine target collection from labels
+                # Determine target collection from labels using reverse of COLLECTION_TO_LABEL
                 target_collection = "records"  # Default
                 for label in target_labels:
                     # Use reverse mapping to get collection from label
@@ -11950,13 +12266,85 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Get edges from node failed: {str(e)}")
             return []
 
+    async def get_edges_from_node_with_target_name(
+        self,
+        node_id: str,
+        edge_collection: str,
+        transaction: str | None = None
+    ) -> list[dict]:
+        """
+        Get all edges originating from a node with target node names.
+
+        Args:
+            node_id: Source node ID (e.g., "groups/123")
+            edge_collection: Edge collection name
+            transaction: Optional transaction ID
+
+        Returns:
+            List[Dict]: List of edges
+        """
+        try:
+            # Parse node_id to get collection and key
+            if "/" in node_id:
+                collection, key = node_id.split("/", 1)
+            else:
+                # Try to determine collection from context
+                collection = "records"  # Default fallback
+                key = node_id
+
+            label = collection_to_label(collection)
+            rel_type = self._get_relationship_type(edge_collection)
+
+            query = f"""
+            MATCH (source:{label} {{id: $key}})-[r:{rel_type}]->(target)
+                 RETURN properties(r) AS r, labels(target) AS target_labels, target.id AS target_id,
+                     coalesce(target.name, target.departmentName, target.recordName, target.groupName, target.id) AS target_name
+            """
+
+            results = await self.client.execute_query(
+                query,
+                parameters={"key": key},
+                txn_id=transaction
+            )
+
+            # Create reverse mapping from label to collection
+            label_to_collection = {v: k for k, v in COLLECTION_TO_LABEL.items()}
+
+            edges = []
+            for result in results:
+                edge_dict = result.get("r", {})  # properties(r) already returns a dict
+                target_labels = result.get("target_labels", [])
+                target_id = result.get("target_id")
+                target_name = result.get("target_name")
+
+                # Determine target collection from labels using reverse of COLLECTION_TO_LABEL
+                target_collection = "records"  # Default
+                for label in target_labels:
+                    # Use reverse mapping to get collection from label
+                    if label in label_to_collection:
+                        target_collection = label_to_collection[label]
+                        break
+
+                # Convert to ArangoDB edge format
+                edge_dict["_from"] = node_id
+                edge_dict["_to"] = f"{target_collection}/{target_id}"
+                edge_dict["name"] = target_name
+                edges.append(edge_dict)
+            return edges
+
+        except Exception as e:
+            self.logger.error(f"❌ Get edges from node failed: {str(e)}")
+            return []
+
+
     # ==================== Missing Abstract Methods Implementation ====================
 
     async def batch_update_connector_status(
         self,
         connector_ids: list[str],
+        *,
         is_active: bool,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> int:
         """Batch update connector status."""
         try:
@@ -11978,12 +12366,20 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def batch_upsert_people(
         self,
-        people: list[dict],
-        collection: str,
-        transaction: Optional[str] = None
-    ) -> Optional[bool]:
-        """Batch upsert people nodes."""
+        people: list[Person],
+        transaction: str | None = None
+    ) -> None:
+        """Upsert people to PEOPLE collection (matches Arango / IGraphDBProvider)."""
         try:
+            if not people:
+                return None
+
+            collection = CollectionNames.PEOPLE.value
+            people_dicts = [
+                self._arango_to_neo4j_node(person.to_arango_person(), collection)
+                for person in people
+            ]
+
             label = collection_to_label(collection)
             query = f"""
             UNWIND $people AS person
@@ -11993,10 +12389,10 @@ class Neo4jProvider(IGraphDBProvider):
             """
             await self.client.execute_query(
                 query,
-                parameters={"people": people},
+                parameters={"people": people_dicts},
                 txn_id=transaction
             )
-            return True
+            self.logger.debug(f"Upserted {len(people)} people records")
         except Exception as e:
             self.logger.error(f"❌ Batch upsert people failed: {str(e)}")
             return False
@@ -12006,9 +12402,9 @@ class Neo4jProvider(IGraphDBProvider):
         collection: str,
         instance_name: str,
         scope: str,
-        org_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        transaction: Optional[str] = None,
+        org_id: str | None = None,
+        user_id: str | None = None,
+        transaction: str | None = None,
     ) -> bool:
         """Check if a connector instance name already exists for the given scope."""
         try:
@@ -12061,7 +12457,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def count_kb_owners(
         self,
         kb_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Count number of owners for a KB."""
         try:
@@ -12086,7 +12482,7 @@ class Neo4jProvider(IGraphDBProvider):
         parent_collection: str = "records",
         child_collection: str = "records",
         collection: str = "recordRelations",
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Create parent-child relationship edge."""
         try:
@@ -12116,7 +12512,7 @@ class Neo4jProvider(IGraphDBProvider):
         from_collection: str,
         collection: str,
         relationship_types: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """Delete edges by relationship types."""
         try:
@@ -12141,7 +12537,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def delete_parent_child_edge_to_record(
         self,
         record_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Delete parent-child edge to a record."""
         try:
@@ -12167,14 +12563,15 @@ class Neo4jProvider(IGraphDBProvider):
         edge_collection: str,
         org_id: str,
         user_id: str,
-        scope: Optional[str] = None,
-        search: Optional[str] = None,
+        scope: str | None = None,
+        search: str | None = None,
         skip: int = 0,
         limit: int = 20,
+        *,
         exclude_kb: bool = True,
-        kb_connector_type: Optional[str] = None,
+        kb_connector_type: str | None = None,
         is_admin: bool = False,
-        transaction: Optional[str] = None,
+        transaction: str | None = None,
     ) -> tuple[list[dict], int, dict[str, int]]:
         """Get filtered connector instances with pagination and scope counts."""
         try:
@@ -12277,9 +12674,9 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_kb_permissions(
         self,
         kb_id: str,
-        user_ids: Optional[list[str]] = None,
-        team_ids: Optional[list[str]] = None,
-        transaction: Optional[str] = None,
+        user_ids: list[str] | None = None,
+        team_ids: list[str] | None = None,
+        transaction: str | None = None,
     ) -> dict[str, dict[str, str]]:
         """Get current roles for users and teams on a KB. Returns {users: {id: role}, teams: {id: None}}."""
         try:
@@ -12331,8 +12728,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         external_revision_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[Record]:
+        transaction: str | None = None
+    ) -> Record | None:
         """Get record by external revision ID."""
         try:
             query = """
@@ -12360,8 +12757,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         connector_id: str,
         web_url: str,
-        transaction: Optional[str] = None
-    ) -> Optional[Record]:
+        transaction: str | None = None
+    ) -> Record | None:
         """Get record by web URL."""
         try:
             query = """
@@ -12385,8 +12782,8 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_record_parent_info(
         self,
         record_id: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """Get parent information for a record."""
         try:
             query = """
@@ -12410,7 +12807,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_records(
         self,
         record_ids: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[Record]:
         """Get multiple records by IDs."""
         try:
@@ -12442,7 +12839,7 @@ class Neo4jProvider(IGraphDBProvider):
         org_id: str,
         team_scope: str,
         personal_scope: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """Get all connector instances accessible to a user (personal + team)."""
         try:
@@ -12478,7 +12875,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         record_id: str,
         ancestor_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Check if record is descendant of ancestor."""
         try:
@@ -12499,7 +12896,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def is_record_folder(
         self,
         record_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> bool:
         """Check if record is a folder (isFile == false on its linked File node)."""
         try:
@@ -12523,9 +12920,9 @@ class Neo4jProvider(IGraphDBProvider):
         record_id: str,
         user_id: str,
         updates: dict,
-        file_metadata: Optional[dict] = None,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        file_metadata: dict | None = None,
+        transaction: str | None = None
+    ) -> dict | None:
         """Update a record."""
         try:
             # Add timestamp
@@ -12555,9 +12952,9 @@ class Neo4jProvider(IGraphDBProvider):
     async def update_record_external_parent_id(
         self,
         record_id: str,
-        new_parent_id: Optional[str] = None,
-        external_parent_id: Optional[str] = None,
-        transaction: Optional[str] = None
+        new_parent_id: str | None = None,
+        external_parent_id: str | None = None,
+        transaction: str | None = None
     ) -> bool:
         """Update record's external parent ID."""
         try:
@@ -12578,7 +12975,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"❌ Update record external parent ID failed for {record_id}: {str(e)}")
             raise
 
-    def _create_typed_record_from_neo4j_simple(self, record_data: dict) -> Optional[Record]:
+    def _create_typed_record_from_neo4j_simple(self, record_data: dict) -> Record | None:
         """
         Create base Record instance from Neo4j data (without type_doc).
         Matches ArangoDB behavior where methods like get_record_by_external_revision_id
@@ -12607,8 +13004,9 @@ class Neo4jProvider(IGraphDBProvider):
         limit: int,
         sort_field: str,
         sort_dir: str,
+        *,
         only_containers: bool,
-        transaction: Optional[str] = None
+        transaction: str | None = None,
     ) -> dict[str, Any]:
         """Get root level nodes (Apps) for Knowledge Hub."""
         try:
@@ -12699,8 +13097,10 @@ class Neo4jProvider(IGraphDBProvider):
         limit: int,
         sort_field: str,
         sort_dir: str,
+        *,
         only_containers: bool = False,
-        transaction: Optional[str] = None
+        record_group_ids: list[str] | None = None,
+        transaction: str | None = None,
     ) -> dict[str, Any]:
         """
         Get direct children of a node for tree navigation (browse mode).
@@ -12717,6 +13117,7 @@ class Neo4jProvider(IGraphDBProvider):
             sort_field: Field to sort by.
             sort_dir: Sort direction ('ASC' or 'DESC').
             only_containers: If True, only return nodes that can have children.
+            record_group_ids: Optional list of record group IDs to restrict visibility.
             transaction: Optional transaction ID.
         """
         start = time.perf_counter()
@@ -12762,6 +13163,12 @@ class Neo4jProvider(IGraphDBProvider):
         else:
             return {"nodes": [], "total": 0}
 
+        # Build optional record_group_ids filter for the Cypher query
+        rg_filter_line = ""
+        if record_group_ids:
+            rg_filter_line = "AND (node.nodeType <> 'recordGroup' OR node.origin <> 'COLLECTION' OR node.id IN $record_group_ids)"
+            params["record_group_ids"] = record_group_ids
+
         # Simple query for direct children with sorting and pagination (no filters)
         query = f"""
         CALL {{
@@ -12771,9 +13178,10 @@ class Neo4jProvider(IGraphDBProvider):
         // Apply only_containers filter
         UNWIND raw_children AS node
         WITH node WHERE
-            ($only_containers IN [false, 'False', 'false'] OR $only_containers = false)
+            (($only_containers IN [false, 'False', 'false'] OR $only_containers = false)
             OR node.hasChildren = true
-            OR node.nodeType IN ['app', 'recordGroup', 'folder']
+            OR node.nodeType IN ['app', 'recordGroup', 'folder'])
+            {rg_filter_line}
 
         // Sort with explicit field mapping (Neo4j doesn't support dynamic property access)
         WITH node,
@@ -12817,19 +13225,21 @@ class Neo4jProvider(IGraphDBProvider):
         limit: int,
         sort_field: str,
         sort_dir: str,
-        search_query: Optional[str] = None,
-        node_types: Optional[list[str]] = None,
-        record_types: Optional[list[str]] = None,
-        origins: Optional[list[str]] = None,
-        connector_ids: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
-        created_at: Optional[dict[str, Optional[int]]] = None,
-        updated_at: Optional[dict[str, Optional[int]]] = None,
-        size: Optional[dict[str, Optional[int]]] = None,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        *,
         only_containers: bool = False,
-        parent_id: Optional[str] = None,
-        parent_type: Optional[str] = None,
-        transaction: Optional[str] = None
+        parent_id: str | None = None,
+        parent_type: str | None = None,
+        record_group_ids: list[str] | None = None,
+        transaction: str | None = None,
     ) -> dict[str, Any]:
         """
         Unified search for knowledge hub nodes with permission-first traversal.
@@ -12847,7 +13257,7 @@ class Neo4jProvider(IGraphDBProvider):
         start = time.perf_counter()
 
         try:
-            self.logger.info(f"🔍 Starting knowledge hub search with parent_id={parent_id}, parent_type={parent_type}, only_containers={only_containers}, search_query={search_query}, node_types={node_types}, record_types={record_types}, origins={origins}, connector_ids={connector_ids}, indexing_status={indexing_status}, created_at={created_at}, updated_at={updated_at}, size={size}")
+            self.logger.info(f"🔍 Starting knowledge hub search with parent_id={parent_id}, parent_type={parent_type}, only_containers={only_containers}, search_query={search_query}, node_types={node_types}, record_types={record_types}, origins={origins}, connector_ids={connector_ids}, indexing_status={indexing_status}, created_at={created_at}, updated_at={updated_at}, size={size}, record_group_ids={record_group_ids}")
             # Build filter conditions using helper
             filter_conditions, filter_params = self._build_knowledge_hub_filter_conditions(
                 search_query=search_query,
@@ -12860,6 +13270,7 @@ class Neo4jProvider(IGraphDBProvider):
                 origins=origins,
                 connector_ids=connector_ids,
                 only_containers=only_containers,
+                record_group_ids=record_group_ids,
             )
 
             # Build scope filters
@@ -12886,7 +13297,7 @@ class Neo4jProvider(IGraphDBProvider):
             else:
                 # For app-level scope or global search, apply scope filters as before
                 scope_filter_rg, scope_filter_record, scope_filter_rg_inline, scope_filter_record_inline = self._build_scope_filters_cypher(
-                    parent_id, parent_type, parent_connector_id
+                    parent_id, parent_type, parent_connector_id, record_group_ids=record_group_ids
                 )
 
             # Build bind variables
@@ -12898,7 +13309,13 @@ class Neo4jProvider(IGraphDBProvider):
                 "sort_field": sort_field,
                 "sort_dir": sort_dir.upper(),
                 "only_containers": only_containers,
+                "user_permission_type": EntityType.USER.value,
+                "team_permission_type": EntityType.TEAM.value,
             }
+
+            # Add record_group_ids to params for scope filter binding
+            if record_group_ids:
+                params["record_group_ids"] = record_group_ids
 
             # Add bind variables based on parent_type
             if parent_id:
@@ -12920,13 +13337,7 @@ class Neo4jProvider(IGraphDBProvider):
             # Build filter clause
             filter_clause = " AND ".join(filter_conditions) if filter_conditions else "true"
 
-            # Get user accessible apps
-            user_apps_query = """
-            MATCH (u:User {id: $user_key})-[:USER_APP_RELATION]->(app:App)
-            RETURN collect(app.id) AS app_ids
-            """
-            user_apps_result = await self.client.execute_query(user_apps_query, parameters={"user_key": user_key}, txn_id=transaction)
-            user_accessible_app_ids = user_apps_result[0].get("app_ids", []) if user_apps_result else []
+            user_accessible_app_ids = await self.get_user_app_ids(user_key, transaction=transaction)
             params["user_accessible_app_ids"] = user_accessible_app_ids
 
             # Build children intersection cypher (only for kb/recordGroup/record/folder parents)
@@ -13111,6 +13522,27 @@ class Neo4jProvider(IGraphDBProvider):
             OPTIONAL MATCH (rg:RecordGroup)
             WHERE rg_data IS NOT NULL AND rg.id = rg_data.id
 
+            // Compute sharingStatus for KB recordGroups only
+            OPTIONAL MATCH (kb_user_perm:User)-[kb_up:PERMISSION {type: $user_permission_type}]->(rg)
+            WHERE rg.connectorName = 'KB'
+
+            OPTIONAL MATCH ()-[kb_tp:PERMISSION {type: $team_permission_type}]->(rg)
+            WHERE rg.connectorName = 'KB'
+
+            WITH rg_data, final_accessible_rgs, final_accessible_records, records_with_fallback, rg,
+                 collect(DISTINCT kb_up) AS kb_user_perms,
+                 collect(DISTINCT kb_tp) AS kb_team_perms
+
+            WITH rg_data, final_accessible_rgs, final_accessible_records, records_with_fallback, rg,
+                 CASE
+                     WHEN rg IS NOT NULL AND rg.connectorName = 'KB' THEN
+                         CASE WHEN (size(kb_user_perms) > 1 OR size(kb_team_perms) > 0)
+                              THEN 'shared'
+                              ELSE 'private'
+                         END
+                     ELSE null
+                 END AS sharingStatus
+
             WITH final_accessible_rgs, final_accessible_records, records_with_fallback,
                  collect(
                    CASE WHEN rg IS NOT NULL THEN
@@ -13126,14 +13558,20 @@ class Neo4jProvider(IGraphDBProvider):
                        recordType: null,
                        recordGroupType: rg.groupType,
                        indexingStatus: null,
-                       createdAt: COALESCE(rg.sourceCreatedAtTimestamp, 0),
-                       updatedAt: COALESCE(rg.sourceLastModifiedTimestamp, 0),
+                       createdAt: CASE WHEN rg.connectorName = 'KB'
+                           THEN COALESCE(rg.createdAtTimestamp, 0)
+                           ELSE COALESCE(rg.sourceCreatedAtTimestamp, 0) END,
+                       updatedAt: CASE WHEN rg.connectorName = 'KB'
+                           THEN COALESCE(rg.updatedAtTimestamp, 0)
+                           ELSE COALESCE(rg.sourceLastModifiedTimestamp, 0) END,
                        sizeInBytes: null,
                        mimeType: null,
                        extension: null,
                        webUrl: rg.webUrl,
                        hasChildren: EXISTS((rg)<-[:BELONGS_TO]-(:RecordGroup)) OR EXISTS((rg)<-[:BELONGS_TO]-(:Record)),
-                       previewRenderable: true
+                       previewRenderable: true,
+                       sharingStatus: sharingStatus,
+                       isInternal: COALESCE(rg.isInternal, false)
                      }
                    ELSE null END
                  ) AS rg_nodes_with_nulls
@@ -13180,6 +13618,7 @@ class Neo4jProvider(IGraphDBProvider):
            recordType: record.recordType,
            recordGroupType: null,
            indexingStatus: record.indexingStatus,
+           reason: record.reason,
            createdAt: COALESCE(record.sourceCreatedAtTimestamp, 0),
            updatedAt: COALESCE(record.sourceLastModifiedTimestamp, 0),
            sizeInBytes: COALESCE(record.sizeInBytes,
@@ -13188,7 +13627,8 @@ class Neo4jProvider(IGraphDBProvider):
            extension: CASE WHEN file_info IS NOT NULL THEN file_info.extension ELSE null END,
            webUrl: record.webUrl,
            hasChildren: has_children,
-           previewRenderable: COALESCE(record.previewRenderable, true)
+           previewRenderable: COALESCE(record.previewRenderable, true),
+           isInternal: COALESCE(record.isInternal, false)
          }
                    ELSE null END
                  ) AS record_nodes_with_nulls
@@ -13267,7 +13707,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_knowledge_hub_breadcrumbs(
         self,
         node_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict[str, Any]]:
         """
         Get breadcrumb trail for a node using iterative parent lookup.
@@ -13343,7 +13783,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WITH node, node_type, record, rg, app, f, is_folder, parent_rec, rg_parent_from_record, head(collect(rg_parent)) AS rg_parent
 
                 // Step 2: If no parent recordGroup, check BELONGS_TO edge to app
-                // Use LIMIT 1 to ensure only one parent (KB filter applied in CASE statement)
+                // Use LIMIT 1 to ensure only one parent
                 OPTIONAL MATCH (rg)-[:BELONGS_TO]->(app_parent:App)
                 WHERE rg IS NOT NULL
                       AND rg_parent IS NULL
@@ -13357,7 +13797,7 @@ class Neo4jProvider(IGraphDBProvider):
                 //   2. If no record parent, check BELONGS_TO edge to recordGroup
                 // For RecordGroups:
                 //   1. Check BELONGS_TO edge to another recordGroup
-                //   2. If no parent recordGroup, check BELONGS_TO edge to app (exclude KB apps)
+                //   2. If no parent recordGroup, check BELONGS_TO edge to app
                 // For Apps: No parent
                 WITH node, node_type, record, rg, app,
                      CASE
@@ -13435,14 +13875,18 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_user_app_ids(
         self,
         user_key: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[str]:
         """Get list of app IDs the user has access to."""
         try:
             query = """
-            MATCH (u:User {id: $user_key})-[:USER_APP_RELATION]->(app:App)
-            WHERE app IS NOT NULL
-            RETURN app.id AS app_id
+            MATCH (u:User {id: $user_key})
+            OPTIONAL MATCH (u)-[:USER_APP_RELATION]->(app1:App)
+            OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(team:Teams)-[:USER_APP_RELATION]->(app2:App)
+            WITH collect(DISTINCT app1) + collect(DISTINCT app2) AS app_list
+            UNWIND app_list AS app
+            WITH app WHERE app IS NOT NULL
+            RETURN DISTINCT app.id AS app_id
             """
             results = await self.client.execute_query(
                 query,
@@ -13458,8 +13902,9 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         user_key: str,
         org_id: str,
-        parent_id: Optional[str],
-        transaction: Optional[str] = None
+        parent_id: str | None,
+        transaction: str | None = None,
+        parent_type: str | None = None,
     ) -> dict[str, Any]:
         """
         Get user's context-level permissions.
@@ -13493,7 +13938,6 @@ class Neo4jProvider(IGraphDBProvider):
                 )
             else:
                 # Node level - use generic permission checker
-                # Generate permission calls for all node types
                 record_permission_call = self._get_permission_role_cypher(
                     node_type="record",
                     node_var="record",
@@ -13510,60 +13954,48 @@ class Neo4jProvider(IGraphDBProvider):
                     user_var="u"
                 )
 
-                query = f"""
-                MATCH (u:User {{id: $user_key}})
+                context_perm_return = """
+                WITH coalesce(permission_role, 'READER') AS final_role
 
-                // Find the node (could be Record, App, or RecordGroup)
-                OPTIONAL MATCH (record:Record {{id: $parent_id}})
-                OPTIONAL MATCH (app:App {{id: $parent_id}})
-                OPTIONAL MATCH (rg:RecordGroup {{id: $parent_id}})
-
-                WITH u, record, app, rg,
-                     coalesce(record, app, rg) AS node,
-                     record IS NOT NULL AS is_record,
-                     app IS NOT NULL AS is_app,
-                     rg IS NOT NULL AS is_rg
-
-                WHERE node IS NOT NULL
-
-                // Get permission for Records
-                CALL {{
-                    WITH u, record, is_record
-                    WITH u, record
-                    WHERE is_record
-                    {record_permission_call}
-                    RETURN permission_role AS record_perm
-                }}
-
-                // Get permission for RecordGroups
-                CALL {{
-                    WITH u, rg, is_rg
-                    WITH u, rg
-                    WHERE is_rg
-                    {rg_permission_call}
-                    RETURN permission_role AS rg_perm
-                }}
-
-                // Get permission for Apps
-                CALL {{
-                    WITH u, app, is_app
-                    WITH u, app
-                    WHERE is_app
-                    {app_permission_call}
-                    RETURN permission_role AS app_perm
-                }}
-
-                WITH coalesce(record_perm, rg_perm, app_perm, 'READER') AS final_role
-
-                RETURN {{
+                RETURN {
                     role: final_role,
                     canUpload: final_role IN ['OWNER', 'ADMIN', 'EDITOR', 'WRITER'],
                     canCreateFolders: final_role IN ['OWNER', 'ADMIN', 'EDITOR', 'WRITER'],
                     canEdit: final_role IN ['OWNER', 'ADMIN', 'EDITOR', 'WRITER'],
                     canDelete: final_role IN ['OWNER', 'ADMIN'],
                     canManagePermissions: final_role IN ['OWNER', 'ADMIN']
-                }} AS result
+                } AS result
                 """
+
+                graph_type: str | None = None
+                if parent_type:
+                    graph_type = (
+                        "record" if parent_type in ("folder", "record") else parent_type
+                    )
+
+                if graph_type == "record":
+                    query = f"""
+                MATCH (u:User {{id: $user_key}})
+                MATCH (record:Record {{id: $parent_id}})
+                {record_permission_call}
+                {context_perm_return}
+                """
+                elif graph_type == "recordGroup":
+                    query = f"""
+                MATCH (u:User {{id: $user_key}})
+                MATCH (rg:RecordGroup {{id: $parent_id}})
+                {rg_permission_call}
+                {context_perm_return}
+                """
+                elif graph_type == "app":
+                    query = f"""
+                MATCH (u:User {{id: $user_key}})
+                MATCH (app:App {{id: $parent_id}})
+                {app_permission_call}
+                {context_perm_return}
+                """
+                else:
+                    raise ValueError(f"Invalid or unsupported parent_type: {parent_type}")
 
                 results = await self.client.execute_query(
                     query,
@@ -13581,6 +14013,8 @@ class Neo4jProvider(IGraphDBProvider):
                 "canDelete": False,
                 "canManagePermissions": False
             }
+        except ValueError:
+            raise
         except Exception as e:
             self.logger.error(f"❌ Get knowledge hub context permissions failed: {str(e)}")
             return {
@@ -13596,8 +14030,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_id: str,
         folder_mime_types: list[str],
-        transaction: Optional[str] = None
-    ) -> Optional[dict[str, Any]]:
+        transaction: str | None = None
+    ) -> dict[str, Any] | None:
         """Get node information including type and subtype."""
         try:
             query = """
@@ -13660,8 +14094,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_id: str,
         folder_mime_types: list[str],
-        transaction: Optional[str] = None
-    ) -> Optional[dict[str, Any]]:
+        transaction: str | None = None
+    ) -> dict[str, Any] | None:
         """Get the parent node of a given node in a single query."""
         try:
             query = """
@@ -13826,40 +14260,29 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         user_key: str,
         org_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict[str, list[dict[str, Any]]]:
         """
         Get available filter options (Apps) for a user.
         Returns connector apps the user has access to. Excludes the Collection app (type='KB').
         """
         try:
-            query = """
-            MATCH (u:User {id: $user_key})
-
-            // Get apps via USER_APP_RELATION (exclude Collection app so it is not in connector filter)
-            OPTIONAL MATCH (u)-[:USER_APP_RELATION]->(app:App)
-            WHERE app.type <> 'KB'
-
-            WITH collect(DISTINCT app) AS all_apps_raw
-
-            // Filter nulls and transform using list comprehensions
-            WITH
-                [app IN all_apps_raw WHERE app IS NOT NULL AND app.id IS NOT NULL |
-                    {id: app.id, name: app.name, type: app.type}
-                ] AS apps
-
-            RETURN {apps: apps} AS result
-            """
-            results = await self.client.execute_query(
-                query,
-                parameters={"user_key": user_key},
-                txn_id=transaction
-            )
-            if results and results[0].get("result"):
-                return results[0]["result"]
-            return {"apps": []}
+            apps_raw = await self.get_user_apps(user_key, transaction=transaction)
+            apps = [
+                {
+                    "id": app.get("_key") or app.get("id"),
+                    "name": app.get("name"),
+                    "type": app.get("type"),
+                }
+                for app in apps_raw
+                if app
+                and (app.get("type") or "") != "KB"
+                and (app.get("_key") or app.get("id"))
+            ]
+            apps.sort(key=lambda a: (a.get("name") or "").lower())
+            return {"apps": apps}
         except Exception as e:
-            self.logger.error(f"❌ Get knowledge hub filter options failed: {str(e)}")
+            self.logger.exception(f"❌ Failed to get knowledge hub filter options: {str(e)}")
             return {"apps": []}
 
     def _get_app_children_cypher(self) -> str:
@@ -13911,6 +14334,27 @@ class Neo4jProvider(IGraphDBProvider):
         WITH app, u, parent_id, is_kb_app, rg, permission_role, has_child_rgs,
              count(DISTINCT child_record) > 0 AS has_records
 
+        // Compute sharingStatus for KB recordGroups only
+        OPTIONAL MATCH (kb_user_perm:User)-[kb_up:PERMISSION {{type: 'USER'}}]->(rg)
+        WHERE rg.connectorName = 'KB'
+
+        OPTIONAL MATCH ()-[kb_tp:PERMISSION {{type: 'TEAM'}}]->(rg)
+        WHERE rg.connectorName = 'KB'
+
+        WITH app, u, parent_id, is_kb_app, rg, permission_role, has_child_rgs, has_records,
+             collect(DISTINCT kb_up) AS kb_user_perms,
+             collect(DISTINCT kb_tp) AS kb_team_perms
+
+        WITH app, u, parent_id, is_kb_app, rg, permission_role, has_child_rgs, has_records,
+             CASE
+                 WHEN rg.connectorName = 'KB' THEN
+                     CASE WHEN (size(kb_user_perms) > 1 OR size(kb_team_perms) > 0)
+                          THEN 'shared'
+                          ELSE 'private'
+                     END
+                 ELSE null
+             END AS sharingStatus
+
         // Build result nodes
         WITH collect({{
             id: rg.id,
@@ -13922,14 +14366,20 @@ class Neo4jProvider(IGraphDBProvider):
             recordType: null,
             recordGroupType: rg.groupType,
             indexingStatus: null,
-            createdAt: coalesce(rg.sourceCreatedAtTimestamp, 0),
-            updatedAt: coalesce(rg.sourceLastModifiedTimestamp, 0),
+            createdAt: CASE WHEN rg.connectorName = 'KB'
+                THEN coalesce(rg.createdAtTimestamp, 0)
+                ELSE coalesce(rg.sourceCreatedAtTimestamp, 0) END,
+            updatedAt: CASE WHEN rg.connectorName = 'KB'
+                THEN coalesce(rg.updatedAtTimestamp, 0)
+                ELSE coalesce(rg.sourceLastModifiedTimestamp, 0) END,
             sizeInBytes: null,
             mimeType: null,
             extension: null,
             webUrl: rg.webUrl,
             hasChildren: has_child_rgs OR has_records,
-            userRole: permission_role
+            userRole: permission_role,
+            sharingStatus: sharingStatus,
+            isInternal: coalesce(rg.isInternal, false)
         }}) AS raw_children
 
         RETURN raw_children
@@ -14008,6 +14458,7 @@ class Neo4jProvider(IGraphDBProvider):
                 recordType: record.recordType,
                 recordGroupType: null,
                 indexingStatus: record.indexingStatus,
+                reason: record.reason,
                 createdAt: coalesce(record.sourceCreatedAtTimestamp, record.createdAtTimestamp, 0),
                 updatedAt: coalesce(record.sourceLastModifiedTimestamp, record.updatedAtTimestamp, 0),
                 sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
@@ -14016,7 +14467,8 @@ class Neo4jProvider(IGraphDBProvider):
                 webUrl: record.webUrl,
                 hasChildren: has_children,
                 previewRenderable: coalesce(record.previewRenderable, true),
-                userRole: permission_role
+                userRole: permission_role,
+                isInternal: coalesce(record.isInternal, false)
             }}) AS internal_records
         }}
 
@@ -14061,6 +14513,27 @@ class Neo4jProvider(IGraphDBProvider):
             WITH node, parent_id, permission_role, has_child_rgs,
                  count(DISTINCT child_record_check) > 0 AS has_records
 
+            // Compute sharingStatus for KB recordGroups only
+            OPTIONAL MATCH (kb_user_perm:User)-[kb_up:PERMISSION {{type: 'USER'}}]->(node)
+            WHERE node.connectorName = 'KB'
+
+            OPTIONAL MATCH ()-[kb_tp:PERMISSION {{type: 'TEAM'}}]->(node)
+            WHERE node.connectorName = 'KB'
+
+            WITH node, parent_id, permission_role, has_child_rgs, has_records,
+                 collect(DISTINCT kb_up) AS kb_user_perms,
+                 collect(DISTINCT kb_tp) AS kb_team_perms
+
+            WITH node, parent_id, permission_role, has_child_rgs, has_records,
+                 CASE
+                     WHEN node.connectorName = 'KB' THEN
+                         CASE WHEN (size(kb_user_perms) > 1 OR size(kb_team_perms) > 0)
+                              THEN 'shared'
+                              ELSE 'private'
+                         END
+                     ELSE null
+                 END AS sharingStatus
+
             RETURN collect({{
                 id: node.id,
                 name: node.groupName,
@@ -14073,14 +14546,20 @@ class Neo4jProvider(IGraphDBProvider):
                 recordType: null,
                 recordGroupType: node.groupType,
                 indexingStatus: null,
-                createdAt: coalesce(node.sourceCreatedAtTimestamp, node.createdAtTimestamp, 0),
-                updatedAt: coalesce(node.sourceLastModifiedTimestamp, node.updatedAtTimestamp, 0),
+                createdAt: CASE WHEN node.connectorName = 'KB'
+                    THEN coalesce(node.createdAtTimestamp, 0)
+                    ELSE coalesce(node.sourceCreatedAtTimestamp, node.createdAtTimestamp, 0) END,
+                updatedAt: CASE WHEN node.connectorName = 'KB'
+                    THEN coalesce(node.updatedAtTimestamp, 0)
+                    ELSE coalesce(node.sourceLastModifiedTimestamp, node.updatedAtTimestamp, 0) END,
                 sizeInBytes: null,
                 mimeType: null,
                 extension: null,
                 webUrl: node.webUrl,
                 hasChildren: has_child_rgs OR has_records,
-                userRole: permission_role
+                userRole: permission_role,
+                sharingStatus: sharingStatus,
+                isInternal: coalesce(node.isInternal, false)
             }}) AS child_rgs
         }}
 
@@ -14139,6 +14618,7 @@ class Neo4jProvider(IGraphDBProvider):
                 recordType: record.recordType,
                 recordGroupType: null,
                 indexingStatus: record.indexingStatus,
+                reason: record.reason,
                 createdAt: coalesce(record.sourceCreatedAtTimestamp, record.createdAtTimestamp, 0),
                 updatedAt: coalesce(record.sourceLastModifiedTimestamp, record.updatedAtTimestamp, 0),
                 sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
@@ -14147,7 +14627,8 @@ class Neo4jProvider(IGraphDBProvider):
                 webUrl: record.webUrl,
                 hasChildren: has_children,
                 previewRenderable: coalesce(record.previewRenderable, true),
-                userRole: permission_role
+                userRole: permission_role,
+                isInternal: coalesce(record.isInternal, false)
             }}) AS direct_records
         }}
 
@@ -14226,6 +14707,7 @@ class Neo4jProvider(IGraphDBProvider):
             recordType: record.recordType,
             recordGroupType: null,
             indexingStatus: record.indexingStatus,
+            reason: record.reason,
             createdAt: coalesce(record.sourceCreatedAtTimestamp, 0),
             updatedAt: coalesce(record.sourceLastModifiedTimestamp, 0),
             sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
@@ -14234,7 +14716,8 @@ class Neo4jProvider(IGraphDBProvider):
             webUrl: record.webUrl,
             hasChildren: has_children,
             previewRenderable: coalesce(record.previewRenderable, true),
-            userRole: permission_role
+            userRole: permission_role,
+            isInternal: coalesce(record.isInternal, false)
         }}) AS raw_children
 
         RETURN raw_children
@@ -14242,16 +14725,18 @@ class Neo4jProvider(IGraphDBProvider):
 
     def _build_knowledge_hub_filter_conditions(
         self,
-        search_query: Optional[str] = None,
-        node_types: Optional[list[str]] = None,
-        record_types: Optional[list[str]] = None,
-        indexing_status: Optional[list[str]] = None,
-        created_at: Optional[dict[str, Optional[int]]] = None,
-        updated_at: Optional[dict[str, Optional[int]]] = None,
-        size: Optional[dict[str, Optional[int]]] = None,
-        origins: Optional[list[str]] = None,
-        connector_ids: Optional[list[str]] = None,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        *,
         only_containers: bool = False,
+        record_group_ids: list[str] | None = None,
     ) -> tuple[list[str], dict[str, Any]]:
         """
         Build filter conditions and parameters for knowledge hub search queries.
@@ -14321,6 +14806,16 @@ class Neo4jProvider(IGraphDBProvider):
         if connector_ids:
             filter_params["connector_ids"] = connector_ids
             filter_conditions.append("((node.nodeType = 'app' AND node.id IN $connector_ids) OR (node.connectorId IN $connector_ids))")
+
+        # Record group ID restriction: only allow COLLECTION-origin recordGroups
+        # whose IDs are in the provided list. CONNECTOR-origin recordGroups
+        # (Confluence spaces, Jira projects, etc.) pass through — they're
+        # already scoped by connector_ids. Non-recordGroup nodes also pass.
+        if record_group_ids:
+            filter_params["record_group_ids"] = record_group_ids
+            filter_conditions.append(
+                "(node.nodeType <> 'recordGroup' OR node.origin <> 'COLLECTION' OR node.id IN $record_group_ids)"
+            )
 
         # Add search condition to filter conditions if present
         if search_query:
@@ -14608,28 +15103,30 @@ class Neo4jProvider(IGraphDBProvider):
             // Check if user has USER_APP_RELATION to app
             OPTIONAL MATCH ({user_var})-[user_app_rel:USER_APP_RELATION]->({node_var})
 
+            // Check if user has path User->Team->App (user in team, team has USER_APP_RELATION to app)
+            OPTIONAL MATCH ({user_var})-[:PERMISSION {{type: 'USER'}}]->(team:Teams)-[team_app_rel:USER_APP_RELATION]->({node_var})
+
             // Check if user is admin
-            WITH {node_var}, {user_var}, user_app_rel,
+            WITH {node_var}, {user_var}, user_app_rel, team_app_rel,
                 (coalesce({user_var}.role, '') = 'ADMIN' OR coalesce({user_var}.orgRole, '') = 'ADMIN') AS is_admin
 
             // Get app scope and check if user is creator
             // createdBy stores MongoDB userId, so compare with user.userId (not user.id)
-            WITH {node_var}, {user_var}, user_app_rel, is_admin,
+            WITH {node_var}, {user_var}, user_app_rel, team_app_rel, is_admin,
                 coalesce({node_var}.scope, 'personal') AS app_scope,
                 ({node_var}.createdBy = {user_var}.userId OR {node_var}.createdBy = {user_var}.id) AS is_creator
 
             // Determine role based on conditions
             RETURN CASE
-                // If no USER_APP_RELATION, no access
-                WHEN user_app_rel IS NULL THEN null
-
+                // No direct user->app and no team->app: no access
+                WHEN user_app_rel IS NULL AND team_app_rel IS NULL THEN null
+                // Access via team (All)->app: READER; admin gets EDITOR
+                WHEN user_app_rel IS NULL AND team_app_rel IS NOT NULL THEN (CASE WHEN is_admin THEN 'EDITOR' ELSE 'READER' END)
                 // Admin users: EDITOR for team apps, OWNER for personal apps
                 WHEN is_admin AND app_scope = 'team' THEN 'EDITOR'
                 WHEN is_admin AND app_scope = 'personal' THEN 'OWNER'
-
                 // Team app creator gets OWNER role
                 WHEN app_scope = 'team' AND is_creator THEN 'OWNER'
-
                 // Default: READER for regular users with USER_APP_RELATION
                 ELSE 'READER'
             END AS permission_role
@@ -14638,9 +15135,10 @@ class Neo4jProvider(IGraphDBProvider):
 
     def _build_scope_filters_cypher(
         self,
-        parent_id: Optional[str],
-        parent_type: Optional[str],
-        parent_connector_id: Optional[str] = None
+        parent_id: str | None,
+        parent_type: str | None,
+        parent_connector_id: str | None = None,
+        record_group_ids: list[str] | None = None,
     ) -> tuple[str, str, str, str]:
         """
         Generate Cypher scope filter conditions based on parent_id and parent_type.
@@ -14655,64 +15153,97 @@ class Neo4jProvider(IGraphDBProvider):
             parent_id: Optional parent node ID for scoped search
             parent_type: Optional type of parent: 'app', 'kb', 'recordGroup', 'folder', 'record'
             parent_connector_id: Optional connector ID of parent (needed for record/folder types)
+            record_group_ids: Optional list of allowed record group IDs.
+                When set, restricts both recordGroups AND their child records.
         """
+        # --- record_group_ids constraint (layered on top of parent scope) ---
+        # Restricts recordGroups by ID and records to those belonging to
+        # allowed recordGroups via INHERIT_PERMISSIONS chain.
+        rg_ids_filter = ""
+        rg_ids_inline = ""
+        record_ids_filter = ""
+        record_ids_inline = ""
+        if record_group_ids:
+            # Origin-aware: only restrict COLLECTION-origin recordGroups (KBs).
+            # CONNECTOR-origin recordGroups (spaces, drives) pass through —
+            # they are scoped by connector_ids instead.
+            rg_ids_filter = "AND (coalesce(rg.origin, 'CONNECTOR') <> 'COLLECTION' OR rg.id IN $record_group_ids)"
+            rg_ids_inline = "(coalesce(inherited_node.origin, 'CONNECTOR') <> 'COLLECTION' OR inherited_node.id IN $record_group_ids)"
+            # Same for records: only restrict COLLECTION-origin records.
+            record_ids_filter = """AND (coalesce(record.origin, 'CONNECTOR') <> 'COLLECTION' OR EXISTS {
+                MATCH (record)-[:INHERIT_PERMISSIONS|BELONGS_TO*]->(ancestor_rg:RecordGroup)
+                WHERE ancestor_rg.id IN $record_group_ids
+            })"""
+            record_ids_inline = """(coalesce(inherited_node.origin, 'CONNECTOR') <> 'COLLECTION' OR EXISTS {
+                MATCH (inherited_node)-[:INHERIT_PERMISSIONS|BELONGS_TO*]->(ancestor_rg:RecordGroup)
+                WHERE ancestor_rg.id IN $record_group_ids
+            }"""
+
         if not parent_id or not parent_type:
-            # Global search - no scope filters
+            # Global search
+            if record_group_ids:
+                return (
+                    rg_ids_filter,
+                    record_ids_filter,
+                    rg_ids_inline or "true",
+                    record_ids_inline or "true",
+                )
             return ("", "", "true", "true")
 
         if parent_type == "app":
-            # Filter RecordGroups by connectorId
-            scope_filter_rg = "AND rg.connectorId = $parent_id"
-            scope_filter_rg_inline = "inherited_node.connectorId = $parent_id"
-            # Records inherit scope from their RecordGroups, so filter by connectorId
-            scope_filter_record = "AND record.connectorId = $parent_id"
-            scope_filter_record_inline = "inherited_node.connectorId = $parent_id"
+            scope_filter_rg = f"AND rg.connectorId = $parent_id {rg_ids_filter}"
+            scope_filter_rg_inline = "inherited_node.connectorId = $parent_id" + (
+                f" AND {rg_ids_inline}" if rg_ids_inline else ""
+            )
+            scope_filter_record = f"AND record.connectorId = $parent_id {record_ids_filter}"
+            scope_filter_record_inline = "inherited_node.connectorId = $parent_id" + (
+                f" AND {record_ids_inline}" if record_ids_inline else ""
+            )
         elif parent_type in ("kb", "recordGroup"):
-            # Filter RecordGroups by hierarchy via BELONGS_TO or parentId
-            # For KB: use BELONGS_TO edges
-            # For connector: use parentId or BELONGS_TO
-            scope_filter_rg = """AND (
+            scope_filter_rg = f"""AND (
                 rg.parentId = $parent_id
-                OR EXISTS((rg)-[:BELONGS_TO]->(:RecordGroup {id: $parent_id}))
-            )"""
+                OR EXISTS((rg)-[:BELONGS_TO]->(:RecordGroup {{id: $parent_id}}))
+            ) {rg_ids_filter}"""
             scope_filter_rg_inline = """(
                 inherited_node.parentId = $parent_id
                 OR EXISTS((inherited_node)-[:BELONGS_TO]->(:RecordGroup {id: $parent_id}))
-            )"""
-            # Records belong to RecordGroups, so filter by parent RecordGroup hierarchy
-            scope_filter_record = """AND (
-                EXISTS((record)-[:BELONGS_TO]->(:RecordGroup {id: $parent_id}))
-                OR EXISTS((record)-[:BELONGS_TO]->(:RecordGroup)-[:BELONGS_TO*]->(:RecordGroup {id: $parent_id}))
-                OR EXISTS((record)-[:INHERIT_PERMISSIONS*]->(:RecordGroup {id: $parent_id}))
-            )"""
+            )""" + (f" AND {rg_ids_inline}" if rg_ids_inline else "")
+            scope_filter_record = f"""AND (
+                EXISTS((record)-[:BELONGS_TO]->(:RecordGroup {{id: $parent_id}}))
+                OR EXISTS((record)-[:BELONGS_TO]->(:RecordGroup)-[:BELONGS_TO*]->(:RecordGroup {{id: $parent_id}}))
+                OR EXISTS((record)-[:INHERIT_PERMISSIONS*]->(:RecordGroup {{id: $parent_id}}))
+            ) {record_ids_filter}"""
             scope_filter_record_inline = """(
                 EXISTS((inherited_node)-[:BELONGS_TO]->(:RecordGroup {id: $parent_id}))
                 OR EXISTS((inherited_node)-[:BELONGS_TO]->(:RecordGroup)-[:BELONGS_TO*]->(:RecordGroup {id: $parent_id}))
                 OR EXISTS((inherited_node)-[:INHERIT_PERMISSIONS*]->(:RecordGroup {id: $parent_id}))
-            )"""
+            )""" + (f" AND {record_ids_inline}" if record_ids_inline else "")
         elif parent_type in ("record", "folder"):
-            # Filter by same connector (parent_connector_id)
             if parent_connector_id:
-                scope_filter_rg = "AND rg.connectorId = $parent_connector_id"
-                scope_filter_rg_inline = "inherited_node.connectorId = $parent_connector_id"
-                scope_filter_record = "AND record.connectorId = $parent_connector_id"
-                scope_filter_record_inline = "inherited_node.connectorId = $parent_connector_id"
+                scope_filter_rg = f"AND rg.connectorId = $parent_connector_id {rg_ids_filter}"
+                scope_filter_rg_inline = "inherited_node.connectorId = $parent_connector_id" + (
+                    f" AND {rg_ids_inline}" if rg_ids_inline else ""
+                )
+                scope_filter_record = f"AND record.connectorId = $parent_connector_id {record_ids_filter}"
+                scope_filter_record_inline = "inherited_node.connectorId = $parent_connector_id" + (
+                    f" AND {record_ids_inline}" if record_ids_inline else ""
+                )
             else:
-                # No connector ID available - can't scope properly
-                scope_filter_rg = ""
-                scope_filter_rg_inline = "true"
-                scope_filter_record = ""
-                scope_filter_record_inline = "true"
+                scope_filter_rg = rg_ids_filter if rg_ids_filter else ""
+                scope_filter_rg_inline = rg_ids_inline if rg_ids_inline else "true"
+                scope_filter_record = record_ids_filter if record_ids_filter else ""
+                scope_filter_record_inline = record_ids_inline if record_ids_inline else "true"
         else:
-            # Unknown parent type - no scope filters
+            if record_group_ids:
+                return (rg_ids_filter, record_ids_filter, rg_ids_inline or "true", record_ids_inline or "true")
             return ("", "", "true", "true")
 
         return (scope_filter_rg, scope_filter_record, scope_filter_rg_inline, scope_filter_record_inline)
 
     def _build_children_intersection_cypher(
         self,
-        parent_id: Optional[str],
-        parent_type: Optional[str]
+        parent_id: str | None,
+        parent_type: str | None
     ) -> str:
         """
         Generate Cypher subquery for children-first traversal and intersection.
@@ -14822,10 +15353,10 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         org_id: str,
         user_key: str,
-        search: Optional[str] = None,
+        search: str | None = None,
         page: int = 1,
         limit: int = 10,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[list[dict], int]:
         """
         Get teams for an organization with pagination, search, members, and permissions.
@@ -14945,8 +15476,8 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         team_id: str,
         user_key: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get a single team with its members and permissions.
         """
@@ -15025,10 +15556,13 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_user_teams(
         self,
         user_key: str,
-        search: Optional[str] = None,
+        search: str | None = None,
         page: int = 1,
         limit: int = 100,
-        transaction: Optional[str] = None
+        created_by: str | None = None,
+        created_after: int | None = None,
+        created_before: int | None = None,
+        transaction: str | None = None
     ) -> tuple[list[dict], int]:
         """
         Get all teams that a user is a member of.
@@ -15044,10 +15578,19 @@ class Neo4jProvider(IGraphDBProvider):
             if search:
                 search_where = "AND (toLower(team.name) CONTAINS toLower($search) OR toLower(team.description) CONTAINS toLower($search))"
 
+            # Build extra filters
+            extra_where = ""
+            if created_by:
+                extra_where += " AND team.createdBy = $created_by"
+            if created_after is not None:
+                extra_where += " AND team.createdAtTimestamp >= $created_after"
+            if created_before is not None:
+                extra_where += " AND team.createdAtTimestamp <= $created_before"
+
             # Query to get all teams user is a member of with pagination
             user_teams_query = f"""
             MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(team:{team_label})
-            WHERE 1=1 {search_where}
+            WHERE 1=1 {search_where} {extra_where}
             OPTIONAL MATCH (member_user:{user_label})-[member_permission:{permission_rel}]->(team)
             WHERE member_user IS NOT NULL
             WITH team, properties(p) AS current_user_permission,
@@ -15084,14 +15627,23 @@ class Neo4jProvider(IGraphDBProvider):
             # Count query for pagination
             count_query = f"""
             MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(team:{team_label})
-            WHERE 1=1 {search_where}
+            WHERE 1=1 {search_where} {extra_where}
             RETURN count(DISTINCT team) AS total_count
             """
 
-            # Get total count
-            count_params = {"user_key": user_key}
+            # Shared filter params
+            filter_params: dict = {}
             if search:
-                count_params["search"] = search
+                filter_params["search"] = search
+            if created_by:
+                filter_params["created_by"] = created_by
+            if created_after is not None:
+                filter_params["created_after"] = created_after
+            if created_before is not None:
+                filter_params["created_before"] = created_before
+
+            # Get total count
+            count_params = {"user_key": user_key, **filter_params}
 
             count_results = await self.client.execute_query(
                 count_query,
@@ -15104,10 +15656,9 @@ class Neo4jProvider(IGraphDBProvider):
             teams_params = {
                 "user_key": user_key,
                 "offset": offset,
-                "limit": limit
+                "limit": limit,
+                **filter_params,
             }
-            if search:
-                teams_params["search"] = search
 
             result_list = await self.client.execute_query(
                 user_teams_query,
@@ -15143,10 +15694,10 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         org_id: str,
         user_key: str,
-        search: Optional[str] = None,
+        search: str | None = None,
         page: int = 1,
         limit: int = 100,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[list[dict], int]:
         """
         Get all teams created by a user.
@@ -15272,21 +15823,29 @@ class Neo4jProvider(IGraphDBProvider):
         team_id: str,
         org_id: str,
         user_key: str,
-        transaction: Optional[str] = None
-    ) -> Optional[dict]:
+        search: str | None = None,
+        page: int = 1,
+        limit: int = 100,
+        transaction: str | None = None
+    ) -> dict | None:
         """
         Get all users in a specific team.
         """
         try:
+            offset = (page - 1) * limit
             team_label = collection_to_label(CollectionNames.TEAMS.value)
             user_label = collection_to_label(CollectionNames.USERS.value)
             permission_rel = edge_collection_to_relationship(CollectionNames.PERMISSION.value)
+
+            search_where = ""
+            if search:
+                search_where = "AND (toLower(member_user.fullName) CONTAINS toLower($search) OR toLower(member_user.email) CONTAINS toLower($search))"
 
             team_users_query = f"""
             MATCH (team:{team_label} {{id: $teamId, orgId: $orgId}})
             OPTIONAL MATCH (current_user:{user_label} {{id: $user_key}})-[current_permission:{permission_rel}]->(team)
             OPTIONAL MATCH (member_user:{user_label})-[member_permission:{permission_rel}]->(team)
-            WHERE member_user IS NOT NULL
+            WHERE member_user IS NOT NULL {search_where}
             WITH team,
                  collect(DISTINCT properties(current_permission))[0] AS current_user_permission,
                  collect(DISTINCT {{
@@ -15297,7 +15856,7 @@ class Neo4jProvider(IGraphDBProvider):
                      role: member_permission.role,
                      joinedAt: member_permission.createdAtTimestamp,
                      isOwner: member_permission.role = 'OWNER'
-                 }}) AS team_members
+                 }}) AS all_members
             RETURN {{
                 id: team.id,
                 name: team.name,
@@ -15307,21 +15866,27 @@ class Neo4jProvider(IGraphDBProvider):
                 createdAtTimestamp: team.createdAtTimestamp,
                 updatedAtTimestamp: team.updatedAtTimestamp,
                 currentUserPermission: CASE WHEN current_user_permission IS NOT NULL THEN current_user_permission ELSE null END,
-                members: team_members,
-                memberCount: size(team_members),
+                members: all_members[$offset..($offset + $limit)],
+                memberCount: size(all_members),
                 canEdit: CASE WHEN current_user_permission IS NOT NULL AND current_user_permission.role IN ['OWNER'] THEN true ELSE false END,
                 canDelete: CASE WHEN current_user_permission IS NOT NULL AND current_user_permission.role = 'OWNER' THEN true ELSE false END,
                 canManageMembers: CASE WHEN current_user_permission IS NOT NULL AND current_user_permission.role IN ['OWNER'] THEN true ELSE false END
             }} AS result
             """
 
+            params: dict = {
+                "teamId": team_id,
+                "orgId": org_id,
+                "user_key": user_key,
+                "offset": offset,
+                "limit": limit,
+            }
+            if search:
+                params["search"] = search
+
             results = await self.client.execute_query(
                 team_users_query,
-                parameters={
-                    "teamId": team_id,
-                    "orgId": org_id,
-                    "user_key": user_key
-                },
+                parameters=params,
                 txn_id=transaction
             )
 
@@ -15357,7 +15922,7 @@ class Neo4jProvider(IGraphDBProvider):
         query: str,
         limit: int = 10,
         offset: int = 0,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Search teams by name or description.
@@ -15449,7 +16014,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         team_id: str,
         user_ids: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Delete edges to remove team members.
@@ -15500,7 +16065,7 @@ class Neo4jProvider(IGraphDBProvider):
         team_id: str,
         user_roles: list[dict[str, str]],
         timestamp: int,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> list[dict]:
         """
         Batch update user roles in a team.
@@ -15549,7 +16114,7 @@ class Neo4jProvider(IGraphDBProvider):
     async def delete_all_team_permissions(
         self,
         team_id: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> None:
         """
         Delete all permissions for a team.
@@ -15577,7 +16142,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         team_id: str,
         user_ids: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict[str, Any]:
         """
         Get information about owners being removed and total owner count for a team.
@@ -15630,7 +16195,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         team_id: str,
         user_ids: list[str],
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> dict[str, Any]:
         """
         Get team info, current permissions for specific users, and total owner count.
@@ -15699,10 +16264,10 @@ class Neo4jProvider(IGraphDBProvider):
     async def get_organization_users(
         self,
         org_id: str,
-        search: Optional[str] = None,
+        search: str | None = None,
         page: int = 1,
         limit: int = 100,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> tuple[list[dict], int]:
         """
         Get users in an organization with pagination and search.
@@ -15787,7 +16352,7 @@ class Neo4jProvider(IGraphDBProvider):
         self,
         node_key: str,
         collection: str,
-        transaction: Optional[str] = None
+        transaction: str | None = None
     ) -> int:
         """
         Delete all edges connected to a node (both incoming and outgoing).
@@ -15844,7 +16409,7 @@ class Neo4jProvider(IGraphDBProvider):
             raise
 
 
-    async def check_toolset_instance_in_use(self, instance_id: str, transaction: Optional[str] = None) -> list[str]:
+    async def check_toolset_instance_in_use(self, instance_id: str, transaction: str | None = None) -> list[str]:
         """
         Check if a toolset instance is currently in use by any active agents.
 
@@ -15886,19 +16451,21 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"Failed to check toolset instance usage: {str(e)}")
             raise
 
-    async def get_agent(self, agent_id: str, user_id: str, org_id: str, transaction: Optional[str] = None) -> Optional[dict]:
+    async def get_agent(self, agent_id: str, org_id: str | None = None, transaction: str | None = None) -> dict | None:
         """
-        Get an agent by ID with user permissions and linked graph data.
+        Fetch the complete agent document with linked graph data.
+
+        This method does NOT perform any permission check — callers must invoke
+        ``check_agent_permission`` separately before calling this method.
 
         Includes:
-        - Agent document with permissions
+        - Agent document
         - Linked toolsets with their tools (via agentHasToolset -> toolsetHasTool)
         - Linked knowledge with filters (via agentHasKnowledge)
+        - shareWithOrg flag (requires org_id to evaluate the ORG permission edge)
         """
         try:
             agent_label = collection_to_label(CollectionNames.AGENT_INSTANCES.value)
-            user_label = collection_to_label(CollectionNames.USERS.value)
-            team_label = collection_to_label(CollectionNames.TEAMS.value)
             org_label = collection_to_label(CollectionNames.ORGS.value)
             permission_rel = edge_collection_to_relationship(CollectionNames.PERMISSION.value)
             agent_has_toolset_rel = edge_collection_to_relationship(CollectionNames.AGENT_HAS_TOOLSET.value)
@@ -15908,125 +16475,25 @@ class Neo4jProvider(IGraphDBProvider):
             tool_label = collection_to_label(CollectionNames.AGENT_TOOLS.value)
             knowledge_label = collection_to_label(CollectionNames.AGENT_KNOWLEDGE.value)
 
-            # user_id is the user's _key (internal ID), not userId (external ID)
-            # This matches ArangoHTTPProvider behavior where user_id is used directly as user_key
-            user_key = user_id
-            org_key = org_id
-
-            # Get user document by id (which is the _key) to extract userId for team queries
-            user_query = f"""
-            MATCH (u:{user_label} {{id: $user_key}})
-            RETURN u
+            # Fetch agent document (no permission filtering)
+            agent_query = f"""
+            MATCH (agent:{agent_label} {{id: $agent_id}})
+            WHERE (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            RETURN agent
             LIMIT 1
             """
-            user_result = await self.client.execute_query(
-                user_query,
-                parameters={"user_key": user_key},
+            agent_result = await self.client.execute_query(
+                agent_query,
+                parameters={"agent_id": agent_id},
                 txn_id=transaction
             )
 
-            # Get user's teams - need userId (external ID) for team lookup
-            user_team_ids = []
-            if user_result:
-                try:
-                    user_dict = dict(user_result[0]["u"])
-                    user_doc = self._neo4j_to_arango_node(user_dict, CollectionNames.USERS.value)
-                    actual_user_id = user_doc.get("userId")
-
-                    if actual_user_id:
-                        # Get user's teams using userId (external ID)
-                        user_teams_query = f"""
-                        MATCH (u:{user_label} {{userId: $user_id}})-[p:{permission_rel}]->(t:{team_label})
-                        WHERE p.type = 'USER'
-                        RETURN t.id AS team_id
-                        """
-                        user_teams_result = await self.client.execute_query(
-                            user_teams_query,
-                            parameters={"user_id": actual_user_id},
-                            txn_id=transaction
-                        )
-                        user_team_ids = [r["team_id"] for r in user_teams_result] if user_teams_result else []
-                except Exception as e:
-                    self.logger.warning(f"Error getting user teams: {str(e)}")
-                    # Continue without teams - individual permission check will still work
-
-            # Check individual user permissions on the agent
-            individual_query = f"""
-            MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
-            WHERE p.type = 'USER'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-            RETURN agent, p.role AS role, 'INDIVIDUAL' AS access_type
-            LIMIT 1
-            """
-
-            individual_result = await self.client.execute_query(
-                individual_query,
-                parameters={"user_key": user_key, "agent_id": agent_id},
-                txn_id=transaction
-            )
-
-            agent_data = None
-            user_role = None
-            access_type = None
-
-            if individual_result:
-                agent_data = dict(individual_result[0]["agent"])
-                user_role = individual_result[0]["role"]
-                access_type = "INDIVIDUAL"
-            elif user_team_ids:
-                # Check team permissions
-                team_query = f"""
-                MATCH (t:{team_label})-[p:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
-                WHERE t.id IN $team_ids
-                AND p.type = 'TEAM'
-                AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-                RETURN agent, p.role AS role, 'TEAM' AS access_type
-                LIMIT 1
-                """
-
-                team_result = await self.client.execute_query(
-                    team_query,
-                    parameters={"team_ids": user_team_ids, "agent_id": agent_id},
-                    txn_id=transaction
-                )
-
-                if team_result:
-                    agent_data = dict(team_result[0]["agent"])
-                    user_role = team_result[0]["role"]
-                    access_type = "TEAM"
-            elif org_key:
-                # Check org permissions (only if no individual or team access)
-                org_query = f"""
-                MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
-                WHERE p.type = 'ORG'
-                AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
-                RETURN agent, p.role AS role, 'ORG' AS access_type
-                LIMIT 1
-                """
-
-                org_result = await self.client.execute_query(
-                    org_query,
-                    parameters={"org_key": org_key, "agent_id": agent_id},
-                    txn_id=transaction
-                )
-
-                if org_result:
-                    agent_data = dict(org_result[0]["agent"])
-                    user_role = org_result[0]["role"]
-                    access_type = "ORG"
-
-            if not agent_data:
-                self.logger.warning(f"No permissions found for user {user_key} on agent {agent_id}")
+            if not agent_result:
+                self.logger.warning(f"Agent {agent_id} not found or deleted")
                 return None
 
-            # Convert to ArangoDB format
+            agent_data = dict(agent_result[0]["agent"])
             agent = self._neo4j_to_arango_node(agent_data, CollectionNames.AGENT_INSTANCES.value)
-            agent["access_type"] = access_type
-            agent["user_role"] = user_role
-            agent["can_edit"] = user_role in ["OWNER", "WRITER", "ORGANIZER"]
-            agent["can_delete"] = user_role == "OWNER"
-            agent["can_share"] = user_role in ["OWNER", "ORGANIZER"]
-            agent["can_view"] = True
 
             # Get linked toolsets with their tools
             toolsets_query = f"""
@@ -16049,17 +16516,16 @@ class Neo4jProvider(IGraphDBProvider):
                 displayName: ts.displayName,
                 type: ts.type,
                 instanceId: ts.instanceId,
+                instanceName: ts.instanceName,
                 selectedTools: ts.selectedTools,
                 tools: tools
             }} AS toolset
             """
-
             toolsets_result = await self.client.execute_query(
                 toolsets_query,
                 parameters={"agent_id": agent_id},
                 txn_id=transaction
             )
-
             agent["toolsets"] = [r["toolset"] for r in toolsets_result] if toolsets_result else []
 
             # Get linked knowledge with filters
@@ -16067,7 +16533,6 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (agent:{agent_label} {{id: $agent_id}})-[r:{agent_has_knowledge_rel}]->(k:{knowledge_label})
             RETURN k.id AS _key, k.connectorId AS connectorId, k.filters AS filters
             """
-
             knowledge_result = await self.client.execute_query(
                 knowledge_query,
                 parameters={"agent_id": agent_id},
@@ -16084,7 +16549,6 @@ class Neo4jProvider(IGraphDBProvider):
                         "filters": k_row["filters"]
                     }
 
-                    # Parse filters to determine if this is a KB or app
                     filters_str = knowledge_item.get("filters", "{}")
                     if isinstance(filters_str, str):
                         try:
@@ -16095,13 +16559,10 @@ class Neo4jProvider(IGraphDBProvider):
                         filters_parsed = filters_str
 
                     knowledge_item["filtersParsed"] = filters_parsed
-
-                    # Check if this is a KB (has recordGroups) or app
                     record_groups = filters_parsed.get("recordGroups", [])
                     is_kb = len(record_groups) > 0
 
                     if is_kb and record_groups:
-                        # For KBs: Get KB name from record group document
                         try:
                             first_kb_id = record_groups[0]
                             kb_doc = await self.get_document(first_kb_id, CollectionNames.RECORD_GROUPS.value, transaction=transaction)
@@ -16120,7 +16581,6 @@ class Neo4jProvider(IGraphDBProvider):
                             knowledge_item["type"] = "UNKNOWN"
                             knowledge_item["displayName"] = knowledge_item["connectorId"]
                     else:
-                        # For apps: Get connector instance name from APPS collection
                         try:
                             app_doc = await self.get_document(knowledge_item["connectorId"], CollectionNames.APPS.value, transaction=transaction)
                             if app_doc:
@@ -16141,21 +16601,32 @@ class Neo4jProvider(IGraphDBProvider):
 
             agent["knowledge"] = knowledge_list
 
-            # Check if the agent is shared with the org (edge-based, not stored in doc)
-            agent["shareWithOrg"] = False
-            if org_key:
+            # shareWithOrg: when org_id is provided match the specific org node;
+            # when org_id is absent check whether any Orgs label node has a
+            # permission edge to this agent (node label check, not type field)
+            if org_id:
                 org_share_query = f"""
-                MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
-                WHERE p.type = 'ORG'
+                MATCH (o:{org_label} {{id: $org_id}})-[:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
                 RETURN true AS share_with_org
                 LIMIT 1
                 """
                 org_share_result = await self.client.execute_query(
                     org_share_query,
-                    parameters={"org_key": org_key, "agent_id": agent_id},
+                    parameters={"org_id": org_id, "agent_id": agent_id},
                     txn_id=transaction
                 )
-                agent["shareWithOrg"] = bool(org_share_result)
+            else:
+                org_share_query = f"""
+                MATCH (o:{org_label})-[:{permission_rel}]->(agent:{agent_label} {{id: $agent_id}})
+                RETURN true AS share_with_org
+                LIMIT 1
+                """
+                org_share_result = await self.client.execute_query(
+                    org_share_query,
+                    parameters={"agent_id": agent_id},
+                    txn_id=transaction
+                )
+            agent["shareWithOrg"] = bool(org_share_result)
 
             return agent
 
@@ -16163,8 +16634,16 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"Failed to get agent: {str(e)}")
             return None
 
-    async def get_all_agents(self, user_id: str, org_id: str, transaction: Optional[str] = None) -> list[dict]:
-        """Get all agents accessible to a user via individual, team, or org access - flattened response with deduplication"""
+    async def check_agent_permission(
+        self, agent_id: str, user_id: str, org_id: str
+    ) -> dict | None:
+        """
+        Lightweight permission check that returns the caller's access rights on
+        an agent without fetching toolsets or knowledge.
+
+        Returns None if the agent does not exist, is deleted, or the user has
+        no access via individual, org, or team permission edges.
+        """
         try:
             agent_label = collection_to_label(CollectionNames.AGENT_INSTANCES.value)
             user_label = collection_to_label(CollectionNames.USERS.value)
@@ -16175,27 +16654,244 @@ class Neo4jProvider(IGraphDBProvider):
             user_key = user_id
             org_key = org_id
 
-            # Get user's teams first (needed for team permission check)
+            # Resolve user and their team memberships
+            user_team_ids: list[str] = []
+            user_query = f"""
+            MATCH (u:{user_label} {{id: $user_key}})
+            RETURN u LIMIT 1
+            """
+            user_result = await self.client.execute_query(
+                user_query, parameters={"user_key": user_key}
+            )
+            if user_result:
+                try:
+                    user_dict = dict(user_result[0]["u"])
+                    user_doc = self._neo4j_to_arango_node(user_dict, CollectionNames.USERS.value)
+                    actual_user_id = user_doc.get("userId")
+                    if actual_user_id:
+                        teams_query = f"""
+                        MATCH (u:{user_label} {{userId: $user_id}})-[p:{permission_rel}]->(t:{team_label})
+                        WHERE p.type = 'USER'
+                        RETURN t.id AS team_id
+                        """
+                        teams_result = await self.client.execute_query(
+                            teams_query, parameters={"user_id": actual_user_id}
+                        )
+                        user_team_ids = [r["team_id"] for r in teams_result] if teams_result else []
+                except Exception as e:
+                    self.logger.warning(f"Error getting user teams for permission check: {str(e)}")
+
+            # 1. Individual access
+            individual_query = f"""
+            MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(a:{agent_label} {{id: $agent_id}})
+            WHERE p.type = 'USER'
+            AND (a.isDeleted IS NULL OR a.isDeleted = false)
+            RETURN p.role AS role, 'INDIVIDUAL' AS access_type
+            LIMIT 1
+            """
+            ind_result = await self.client.execute_query(
+                individual_query, parameters={"user_key": user_key, "agent_id": agent_id}
+            )
+            if ind_result:
+                role = ind_result[0]["role"]
+                return {
+                    "access_type": "INDIVIDUAL",
+                    "user_role": role,
+                    "can_edit": role in ("OWNER", "WRITER", "ORGANIZER"),
+                    "can_delete": role == "OWNER",
+                    "can_share": role in ("OWNER", "ORGANIZER"),
+                    "can_view": True,
+                }
+
+            # 2. Org access
+            org_query = f"""
+            MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(a:{agent_label} {{id: $agent_id}})
+            WHERE p.type = 'ORG'
+            AND (a.isDeleted IS NULL OR a.isDeleted = false)
+            RETURN p.role AS role, 'ORG' AS access_type
+            LIMIT 1
+            """
+            org_result = await self.client.execute_query(
+                org_query, parameters={"org_key": org_key, "agent_id": agent_id}
+            )
+            if org_result:
+                role = org_result[0]["role"]
+                return {
+                    "access_type": "ORG",
+                    "user_role": role,
+                    "can_edit": role in ("OWNER", "WRITER", "ORGANIZER"),
+                    "can_delete": role == "OWNER",
+                    "can_share": role in ("OWNER", "ORGANIZER"),
+                    "can_view": True,
+                }
+
+            # 3. Team access
+            if user_team_ids:
+                team_query = f"""
+                MATCH (t:{team_label})-[p:{permission_rel}]->(a:{agent_label} {{id: $agent_id}})
+                WHERE t.id IN $team_ids
+                AND p.type = 'TEAM'
+                AND (a.isDeleted IS NULL OR a.isDeleted = false)
+                RETURN p.role AS role, 'TEAM' AS access_type
+                LIMIT 1
+                """
+                team_result = await self.client.execute_query(
+                    team_query, parameters={"agent_id": agent_id, "team_ids": user_team_ids}
+                )
+                if team_result:
+                    role = team_result[0]["role"]
+                    return {
+                        "access_type": "TEAM",
+                        "user_role": role,
+                        "can_edit": role in ("OWNER", "WRITER", "ORGANIZER"),
+                        "can_delete": role == "OWNER",
+                        "can_share": role in ("OWNER", "ORGANIZER"),
+                        "can_view": True,
+                    }
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Failed to check agent permission: {str(e)}")
+            return None
+
+    async def get_agents_by_web_search_provider(
+        self, org_id: str, provider: str
+    ) -> list[dict]:
+        try:
+            agent_label = collection_to_label(CollectionNames.AGENT_INSTANCES.value)
+            user_label = collection_to_label(CollectionNames.USERS.value)
+            org_label = collection_to_label(CollectionNames.ORGS.value)
+            permission_rel = edge_collection_to_relationship(CollectionNames.PERMISSION.value)
+            belongs_to_rel = edge_collection_to_relationship(CollectionNames.BELONGS_TO.value)
+
+            query = f"""
+            // Agents owned by users in this org (covers private + shared)
+            MATCH (u:{user_label})-[bt:{belongs_to_rel}]->(o:{org_label} {{id: $org_id}})
+            MATCH (u)-[p:{permission_rel}]->(agent:{agent_label})
+            WHERE p.type = 'USER' AND p.role = 'OWNER'
+            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            AND agent.webSearch = $provider
+            OPTIONAL MATCH (creator:{user_label} {{id: agent.createdBy}})
+            RETURN DISTINCT agent.name AS name,
+                   agent.id AS _key,
+                   COALESCE(creator.fullName, creator.name) AS creatorName
+
+            UNION
+
+            // Agents shared directly with this org
+            MATCH (o:{org_label} {{id: $org_id}})-[p:{permission_rel}]->(agent:{agent_label})
+            WHERE p.type = 'ORG'
+            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            AND agent.webSearch = $provider
+            OPTIONAL MATCH (creator:{user_label} {{id: agent.createdBy}})
+            RETURN DISTINCT agent.name AS name,
+                   agent.id AS _key,
+                   COALESCE(creator.fullName, creator.name) AS creatorName
+            """
+            result = await self.client.execute_query(
+                query, parameters={"org_id": org_id, "provider": provider}
+            )
+            if not result:
+                return []
+            seen = set()
+            deduped = []
+            for row in result:
+                key = row.get("_key")
+                if key and key not in seen:
+                    seen.add(key)
+                    deduped.append(row)
+            return deduped
+        except Exception as e:
+            self.logger.error(f"Failed to get agents by web search provider: {str(e)}")
+            return []
+
+    async def get_all_agents(
+        self,
+        user_id: str,
+        org_id: str,
+        page: int | None = None,
+        limit: int | None = None,
+        search: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+        is_deleted: bool = False,
+        transaction: str | None = None,
+    ) -> list[dict] | dict[str, Any]:
+        """Get all agents accessible to a user via individual, team, or org access.
+
+        Pipeline:
+          1. Cypher UNION ALL — returns only permission-visible agents, with an
+             optional search clause pushed into *every* branch so only matching
+             rows are transferred from Neo4j to Python.
+          2. Python deduplication — keeps the best permission per agent
+             (INDIVIDUAL > TEAM > ORG).
+          3. Python org-sharing check (second DB query on the already-small
+             deduplicated list).
+          4. Python sort.
+          5. Python pagination — total_items is counted AFTER search so that
+             'page 2 of search results' always works correctly.
+
+        Returns:
+          - list[dict]            when page / limit are both None (backward-compat)
+          - dict[str, Any]        { "agents": [...], "totalItems": int }
+        """
+        try:
+            agent_label = collection_to_label(CollectionNames.AGENT_INSTANCES.value)
+            user_label = collection_to_label(CollectionNames.USERS.value)
+            team_label = collection_to_label(CollectionNames.TEAMS.value)
+            org_label = collection_to_label(CollectionNames.ORGS.value)
+            permission_rel = edge_collection_to_relationship(CollectionNames.PERMISSION.value)
+
+            user_key = user_id
+            org_key = org_id
+
+            # Normalise search term once
+            q: str | None = search.strip().lower() if search and search.strip() else None
+
+            # ── Step 1a: resolve user's team memberships ──────────────────────
             user_teams_query = f"""
             MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(t:{team_label})
             WHERE p.type = 'USER'
             RETURN collect(t.id) AS team_ids
             """
-
             user_teams_result = await self.client.execute_query(
                 user_teams_query,
                 parameters={"user_key": user_key},
-                txn_id=transaction
+                txn_id=transaction,
             )
-            user_team_ids = user_teams_result[0]["team_ids"] if user_teams_result and user_teams_result[0].get("team_ids") else []
+            user_team_ids = (
+                user_teams_result[0]["team_ids"]
+                if user_teams_result and user_teams_result[0].get("team_ids")
+                else []
+            )
 
-            # Optimized query using UNION to combine all permission types in a single query
-            # Priority: INDIVIDUAL > TEAM > ORG (handled by ORDER BY and deduplication)
+            # ── Step 1b: build optional search filter clause ──────────────────
+            # Pushing search into Cypher avoids transferring every agent document
+            # over the network just to discard it in Python.  The clause is
+            # identical for all three UNION branches.
+            if q:
+                search_clause = """
+            AND (
+                (agent.name IS NOT NULL AND toLower(agent.name) CONTAINS $q)
+                OR (agent.description IS NOT NULL AND toLower(agent.description) CONTAINS $q)
+                OR (agent.tags IS NOT NULL AND ANY(tag IN agent.tags
+                    WHERE tag IS NOT NULL AND toLower(toString(tag)) CONTAINS $q))
+            )"""
+            else:
+                search_clause = ""
+
+            if is_deleted:
+                deleted_clause = "AND agent.isDeleted = true"
+            else:
+                deleted_clause = "AND (agent.isDeleted IS NULL OR agent.isDeleted = false)"
+
+            # ── Step 1c: fetch visible (and optionally search-filtered) agents ─
             combined_query = f"""
             // Individual user permissions
             MATCH (u:{user_label} {{id: $user_key}})-[p:{permission_rel}]->(agent:{agent_label})
             WHERE p.type = 'USER'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            {deleted_clause}{search_clause}
             RETURN agent, p.role AS role, 'INDIVIDUAL' AS access_type, 1 AS priority
 
             UNION ALL
@@ -16204,7 +16900,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (t:{team_label})-[p:{permission_rel}]->(agent:{agent_label})
             WHERE t.id IN $team_ids
             AND p.type = 'TEAM'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            {deleted_clause}{search_clause}
             RETURN agent, p.role AS role, 'TEAM' AS access_type, 2 AS priority
 
             UNION ALL
@@ -16212,24 +16908,38 @@ class Neo4jProvider(IGraphDBProvider):
             // Org permissions
             MATCH (o:{org_label} {{id: $org_key}})-[p:{permission_rel}]->(agent:{agent_label})
             WHERE p.type = 'ORG'
-            AND (agent.isDeleted IS NULL OR agent.isDeleted = false)
+            {deleted_clause}{search_clause}
             RETURN agent, p.role AS role, 'ORG' AS access_type, 3 AS priority
             """
 
+            params: dict = {
+                "user_key": user_key,
+                "org_key": org_key,
+                "team_ids": user_team_ids,
+            }
+            if q:
+                params["q"] = q
+
             result = await self.client.execute_query(
                 combined_query,
-                parameters={"user_key": user_key, "org_key": org_key, "team_ids": user_team_ids},
-                txn_id=transaction
+                parameters=params,
+                txn_id=transaction,
             )
 
-            # Deduplicate by agent ID, keeping highest priority (lowest priority number)
-            agents_dict = {}
+            # ── Step 2: deduplicate (UNION ALL may return the same agent from
+            #            multiple permission sources; keep the highest-priority one)
+            agents_dict: dict = {}
             if result:
                 for row in result:
                     agent_data = dict(row["agent"])
                     agent_id = agent_data.get("id", "")
-                    if agent_id and (agent_id not in agents_dict or agents_dict[agent_id]["priority"] > row["priority"]):
-                        agent = self._neo4j_to_arango_node(agent_data, CollectionNames.AGENT_INSTANCES.value)
+                    if agent_id and (
+                        agent_id not in agents_dict
+                        or agents_dict[agent_id]["priority"] > row["priority"]
+                    ):
+                        agent = self._neo4j_to_arango_node(
+                            agent_data, CollectionNames.AGENT_INSTANCES.value
+                        )
                         agent["access_type"] = row["access_type"]
                         agent["user_role"] = row["role"]
                         agent["can_edit"] = row["role"] in ["OWNER", "WRITER", "ORGANIZER"]
@@ -16238,10 +16948,10 @@ class Neo4jProvider(IGraphDBProvider):
                         agent["can_view"] = True
                         agents_dict[agent_id] = {"agent": agent, "priority": row["priority"]}
 
-            # Convert dictionary to list (deduplicated)
             agents = [agents_dict[key]["agent"] for key in agents_dict]
 
-            # Bulk-check which agents are shared with the org (edge-based, not stored in doc)
+            # ── Step 3: bulk-check org sharing (edge-based, not stored on the doc)
+            #           Run only on the deduplicated (and already-filtered) list.
             if agents and org_key:
                 agent_ids = list(agents_dict.keys())
                 org_share_query = f"""
@@ -16253,23 +16963,64 @@ class Neo4jProvider(IGraphDBProvider):
                 org_share_result = await self.client.execute_query(
                     org_share_query,
                     parameters={"org_key": org_key, "agent_ids": agent_ids},
-                    txn_id=transaction
+                    txn_id=transaction,
                 )
-                org_shared_ids = set(org_share_result[0]["org_shared_ids"]) if org_share_result and org_share_result[0].get("org_shared_ids") else set()
+                org_shared_ids = (
+                    set(org_share_result[0]["org_shared_ids"])
+                    if org_share_result and org_share_result[0].get("org_shared_ids")
+                    else set()
+                )
                 for agent in agents:
                     agent["shareWithOrg"] = agent.get("_key", "") in org_shared_ids
             else:
                 for agent in agents:
                     agent["shareWithOrg"] = False
 
-            return agents
+            # ── Step 4: sort ──────────────────────────────────────────────────
+            # Sort is done in Python post-deduplication.  For large result sets
+            # with search, this is fast because Cypher already filtered rows down.
+            sort_field = sort_by or "updatedAtTimestamp"
+            is_asc = (sort_order or "desc").lower() == "asc"
+
+            def sort_key(doc: dict) -> Any:
+                primary = doc.get(sort_field)
+                # Fall back to updatedAt, then createdAt for stable ordering
+                if primary is None and sort_field != "updatedAtTimestamp":
+                    primary = doc.get("updatedAtTimestamp")
+                if primary is None:
+                    primary = doc.get("createdAtTimestamp")
+                return (primary,)
+
+            try:
+                agents.sort(key=sort_key, reverse=not is_asc)
+            except Exception:
+                # Best-effort sort; ignore when field types are incomparable
+                pass
+
+            # ── Step 5: paginate ──────────────────────────────────────────────
+            # Pagination is applied AFTER deduplication and (Cypher-side) search,
+            # so `total_items` correctly reflects the count of matching agents
+            # across ALL pages, not just the current page.
+            has_paging = page is not None and limit is not None
+            if not has_paging:
+                return agents
+
+            total_items = len(agents)          # count after search + dedup
+            start_index = max((page - 1) * limit, 0)
+            end_index = start_index + limit
+            paged = agents[start_index:end_index]
+
+            return {
+                "agents": paged,
+                "totalItems": total_items,    # used by the route to build the pagination envelope
+            }
 
         except Exception as e:
             self.logger.error(f"Failed to get all agents: {str(e)}")
             return []
 
 
-    async def update_agent(self, agent_id: str, agent_updates: dict[str, Any], user_id: str, org_id: str, transaction: Optional[str] = None) -> Optional[bool]:
+    async def update_agent(self, agent_id: str, agent_updates: dict[str, Any], user_id: str, org_id: str, transaction: str | None = None) -> bool | None:
         """
         Update an agent.
 
@@ -16277,14 +17028,14 @@ class Neo4jProvider(IGraphDBProvider):
         Tools, connectors, kb, vectorDBs are handled via edges, not in agent document.
         """
         try:
-            # Check if user has permission to update the agent using the new method
-            agent_with_permission = await self.get_agent(agent_id, user_id, org_id, transaction=transaction)
-            if agent_with_permission is None:
+            # get_agent(agent_id, org_id, transaction) — do not pass user_id positionally (that was
+            # misread as org_id and broke transaction=). Use check_agent_permission for ACL.
+            perm = await self.check_agent_permission(agent_id, user_id, org_id)
+            if not perm:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
 
-            # Check if user can edit the agent
-            if not agent_with_permission.get("can_edit", False):
+            if not perm.get("can_edit", False):
                 self.logger.warning(f"User {user_id} does not have edit permission on agent {agent_id}")
                 return False
 
@@ -16295,7 +17046,7 @@ class Neo4jProvider(IGraphDBProvider):
             }
 
             # Add only schema-allowed fields
-            allowed_fields = ["name", "description", "startMessage", "systemPrompt", "tags", "isActive", "instructions"]
+            allowed_fields = ["name", "description", "startMessage", "systemPrompt", "tags", "isActive", "instructions", "isServiceAccount", "webSearch"]
             for field in allowed_fields:
                 if field in agent_updates:
                     update_data[field] = agent_updates[field]
@@ -16352,7 +17103,7 @@ class Neo4jProvider(IGraphDBProvider):
             return False
 
 
-    async def delete_agent(self, agent_id: str, user_id: str, org_id: str, transaction: Optional[str] = None) -> Optional[bool]:
+    async def delete_agent(self, agent_id: str, user_id: str, org_id: str, transaction: str | None = None) -> bool | None:
         """Delete an agent (soft delete)"""
         try:
             # Check if agent exists
@@ -16361,14 +17112,12 @@ class Neo4jProvider(IGraphDBProvider):
                 self.logger.warning(f"Agent {agent_id} not found")
                 return False
 
-            # Check if user has permission to delete the agent using the new method
-            agent_with_permission = await self.get_agent(agent_id, user_id, org_id, transaction=transaction)
-            if agent_with_permission is None:
+            perm = await self.check_agent_permission(agent_id, user_id, org_id)
+            if not perm:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
 
-            # Check if user can delete the agent
-            if not agent_with_permission.get("can_delete", False):
+            if not perm.get("can_delete", False):
                 self.logger.warning(f"User {user_id} does not have delete permission on agent {agent_id}")
                 return False
 
@@ -16393,7 +17142,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"Failed to delete agent: {str(e)}")
             return False
 
-    async def hard_delete_agent(self, agent_id: str, transaction: Optional[str] = None) -> dict[str, int]:
+    async def hard_delete_agent(self, agent_id: str, transaction: str | None = None) -> dict[str, int]:
         """
         Hard delete a single agent and all its related edges/nodes.
 
@@ -16597,7 +17346,7 @@ class Neo4jProvider(IGraphDBProvider):
                 "edges_deleted": 0,
             }
 
-    async def hard_delete_all_agents(self, transaction: Optional[str] = None) -> dict[str, int]:
+    async def hard_delete_all_agents(self, transaction: str | None = None) -> dict[str, int]:
         """
         Hard delete ALL agents (including soft-deleted ones) and all their related edges/nodes.
 
@@ -16807,17 +17556,15 @@ class Neo4jProvider(IGraphDBProvider):
                 "edges_deleted": 0,
             }
 
-    async def share_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: Optional[list[str]], team_ids: Optional[list[str]], transaction: Optional[str] = None) -> Optional[bool]:
+    async def share_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: list[str] | None, team_ids: list[str] | None, transaction: str | None = None) -> bool | None:
         """Share an agent to users and teams"""
         try:
-            # Check if agent exists and user has permission to share it
-            agent_with_permission = await self.get_agent(agent_id, user_id, org_id, transaction=transaction)
-            if agent_with_permission is None:
+            perm = await self.check_agent_permission(agent_id, user_id, org_id)
+            if not perm:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return False
 
-            # Check if user can share the agent
-            if not agent_with_permission.get("can_share", False):
+            if not perm.get("can_share", False):
                 self.logger.warning(f"User {user_id} does not have share permission on agent {agent_id}")
                 return False
 
@@ -16873,12 +17620,11 @@ class Neo4jProvider(IGraphDBProvider):
             return False
 
 
-    async def unshare_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: Optional[list[str]], team_ids: Optional[list[str]], transaction: Optional[str] = None) -> Optional[dict]:
+    async def unshare_agent(self, agent_id: str, user_id: str, org_id: str, user_ids: list[str] | None, team_ids: list[str] | None, transaction: str | None = None) -> dict | None:
         """Unshare an agent from users and teams - direct deletion without validation"""
         try:
-            # Check if user has permission to unshare the agent
-            agent_with_permission = await self.get_agent(agent_id, user_id, org_id, transaction=transaction)
-            if agent_with_permission is None or not agent_with_permission.get("can_share", False):
+            perm = await self.check_agent_permission(agent_id, user_id, org_id)
+            if not perm or not perm.get("can_share", False):
                 return {"success": False, "reason": "Insufficient permissions to unshare agent"}
 
             permission_rel = edge_collection_to_relationship(CollectionNames.PERMISSION.value)
@@ -16945,17 +17691,15 @@ class Neo4jProvider(IGraphDBProvider):
             return {"success": False, "reason": f"Internal error: {str(e)}"}
 
 
-    async def update_agent_permission(self, agent_id: str, owner_user_id: str, org_id: str, user_ids: Optional[list[str]], team_ids: Optional[list[str]], role: str, transaction: Optional[str] = None) -> Optional[dict]:
+    async def update_agent_permission(self, agent_id: str, owner_user_id: str, org_id: str, user_ids: list[str] | None, team_ids: list[str] | None, role: str, transaction: str | None = None) -> dict | None:
         """Update permission role for users and teams on an agent (only OWNER can do this)"""
         try:
-            # Check if the requesting user is the OWNER of the agent
-            agent_with_permission = await self.get_agent(agent_id, owner_user_id, org_id, transaction=transaction)
-            if agent_with_permission is None:
+            perm = await self.check_agent_permission(agent_id, owner_user_id, org_id)
+            if not perm:
                 self.logger.warning(f"No permission found for user {owner_user_id} on agent {agent_id}")
                 return {"success": False, "reason": "Agent not found or no permission"}
 
-            # Only OWNER can update permissions
-            if agent_with_permission.get("user_role") != "OWNER":
+            if perm.get("user_role") != "OWNER":
                 self.logger.warning(f"User {owner_user_id} is not the OWNER of agent {agent_id}")
                 return {"success": False, "reason": "Only OWNER can update permissions"}
 
@@ -17035,17 +17779,15 @@ class Neo4jProvider(IGraphDBProvider):
             return {"success": False, "reason": f"Internal error: {str(e)}"}
 
 
-    async def get_agent_permissions(self, agent_id: str, user_id: str, org_id: str, transaction: Optional[str] = None) -> Optional[list[dict]]:
+    async def get_agent_permissions(self, agent_id: str, user_id: str, org_id: str, transaction: str | None = None) -> list[dict] | None:
         """Get all permissions for an agent (only OWNER can view all permissions)"""
         try:
-            # Check if user has access to the agent
-            agent_with_permission = await self.get_agent(agent_id, user_id, org_id, transaction=transaction)
-            if agent_with_permission is None:
+            perm = await self.check_agent_permission(agent_id, user_id, org_id)
+            if not perm:
                 self.logger.warning(f"No permission found for user {user_id} on agent {agent_id}")
                 return None
 
-            # Only OWNER can view all permissions
-            if agent_with_permission.get("user_role") != "OWNER":
+            if perm.get("user_role") != "OWNER":
                 self.logger.warning(f"User {user_id} is not the OWNER of agent {agent_id}")
                 return None
 
@@ -17079,7 +17821,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"Failed to get agent permissions: {str(e)}")
             return None
 
-    async def get_all_agent_templates(self, user_id: str, transaction: Optional[str] = None) -> list[dict]:
+    async def get_all_agent_templates(self, user_id: str, transaction: str | None = None) -> list[dict]:
         """Get all agent templates accessible to a user via individual or team access"""
         try:
             template_label = collection_to_label(CollectionNames.AGENT_TEMPLATES.value)
@@ -17180,7 +17922,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to get all agent templates: %s", str(e))
             return []
 
-    async def get_template(self, template_id: str, user_id: str, transaction: Optional[str] = None) -> Optional[dict]:
+    async def get_template(self, template_id: str, user_id: str, transaction: str | None = None) -> dict | None:
         """Get a template by ID with user permissions"""
         try:
             template_label = collection_to_label(CollectionNames.AGENT_TEMPLATES.value)
@@ -17299,7 +18041,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to get template access: %s", str(e))
             return None
 
-    async def share_agent_template(self, template_id: str, user_id: str, user_ids: Optional[list[str]] = None, team_ids: Optional[list[str]] = None, transaction: Optional[str] = None) -> Optional[bool]:
+    async def share_agent_template(self, template_id: str, user_id: str, user_ids: list[str] | None = None, team_ids: list[str] | None = None, transaction: str | None = None) -> bool | None:
         """Share an agent template with users"""
         try:
             self.logger.info(f"Sharing agent template {template_id} with users {user_ids}")
@@ -17370,7 +18112,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to share agent template: %s", str(e))
             return False
 
-    async def clone_agent_template(self, template_id: str, transaction: Optional[str] = None) -> Optional[str]:
+    async def clone_agent_template(self, template_id: str, transaction: str | None = None) -> str | None:
         """Clone an agent template"""
         try:
             template = await self.get_document(template_id, CollectionNames.AGENT_TEMPLATES.value, transaction=transaction)
@@ -17395,7 +18137,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to clone agent template: %s", str(e))
             return None
 
-    async def delete_agent_template(self, template_id: str, user_id: str, transaction: Optional[str] = None) -> Optional[bool]:
+    async def delete_agent_template(self, template_id: str, user_id: str, transaction: str | None = None) -> bool | None:
         """Delete an agent template"""
         try:
             template_label = collection_to_label(CollectionNames.AGENT_TEMPLATES.value)
@@ -17451,7 +18193,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to delete agent template: %s", str(e), exc_info=True)
             return False
 
-    async def update_agent_template(self, template_id: str, template_updates: dict[str, Any], user_id: str, transaction: Optional[str] = None) -> Optional[bool]:
+    async def update_agent_template(self, template_id: str, template_updates: dict[str, Any], user_id: str, transaction: str | None = None) -> bool | None:
         """Update an agent template"""
         try:
             template_label = collection_to_label(CollectionNames.AGENT_TEMPLATES.value)
@@ -17506,15 +18248,22 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error("❌ Failed to update agent template: %s", str(e))
             return False
 
-    async def get_app_creator_user(self, connector_id: str, transaction: Optional[str] = None) -> Optional[User]:
+    async def get_app_creator_user(self, connector_id: str, transaction: str | None = None) -> User | None:
         """
         Get the creator user for an app by connectorId.
         """
         try:
             app = await self.get_document(connector_id, CollectionNames.APPS.value, transaction=transaction)
-            if app is None:
+            if not app:
                 return None
-            return app.get("createdBy")
+            user_id = app.get("createdBy")
+            if user_id is None:
+                return None
+            user_doc  =  await self.get_user_by_user_id(user_id)
+            if user_doc is None:
+                return None
+            # NOTE: This conversion of type can be removed once get_user_by_user_id returns User object
+            return  User.from_arango_user(user_doc) if isinstance(user_doc, dict) else user_doc
         except Exception as e:
             self.logger.error("❌ Failed to get app creator user: %s", str(e))
             return None

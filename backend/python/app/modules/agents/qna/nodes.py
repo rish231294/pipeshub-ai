@@ -12,13 +12,17 @@ Enterprise-grade agent system with:
 
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Literal, Union
+from uuid import UUID
 
+from app.config.constants.service import config_node_constants
+from app.config.configuration_service import ConfigurationService
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -26,10 +30,19 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.types import StreamWriter
 
-from app.modules.agents.qna.chat_state import ChatState
+from app.modules.agents.capability_summary import (
+    build_capability_summary,
+    build_connector_routing_rules,
+    classify_knowledge_sources,
+)
+from app.modules.agents.qna.chat_state import ChatState, is_custom_agent_system_prompt
 from app.modules.agents.qna.stream_utils import safe_stream_write, send_keepalive
-from app.modules.qna.response_prompt import create_response_messages
+from app.modules.qna.response_prompt import (
+    build_direct_answer_time_context,
+    create_response_messages,
+)
 from app.utils.streaming import stream_llm_response, stream_llm_response_with_tools
+from app.utils.time_conversion import build_llm_time_context
 
 # ============================================================================
 # CONSTANTS & CONFIGURATION
@@ -58,6 +71,11 @@ _TOOL_LOG_LIMIT = 5
 _PARAM_DESC_TRUNCATE = 60
 _REASONING_DISPLAY_LEN = 200
 
+# Orchestration status taxonomy (metadata fields on tool result dicts)
+ORCHESTRATION_STATUS_RESOLVED = "resolved"
+ORCHESTRATION_STATUS_PARTIAL = "partial_failure"
+ORCHESTRATION_STATUS_CASCADE_BROKEN = "cascade_broken"
+
 # Content detection constants
 MIN_CONTENT_LENGTH_FOR_REUSE = 500  # Minimum chars for content to be considered reusable
 MIN_PLACEHOLDER_PARTS = 2  # Minimum parts in placeholder for fuzzy matching
@@ -85,6 +103,10 @@ class NodeConfig:
     MAX_PARALLEL_TOOLS: int = 10
     TOOL_TIMEOUT_SECONDS: float = 60.0
     RETRIEVAL_TIMEOUT_SECONDS: float = 60.0  # Faster timeout for retrieval
+    # Generative image models can easily take 1-3 minutes per call, and
+    # multi-image requests (n > 1) stack that up further. Give them plenty
+    # of headroom.
+    IMAGE_GENERATION_TIMEOUT_SECONDS: float = 300.0
     PLANNER_TIMEOUT_SECONDS: float = 45.0
     REFLECTION_TIMEOUT_SECONDS: float = 8.0
 
@@ -94,7 +116,7 @@ class NodeConfig:
     MAX_VALIDATION_RETRIES: int = 2
 
     # Query limits
-    MAX_RETRIEVAL_QUERIES: int = 3
+    MAX_RETRIEVAL_QUERIES: int = 6
     MAX_QUERY_LENGTH: int = 100
     MAX_QUERY_WORDS: int = 8
 
@@ -145,7 +167,7 @@ def clean_tool_result(result: object) -> object:
         for key, value in result.items():
             if key in REMOVE_FIELDS or key.lower() in REMOVE_FIELDS:
                 continue
-            if key.startswith("_") or key.startswith("$"):
+            if key.startswith(("_", "$")):
                 continue
 
             if isinstance(value, dict):
@@ -189,7 +211,7 @@ class ToolResultExtractor:
     """Reliable extraction of data from tool results"""
 
     @staticmethod
-    def extract_success_status(result: Union[Dict[str, Any], str, Tuple[bool, Any], None]) -> bool:
+    def extract_success_status(result: dict[str, Any] | str | tuple[bool, Any] | None) -> bool:
         """
         Reliably detect if a tool execution succeeded.
 
@@ -202,9 +224,8 @@ class ToolResultExtractor:
             return False
 
         # Tuple format: (success, data)
-        if isinstance(result, tuple) and len(result) >= 1:
-            if isinstance(result[0], bool):
-                return result[0]
+        if isinstance(result, tuple) and len(result) >= 1 and isinstance(result[0], bool):
+            return result[0]
 
         # Dict format
         if isinstance(result, dict):
@@ -218,7 +239,16 @@ class ToolResultExtractor:
             if "error" in result and result["error"] not in (None, "", "null"):
                 return False
 
-        # String format - check for error indicators
+        # String format - try JSON parse first to avoid false negatives from content
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                return ToolResultExtractor.extract_success_status(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Plain string fallback - check for error indicators
+        # NOTE: only reaches here for non-JSON strings; JSON results are handled above
         result_str = str(result).lower()
         error_indicators = [
             "error:", '"error": "', "'error': '",
@@ -233,7 +263,7 @@ class ToolResultExtractor:
         return not any(ind in result_str for ind in error_indicators)
 
     @staticmethod
-    def extract_data_from_result(result: Union[Dict[str, Any], str, Tuple[bool, Any], List[Any], None]) -> Union[Dict[str, Any], str, List[Any], None]:
+    def extract_data_from_result(result: dict[str, Any] | str | tuple[bool, Any] | list[Any] | None) -> dict[str, Any] | str | list[Any] | None:
         """
         Extract the actual data from a tool result.
 
@@ -250,8 +280,7 @@ class ToolResultExtractor:
         # Handle JSON strings
         if isinstance(result, str):
             try:
-                parsed = json.loads(result)
-                return parsed
+                return json.loads(result)
             except (json.JSONDecodeError, TypeError):
                 # ✅ NEW: Return the string directly (for retrieval tool)
                 # Retrieval returns formatted string, not JSON
@@ -260,7 +289,7 @@ class ToolResultExtractor:
         return result
 
     @staticmethod
-    def extract_field_from_data(data: Union[Dict[str, Any], List[Any], str, None], field_path: List[str]) -> Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]]:
+    def extract_field_from_data(data: dict[str, Any] | list[Any] | str | None, field_path: list[str]) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
         """
         Extract a specific field from data using a field path.
 
@@ -337,12 +366,26 @@ class ToolResultExtractor:
                                 pass
                         i += 1
                         continue
-                    # Bidirectional alias fallback: content ↔ body (common in Confluence/API responses)
-                    # Try the alias if the requested field doesn't exist
+                    # Fallback: "results" → prefixed variants (e.g. web_results)
+                    elif field == "results":
+                        matched = None
+                        for key in current:
+                            if key.endswith("_results") and isinstance(current[key], list):
+                                matched = key
+                                break
+                        if matched is not None:
+                            current = current[matched]
+                        else:
+                            return None
+                    # Bidirectional alias fallbacks
                     elif field == "content" and "body" in current:
                         current = current.get("body")
                     elif field == "body" and "content" in current:
                         current = current.get("content")
+                    elif field == "url" and "link" in current:
+                        current = current.get("link")
+                    elif field == "link" and "url" in current:
+                        current = current.get("url")
                     else:
                         return None
 
@@ -486,6 +529,61 @@ class ToolResultExtractor:
         return current
 
 
+def _is_semantically_empty(result: object) -> bool:
+    """Check if a tool result succeeded but contains no meaningful data.
+
+    Used for cascading chain analysis — an empty source tool means
+    downstream tools will receive no useful input.
+    """
+    if result is None:
+        return True
+
+    data = ToolResultExtractor.extract_data_from_result(result)
+    if data is None:
+        return True
+
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            for key in ("results", "items", "values"):
+                lst = inner.get(key)
+                if isinstance(lst, list) and len(lst) == 0:
+                    return True
+        elif isinstance(inner, list) and len(inner) == 0:
+            return True
+        for key in ("results", "items", "values", "records"):
+            if key in data and isinstance(data[key], list) and len(data[key]) == 0:
+                return True
+
+    if isinstance(data, list) and len(data) == 0:
+        return True
+
+    return False
+
+
+def _underscore_to_dotted(name: str) -> str:
+    """Convert a sanitized tool name back to its most likely dotted form.
+
+    'jira_search_users' → 'jira.search_users'
+    'confluence_get_page_content' → 'confluence.get_page_content'
+    'knowledgehub_list_files' → 'knowledgehub.list_files'
+
+    Tool names follow 'app.tool_name' format.  The first underscore
+    that corresponds to the app/tool separator is replaced with a dot.
+
+    If the name already contains a dot, return it as-is (don't create invalid names).
+    """
+    # If name already has a dot, don't convert (avoid creating invalid names like calculator.calculate.single_operand)
+    if '.' in name:
+        return name
+
+    parts = name.split('_')
+    if len(parts) >= 2:
+        # First underscore is the app.tool separator
+        return parts[0] + '.' + '_'.join(parts[1:])
+    return name
+
+
 # ============================================================================
 # PLACEHOLDER RESOLUTION - SIMPLIFIED & RELIABLE
 # ============================================================================
@@ -503,7 +601,7 @@ class PlaceholderResolver:
     PLACEHOLDER_PATTERN = re.compile(r'\{\{([^}]+)\}\}')
 
     @classmethod
-    def has_placeholders(cls, args: Dict[str, Any]) -> bool:
+    def has_placeholders(cls, args: dict[str, Any]) -> bool:
         """Check if args contain any placeholders"""
         args_str = json.dumps(args, default=str)
         return bool(cls.PLACEHOLDER_PATTERN.search(args_str))
@@ -511,8 +609,8 @@ class PlaceholderResolver:
     @classmethod
     def strip_unresolved(
         cls,
-        args: Dict[str, Any]
-    ) -> Tuple[Dict[str, Any], List[str]]:
+        args: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[str]]:
         """
         Replace any remaining unresolved {{...}} placeholders with None.
 
@@ -523,7 +621,7 @@ class PlaceholderResolver:
         Returns:
             (cleaned_args, list_of_placeholder_names_that_were_stripped)
         """
-        stripped: List[str] = []
+        stripped: list[str] = []
 
         def clean_value(value: object) -> object:
             if isinstance(value, str):
@@ -552,10 +650,10 @@ class PlaceholderResolver:
     @classmethod
     def resolve_all(
         cls,
-        args: Dict[str, Any],
-        results_by_tool: Dict[str, Any],
+        args: dict[str, Any],
+        results_by_tool: dict[str, Any],
         log: logging.Logger
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Resolve all placeholders in args using results from previous tools.
 
@@ -593,7 +691,7 @@ class PlaceholderResolver:
     def _resolve_string_value(
         cls,
         value: str,
-        results_by_tool: Dict[str, Any],
+        results_by_tool: dict[str, Any],
         log: logging.Logger
     ) -> str:
         """Resolve all placeholders in a string value"""
@@ -614,9 +712,9 @@ class PlaceholderResolver:
     def _resolve_single_placeholder(
         cls,
         placeholder: str,
-        results_by_tool: Dict[str, Any],
+        results_by_tool: dict[str, Any],
         log: logging.Logger
-    ) -> Optional[Union[Dict[str, Any], List[Any], str, int, float, bool]]:
+    ) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
         """
         Resolve a single placeholder to its value.
 
@@ -683,8 +781,8 @@ class PlaceholderResolver:
     def _parse_placeholder(
         cls,
         placeholder: str,
-        results_by_tool: Dict[str, Any]
-    ) -> Tuple[Optional[str], List[str]]:
+        results_by_tool: dict[str, Any]
+    ) -> tuple[str | None, list[str]]:
         """
         Parse placeholder into tool_name and field_path.
 
@@ -698,7 +796,7 @@ class PlaceholderResolver:
             (tool_name, field_path) or (None, []) if can't parse
         """
         # Helper function to parse field path with array indices
-        def parse_field_path(path_str: str) -> List[str]:
+        def parse_field_path(path_str: str) -> list[str]:
             """Parse field path handling array indices like [0], [1], [?], [*].
 
             Non-numeric indices ([?], [*], etc.) are normalised to '0' so that
@@ -752,33 +850,63 @@ class PlaceholderResolver:
         sorted_tools = sorted(results_by_tool.keys(), key=len, reverse=True)
 
         for tool_name in sorted_tools:
+            # Original exact match
             if placeholder.startswith(tool_name + '.'):
-                # Extract field path
                 remaining = placeholder[len(tool_name) + 1:]
                 field_path = parse_field_path(remaining)
-                # Don't remove .results here - let extract_field_from_data handle it
-                # It will check if results exists and only fallback if it doesn't
                 return tool_name, field_path
 
-        # Fuzzy match - find tool that matches end of placeholder
+            # Auto-resolve dotted ↔ underscore tool names.
+            # Planner generates dotted names (jira.search_users) but results
+            # may be stored under sanitized names (jira_search_users), or
+            # vice versa.  Try both forms to avoid false mismatches.
+
+            # Try dotted form if stored name uses underscores
+            # e.g., stored: "jira_search_users" → try matching "jira.search_users."
+            dotted_form = _underscore_to_dotted(tool_name)
+            if dotted_form != tool_name and placeholder.startswith(dotted_form + '.'):
+                remaining = placeholder[len(dotted_form) + 1:]
+                field_path = parse_field_path(remaining)
+                return tool_name, field_path  # Return the ACTUAL stored key
+
+            # Try underscore form if stored name uses dots
+            # e.g., stored: "jira.search_users" → try matching "jira_search_users."
+            underscore_form = tool_name.replace('.', '_')
+            if underscore_form != tool_name and placeholder.startswith(underscore_form + '.'):
+                remaining = placeholder[len(underscore_form) + 1:]
+                field_path = parse_field_path(remaining)
+                return tool_name, field_path
+
+        # Fuzzy match: try progressively longer dot-prefixes (3, 2, 1 segments)
+        # This avoids the old single-segment prefix bug where e.g. "jira" matched
+        # "jira_search_users" but leaked "search_users" into the field path.
         parts = placeholder.split('.')
         if len(parts) >= MIN_PLACEHOLDER_PARTS:
-            # Try matching the first part against tool names
-            prefix = parts[0]
-            # Reconstruct remaining path and parse it
-            remaining = '.'.join(parts[1:])
-            field_path = parse_field_path(remaining)
-            # Don't remove .results here - let extract_field_from_data handle it
+            for prefix_len in range(min(len(parts) - 1, 3), 0, -1):
+                prefix_candidate = '.'.join(parts[:prefix_len])
+                remaining = '.'.join(parts[prefix_len:])
+                field_path = parse_field_path(remaining)
 
-            for tool_name in sorted_tools:
-                # Normalize for comparison
-                normalized_tool = tool_name.lower().replace('_', '').replace('.', '')
-                normalized_prefix = prefix.lower().replace('_', '')
+                for tool_name in sorted_tools:
+                    normalized_tool = tool_name.lower().replace('_', '').replace('.', '')
+                    normalized_prefix = prefix_candidate.lower().replace('_', '').replace('.', '')
 
-                if normalized_prefix in normalized_tool or normalized_tool.endswith(normalized_prefix):
-                    return tool_name, field_path
+                    if normalized_prefix == normalized_tool:
+                        return tool_name, field_path
 
         return None, []
+
+    @classmethod
+    def _extract_source_tool_name(cls, placeholder: str) -> str | None:
+        """Extract the source tool name from a placeholder string.
+
+        'jira.search_users.data.results[0].accountId' -> 'jira.search_users'
+        'jira_search_users.data.results[0].accountId' -> 'jira_search_users'
+        """
+        parts = placeholder.split(".")
+        if len(parts) >= 2:
+            return f"{parts[0]}.{parts[1]}"
+        return parts[0] if parts else None
 
 
 # ============================================================================
@@ -789,7 +917,7 @@ class ToolExecutor:
     """Handles tool execution with cascading support"""
 
     @staticmethod
-    def _format_args_preview(args: Dict[str, Any], max_len: int = 220) -> str:
+    def _format_args_preview(args: dict[str, Any], max_len: int = 220) -> str:
         """Return a compact JSON preview for tool args in logs."""
         try:
             preview = json.dumps(args, default=str, ensure_ascii=False)
@@ -801,14 +929,14 @@ class ToolExecutor:
 
     @staticmethod
     async def execute_tools(
-        planned_tools: List[Dict[str, Any]],
-        tools_by_name: Dict[str, Any],
+        planned_tools: list[dict[str, Any]],
+        tools_by_name: dict[str, Any],
         llm: BaseChatModel,
         state: ChatState,
         log: logging.Logger,
         writer: StreamWriter,
         config: RunnableConfig
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Execute tools - sequentially if cascading, parallel otherwise.
 
@@ -833,14 +961,14 @@ class ToolExecutor:
 
     @staticmethod
     async def _execute_sequential(
-        planned_tools: List[Dict[str, Any]],
-        tools_by_name: Dict[str, Any],
+        planned_tools: list[dict[str, Any]],
+        tools_by_name: dict[str, Any],
         llm: BaseChatModel,
         state: ChatState,
         log: logging.Logger,
         writer: StreamWriter,
         config: RunnableConfig
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Execute tools sequentially with placeholder resolution"""
         from app.modules.agents.qna.tool_system import _sanitize_tool_name_if_needed
 
@@ -852,11 +980,19 @@ class ToolExecutor:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
 
-            # Normalize tool name
-            normalized_name = _sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name
-            actual_tool_name = normalized_name if normalized_name in tools_by_name else tool_name
+            # Resolve tool name: tools_by_name contains both sanitized (underscore)
+            # and original (dot) names, so a direct lookup covers the common cases.
+            # Fall back to sanitizing the LLM name (replaces dots→underscores) in
+            # case the LLM used the dotted form but only the sanitized key is stored.
+            actual_tool_name = None
+            if tool_name in tools_by_name:
+                actual_tool_name = tool_name
+            else:
+                normalized_name = _sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name
+                if normalized_name in tools_by_name:
+                    actual_tool_name = normalized_name
 
-            if actual_tool_name not in tools_by_name:
+            if actual_tool_name is None:
                 log.warning(f"❌ Tool not found: {tool_name}")
                 tool_results.append({
                     "tool_name": tool_name,
@@ -879,6 +1015,34 @@ class ToolExecutor:
                 # that end up as None will be rejected by Pydantic validation.
                 resolved_args, stripped_placeholders = PlaceholderResolver.strip_unresolved(resolved_args)
                 log.debug(f"  Stripped {len(stripped_placeholders)} placeholder(s): {stripped_placeholders}")
+
+                # Cascading dependency check: if any stripped placeholder
+                # references a tool in this execution chain, it is NOT optional
+                # — it means the cascading chain broke.  Skip execution.
+                if stripped_placeholders:
+                    cascade_failures = []
+                    planned_tool_names = {t.get("name", "") for t in planned_tools}
+                    planned_tool_names_sanitized = {n.replace(".", "_") for n in planned_tool_names}
+                    all_known = planned_tool_names | planned_tool_names_sanitized | set(results_by_tool.keys())
+
+                    for ph in stripped_placeholders:
+                        source = PlaceholderResolver._extract_source_tool_name(ph)
+                        if source and (source in all_known or source.replace(".", "_") in all_known):
+                            cascade_failures.append(ph)
+
+                    if cascade_failures:
+                        log.error(
+                            f"CASCADE FAILURE: {actual_tool_name} depends on unresolved "
+                            f"cascading placeholders: {cascade_failures}. Skipping execution."
+                        )
+                        tool_results.append({
+                            "tool_name": actual_tool_name,
+                            "result": f"Cascade failure: dependent data not available from {cascade_failures}",
+                            "status": "cascade_error",
+                            "tool_id": f"call_{i}_{actual_tool_name}",
+                            "orchestration_status": ORCHESTRATION_STATUS_CASCADE_BROKEN,
+                        })
+                        continue  # Skip execution — result would be meaningless
 
                 # If placeholders still remain after stripping (shouldn't happen),
                 # something is structurally wrong – fail the tool call.
@@ -1003,6 +1167,10 @@ class ToolExecutor:
                     "data": {"status": "error", "message": f"Operation failed: {error_msg[:100]}"}
                 }, config)
 
+            # Set default orchestration status
+            if "orchestration_status" not in result_dict:
+                result_dict["orchestration_status"] = ORCHESTRATION_STATUS_RESOLVED
+
             # Store successful results for next placeholder resolution
             if result_dict.get("status") == "success":
                 # Extract clean data for placeholder resolution
@@ -1023,6 +1191,22 @@ class ToolExecutor:
                     storage_key = f"{actual_tool_name}_{suffix_number}"
                     results_by_tool[storage_key] = result_data
                     log.debug(f"✅ Stored result for {storage_key} (keys: {list(result_data.keys()) if isinstance(result_data, dict) else type(result_data).__name__})")
+
+                # Detect empty cascade sources: if this tool returned empty
+                # results and a downstream tool depends on its output via
+                # placeholder, mark as a broken cascade source.
+                if _is_semantically_empty(result_data):
+                    dotted_name = tool_call.get("name", "")
+                    remaining_tools = planned_tools[i + 1:]
+                    for downstream in remaining_tools:
+                        args_str = json.dumps(downstream.get("args", {}), default=str)
+                        if actual_tool_name in args_str or dotted_name in args_str:
+                            log.warning(
+                                f"SEMANTIC FAILURE: {actual_tool_name} returned empty "
+                                f"results but downstream tool depends on its output"
+                            )
+                            result_dict["orchestration_status"] = "empty_cascade_source"
+                            break
             else:
                 log.debug(f"❌ Skipped storing failed tool: {actual_tool_name}")
 
@@ -1030,12 +1214,12 @@ class ToolExecutor:
 
     @staticmethod
     async def _execute_parallel(
-        planned_tools: List[Dict[str, Any]],
-        tools_by_name: Dict[str, Any],
+        planned_tools: list[dict[str, Any]],
+        tools_by_name: dict[str, Any],
         llm: BaseChatModel,
         state: ChatState,
         log: logging.Logger
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Execute tools in parallel"""
         from app.modules.agents.qna.tool_system import _sanitize_tool_name_if_needed
 
@@ -1045,11 +1229,16 @@ class ToolExecutor:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
 
-            # Normalize tool name
-            normalized_name = _sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name
-            actual_tool_name = normalized_name if normalized_name in tools_by_name else tool_name
+            # Resolve tool name: same 2-step strategy as sequential executor.
+            actual_tool_name = None
+            if tool_name in tools_by_name:
+                actual_tool_name = tool_name
+            else:
+                normalized_name = _sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name
+                if normalized_name in tools_by_name:
+                    actual_tool_name = normalized_name
 
-            if actual_tool_name not in tools_by_name:
+            if actual_tool_name is None:
                 log.warning(f"❌ Tool not found: {tool_name}")
                 # Create error result directly
                 tasks.append(asyncio.create_task(asyncio.sleep(0, result={
@@ -1103,11 +1292,11 @@ class ToolExecutor:
     async def _execute_single_tool(
         tool: object,
         tool_name: str,
-        tool_args: Dict[str, Any],
+        tool_args: dict[str, Any],
         tool_id: str,
         state: ChatState,
         log: logging.Logger
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Execute a single tool with proper timeout and error handling.
 
@@ -1142,8 +1331,11 @@ class ToolExecutor:
 
             # Determine timeout based on tool type
             timeout = NodeConfig.TOOL_TIMEOUT_SECONDS
-            if "retrieval" in tool_name.lower():
+            tool_name_lower = tool_name.lower()
+            if "retrieval" in tool_name_lower:
                 timeout = NodeConfig.RETRIEVAL_TIMEOUT_SECONDS
+            elif "image_generator" in tool_name_lower or "generate_image" in tool_name_lower:
+                timeout = NodeConfig.IMAGE_GENERATION_TIMEOUT_SECONDS
 
             # Execute tool
             result = await asyncio.wait_for(
@@ -1208,9 +1400,9 @@ class ToolExecutor:
     async def _validate_and_normalize_args(
         tool: object,
         tool_name: str,
-        tool_args: Dict[str, Any],
+        tool_args: dict[str, Any],
         log: logging.Logger
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Validate and normalize tool args using Pydantic schema"""
         try:
             # Get schema
@@ -1230,7 +1422,7 @@ class ToolExecutor:
             return None
 
     @staticmethod
-    async def _run_tool(tool: object, args: Dict[str, Any]) -> Union[Dict[str, Any], str, Tuple[bool, str], List[Any], None]:
+    async def _run_tool(tool: object, args: dict[str, Any]) -> dict[str, Any] | str | tuple[bool, str] | list[Any] | None:
         """Run tool using appropriate method - all tools run in the same event loop as FastAPI"""
         if hasattr(tool, 'arun'):
             # Tool has async arun() - use it directly (no thread executor)
@@ -1244,12 +1436,17 @@ class ToolExecutor:
             return tool.run(**args)
 
     @staticmethod
-    def _process_retrieval_output(result: Union[Dict[str, Any], str, Tuple[bool, str], List[Any], None], state: ChatState, log: logging.Logger) -> str:
+    def _process_retrieval_output(result: dict[str, Any] | str | tuple[bool, str] | list[Any] | None, state: ChatState, log: logging.Logger) -> str:
         """Process retrieval tool output and update state (accumulates results from multiple retrieval calls)"""
         try:
+            # Fast path: tool already wrote to state and returned pre-formatted content
+            if isinstance(result, str) and "<record>" in result:
+                log.info("📚 Retrieval returned pre-formatted content (state already updated by tool)")
+                return result
+
             from app.agents.actions.retrieval.retrieval import RetrievalToolOutput
 
-            # Try to parse as RetrievalToolOutput
+            # Legacy/fallback path: parse JSON and extract data
             retrieval_output = None
 
             if isinstance(result, dict) and "content" in result and "final_results" in result:
@@ -2136,7 +2333,7 @@ GITHUB_GUIDANCE = r"""
 **"Reviews on my PRs" / "Reviews on repo X PRs" (no "every"/"all"):** get_owner → list_pull_requests → **one** get_pull_request_reviews(owner, repo, number=**list_pull_requests.data[0].number**).
 
 **"Give repo details then all PR details and every PR reviews" / "Every PR reviews" / "All PRs and every PR reviews":** get_owner(owner="me") → get_repository(owner, repo) → list_pull_requests(owner, repo, state="all") → then **one get_pull_request_reviews per PR**: plan get_pull_request_reviews(owner, repo, number=**list_pull_requests.data[0].number**), get_pull_request_reviews(owner, repo, number=**list_pull_requests.data[1].number**), … up to **list_pull_requests.data[9].number** (indices 0–9). Executor skips steps where the index does not exist.
-**"Review comments on PR 
+**"Review comments on PR
 **"Comment on this PR" / "Add a review comment on PR
 **"Review this PR" / "What changes in this PR?" / "What files changed in PR
 **"Approve this PR" / "Approve PR
@@ -2186,6 +2383,190 @@ GITHUB_GUIDANCE = r"""
 
 """
 
+CLICKUP_GUIDANCE = r"""
+## ClickUp Tools
+
+### Available Tools
+- get_authorized_user — current authenticated user (id, name, email)
+- get_authorized_teams_workspaces — all workspaces (team_id, name) and team members
+- get_spaces — spaces in a workspace
+- get_folders — folders in a space
+- get_lists — lists in a folder
+- get_folderless_lists — lists directly in a space (no folder)
+- get_tasks — filter/search tasks across workspace, space, folder, or list
+- get_task — full details of a single task
+- search_tasks — find tasks by keyword (name, description, custom field text)
+- create_task — create a new task in a list
+- update_task — update fields on an existing task
+- get_comments — comments on a task or replies to a comment
+- create_task_comment — add a comment or reply to a comment on a task
+- create_checklist — add a checklist to a task
+- create_checklist_item — add an item to a checklist
+- update_checklist_item — check/uncheck or rename a checklist item
+- get_workspace_docs — all docs in a workspace
+- get_doc_pages — pages in a doc
+- get_doc_page — full content of a single page
+- create_doc — create a new doc
+- create_doc_page — add a page to a doc
+- update_doc_page — edit content or title of a page
+- create_space — create a new space in a workspace
+- create_folder — create a new folder in a space
+- create_list — create a new list in a folder or folderless list in a space
+- update_list — rename or update settings of a list
+
+### Dependencies
+- get_spaces              depends on: get_authorized_teams_workspaces
+- get_folders             depends on: get_spaces
+- get_lists               depends on: get_folders
+- get_folderless_lists    depends on: get_spaces
+- get_tasks               depends on: get_authorized_teams_workspaces
+- get_task                depends on: get_tasks | search_tasks | create_task
+- search_tasks            depends on: get_authorized_teams_workspaces
+- create_task             depends on: get_lists | get_folderless_lists
+- update_task             depends on: get_tasks | search_tasks | create_task
+- get_comments            depends on: get_tasks | search_tasks
+- create_task_comment     depends on: get_tasks | search_tasks
+- create_checklist        depends on: get_tasks | search_tasks
+- create_checklist_item   depends on: create_checklist | get_task
+- update_checklist_item   depends on: create_checklist | get_task
+- get_workspace_docs      depends on: get_authorized_teams_workspaces
+- get_doc_pages           depends on: get_workspace_docs | create_doc
+- get_doc_page            depends on: get_doc_pages
+- create_doc              depends on: get_authorized_teams_workspaces
+- create_doc_page         depends on: get_workspace_docs | create_doc
+- update_doc_page         depends on: get_doc_pages | create_doc_page
+- create_space            depends on: get_authorized_teams_workspaces
+- create_folder           depends on: get_spaces
+- create_list             depends on: get_folders
+- update_list             depends on: get_lists | get_folderless_lists
+- get_workspace_members   depends on: get_authorized_teams_workspaces (use for all members of a workspace; not list-specific)
+
+### Critical Rules
+- team_id and workspace_id are the same value — from get_authorized_teams_workspaces
+- A space has two kinds of lists: folder lists (get_folders → get_lists) and folderless lists (get_folderless_lists). Both must be checked when searching all lists in a space.
+- **Task by name:** Call **search_tasks**(team_id, keyword) first to get task_id, then use it for get_task, update_task, create_task_comment, get_comments, create_checklist, create_checklist_item, update_checklist_item. Subtask: search_tasks → get_task for list_id → create_task(list_id, name, parent=task_id).
+- When creating a task as a subtask, pass the parent task_id in the parent field. The list_id must be the same list the parent task belongs to (get it from get_task(parent_id)).
+- Never fabricate IDs — always obtain team_id, space_id, folder_id, list_id, task_id, doc_id, page_id, checklist_id, checklist_item_id from a prior tool call or explicit user input.
+- get_authorized_user is the source for the current user's id — use it when the user says "me", "my tasks", or "assign to me".
+"""
+
+MARIADB_GUIDANCE = r"""
+## MariaDB-Specific Guidance
+
+### Core Rules
+- Use MariaDB tools when the user asks for database data, table details, SQL results, or table definitions.
+- Prefer read-safe operations (`SELECT`, metadata introspection tools).
+- Do not run destructive SQL (`DROP`, `TRUNCATE`, `DELETE`, `ALTER`) unless the user explicitly asks.
+- If table/column context is unclear, discover structure first before executing SQL.
+- In multi-step tasks, execute in a strict tool loop: one tool call, inspect result, then choose next tool.
+
+### Tool Action Loop (MANDATORY)
+For MariaDB work, follow this loop every time:
+1. Choose exactly one next best tool.
+2. Call that tool with concrete parameters (no placeholders).
+3. Read the returned data/errors.
+4. Decide the next single tool call.
+5. Repeat until the task is complete.
+- Never guess columns/table names when schema tools can confirm them.
+- If a step fails, recover with introspection tools (`list_tables`, `fetch_db_schema`, `get_tables_schema`) before retrying SQL.
+
+### Recommended Tool Order by Scenario
+
+#### Case A: User asks a data question but table/column context is unknown
+1. `mariadb.fetch_db_schema`
+2. `mariadb.execute_query` (final SQL)
+
+#### Case B: User gives table name but not columns
+1. `mariadb.get_tables_schema`
+2. `mariadb.execute_query`
+
+#### Case C: User asks for table structure / DDL
+1. `mariadb.get_table_ddl` (single table)
+
+#### Case D: User asks "show full DB structure"
+1. `mariadb.fetch_db_schema`
+2. Optionally narrow with `mariadb.get_tables_schema` for key tables
+
+#### Case E: User asks "list what exists"
+1. `mariadb.list_tables`
+
+### SQL Construction Guidance
+- Select only needed columns; avoid `SELECT *` unless user explicitly wants all fields.
+- Add sensible limits for exploratory reads (for example `LIMIT 50`), unless user requests full result.
+- Use discovered column names/types from schema tools before writing joins/filters.
+- For time-based requests, use explicit date predicates and clear sorting.
+
+### Error Recovery (MariaDB)
+- If SQL fails due to missing table/column:
+    1. Run `mariadb.list_tables`
+    2. Run `mariadb.get_tables_schema`
+    3. Retry `mariadb.execute_query` with corrected identifiers
+- If results are empty:
+    1. Verify filters/date range
+    2. Re-check columns/types via `mariadb.get_tables_schema`
+    3. Retry with adjusted query
+
+### Planning Examples (one tool after another)
+
+Example 1: "Show total orders by status for last 30 days"
+1. `mariadb.fetch_db_schema`
+2. `mariadb.get_tables_schema(tables=["orders"])`
+3. `mariadb.execute_query(query="SELECT status, COUNT(*) AS total_orders FROM orders WHERE created_at >= NOW() - INTERVAL 30 DAY GROUP BY status ORDER BY total_orders DESC")`
+
+Example 2: "What columns are in invoice?"
+1. `mariadb.get_tables_schema(tables=["invoice"])`
+2. Optional follow-up: `mariadb.execute_query` only if user asks for row data
+
+Example 3: "Give me the DDL for invoice"
+1. `mariadb.get_table_ddl(table="invoice")`
+"""
+
+
+REDSHIFT_GUIDANCE = r"""
+## Redshift-Specific Guidance
+
+### Core Rules
+- Use Redshift tools when the user asks for any data, warehouse data, SQL results.
+- Call fetch_db_schema to know the context around the user query and then form the SQL query and run it using execute_query tool.
+- Call fetch_db_schema/get_tables_schema/get_schema_ddl tools to know the column names.
+- Prefer read-safe operations (`SELECT`, metadata introspection tools).
+- Do not run destructive SQL (`DROP`, `TRUNCATE`, `DELETE`, `ALTER`) unless the user explicitly asks.
+- If table name or schema name is provided by the user, use tools to fetch their details and then form the SQL query and run it using execute_query tool.
+- In multi-step tasks, execute in a strict tool loop: one tool call, inspect result, then choose next tool.
+
+### Tool Action Loop (MANDATORY)
+For Redshift work, follow this loop every time:
+1. Choose next best tool to fetch the context around the user query.
+2. If first tool call does not return the context around the user query, call the fetch_db_schema tool to fetch the complete context around the user query.
+3. Now form the SQL query to bring data and run it using execute_query tool.
+- Never guess columns/table names when schema tools can confirm them.
+- If a step fails, recover with introspection tools (schemas/tables/table schema) before retrying SQL.
+
+
+### SQL Construction Guidance
+- Always qualify table names when possible: `schema.table`.
+- Use discovered column names/types from schema tools before writing joins/filters.
+- Normalize location names and match case-insensitively with common variants (e.g., treat “New York”, “new york”, and “New York City” as equivalent).
+
+### Error Recovery (Redshift)
+- If SQL fails due to missing relation/column:
+  1. Run `redshift.fetch_db_schema`
+  2. Retry `redshift.execute_query` with adjusted query
+- If permissions fail, report clearly and stop retry loops.
+
+
+Example 1: “Show total orders by status for last 30 days”
+1. `redshift.fetch_db_schema`
+2. `redshift.execute_query(query="SELECT status, COUNT(*) AS total_orders FROM public.orders WHERE created_at >= DATEADD(day, -30, GETDATE()) GROUP BY status ORDER BY total_orders DESC")`
+
+Example 2: “What columns are in finance.invoice?”
+1. `redshift.get_tables_schema(schema_name="finance", tables=["invoice"])`
+2. Optional follow-up: `redshift.execute_query` only if user asks for row data
+
+Example 3: “Give me the DDL for all tables in analytics”
+1. `redshift.get_schema_ddl(schema_name="analytics")`
+"""
+
 PLANNER_SYSTEM_PROMPT = """You are an intelligent task planner for an enterprise AI assistant. Your role is to understand user intent and select the appropriate tools to fulfill their request.
 
 ## Core Planning Logic - Understanding User Intent
@@ -2193,17 +2574,28 @@ PLANNER_SYSTEM_PROMPT = """You are an intelligent task planner for an enterprise
 **Decision Tree (Follow in Order):**
 1. **Simple greeting/thanks?** → `can_answer_directly: true`
 2. **User asks about the conversation itself?** (meta-questions like "what did we discuss", "summarize our conversation") → `can_answer_directly: true`
-3. **User wants to PERFORM an action?** (create/update/delete/modify) → Use appropriate service tools
-4. **User wants data FROM a specific service?**
+3. **User EXPLICITLY asks to GENERATE/CREATE an IMAGE from a text description?** (literal verbs like "generate an image of...", "create a picture of...", "draw me a...", "paint...", "render an illustration of...", "design a logo for...") → **Use `image_generator.generate_image`**. For ambiguous phrasings like "show me a <thing>", "find an image of...", "any photo of...", first try `retrieval.search_internal_knowledge` — only fall back to `image_generator.generate_image` if retrieval returns nothing AND the user clearly wants a newly synthesised image. Do NOT set `can_answer_directly: true` when the user truly wants an image produced.
+4. **User wants to PERFORM an action?** (create/update/delete/modify) → Use appropriate service tools
+5. **User wants data FROM a specific service?**
    - *Explicit:* names the service ("list Jira issues", "Confluence pages", "my Gmail")
+   - *Topic + source pattern:* **"[topic] from [service]"**, **"[topic] only from [service]"**, **"[topic] in [service]"** → Treat as a data request: search [service] for [topic] using live API + retrieval in parallel (if indexed). Even if phrased as a constraint/instruction, always SEARCH immediately.
    - *Implicit:* uses service-specific nouns — **"tickets/issues/bugs/epics/stories/sprints/backlog"** → Jira; **"pages/spaces/wiki"** → Confluence; **"emails/inbox"** → Gmail; **"messages/channels/DMs"** → Slack
    → Use the matching service tool. **If that service is ALSO indexed (see DUAL-SOURCE APPS), add retrieval in parallel.**
-5. **DEFAULT: Any information query** → Use `retrieval.search_internal_knowledge`
+6. **Short follow-up trigger after established topic+source?** ("give data", "show me", "go ahead", "yes", "do it", "continue") → Check conversation context for the most recent topic and source, then search that source for that topic. Do NOT set `can_answer_directly: true`.
+7. **User references an EXTERNAL WEBSITE or URL?** (mentions a public website by name — Wikipedia, Stack Overflow, GitHub docs, MDN, Medium, Reddit, any "*.com/org/io" domain, or includes a URL like "https://...") → Use `fetch_url` (if a specific URL is given) or `web_search` (to find the page first).
+
+**Image Generation Rule:** Only plan `image_generator.generate_image` when the user's request contains an **explicit** instruction to create a new image from a description (e.g. "generate / create / draw / render / paint / design an image/logo/illustration of ..."). Do not use it for:
+
+- Ambiguous phrasings like "show me a <thing>" or "find an image of ..." — try `retrieval.search_internal_knowledge` first and only fall back to generation if the user confirms they want a new synthesised image.
+- CHART / PLOT / DIAGRAM / DATA VISUALISATION requests — those go to `coding_sandbox.execute_python` when code execution is enabled, or return a text explanation otherwise.
+
+When in doubt, prefer a retrieval search or clarifying question over unnecessary image generation (the tool is expensive).
 
 ## CRITICAL: Retrieval is the Default
 
 **⚠️ RULE: When in doubt, USE RETRIEVAL. Never clarify for read/info queries.**
 **⚠️ RULE: If you have 0 tools planned and needs_clarification=false and can_answer_directly=false, you MUST add retrieval.**
+**⚠️ RULE: A bare topic keyword, name, or phrase (even a single word) is ALWAYS a retrieval query — NEVER `can_answer_directly: true`. Search first, answer from results.**
 
 Examples of retrieval queries:
 - "Tell me about X" → retrieval
@@ -2227,6 +2619,17 @@ Examples of retrieval queries:
   - `messages` / `channels` / `DMs` → **Slack** search tool
 - Tool description matches the user's request
 
+**Use WEB TOOLS (`web_search` / `fetch_url`) when:**
+- User mentions a **specific external/public website** by name (Wikipedia, Stack Overflow, GitHub, MDN, Reddit, Medium, any public site)
+- User provides or references a **URL** (https://...)
+- User asks to summarize, read, or get content from an **external page/site/article**
+- User wants information that is explicitly **from the web** or **from a specific public source**
+- Query is about **general/public knowledge** unlikely to exist in internal org documents — e.g. product reviews, consumer recommendations, health/medical info, market comparisons, "best X", travel, recipes, public news, scientific research, technology comparisons
+- Query asks for **recommendations, rankings, or comparisons** of products, services, or brands (e.g. "best probiotic supplement", "top laptops 2026", "cheapest flight to X")
+- Query requires **current/real-time data** — prices, availability, weather, sports scores, stock prices, release dates
+
+**⚠️ IMPORTANT — web_search + retrieval in parallel:** When a query could have BOTH internal AND external relevance, plan BOTH `retrieval.search_internal_knowledge` AND `web_search` in parallel.
+
 **Use RETRIEVAL when:**
 - User wants **INFORMATION ABOUT** a topic/person/concept (e.g., "what is X", "tell me about Y", "who is Z")
 - User wants **DOCUMENTATION** or **KNOWLEDGE** (e.g., "how to X", "best practices for Y")
@@ -2237,16 +2640,43 @@ Examples of retrieval queries:
 **Key Distinction:**
 - **LIVE data requests (explicit):** "list/get/show/fetch [items] from [service]" → Use service tools
 - **LIVE data requests (implicit — SERVICE NOUN):** "[topic] tickets", "[topic] issues", "[topic] bugs", "[topic] pages" — service resource noun used → **Use BOTH the matching service search tool AND retrieval (if that service is indexed).** This rule takes priority over the "ambiguous → retrieval only" default.
-- **Information requests:** "what/explain/tell me about [topic]" (no service resource noun) → Use retrieval only
 - **Action requests:** "create/update/delete [resource]" → Use service tools
 - **DUAL-SOURCE:** If the query references a service that is BOTH indexed AND has live API → use BOTH retrieval + service search API in parallel
+
+**⚠️ DUAL-SOURCE TRIGGER PHRASES (use BOTH retrieval + service API when the service is indexed):**
+- "[topic] from [service]" → e.g., "holidays from confluence" → BOTH retrieval + confluence.search_content
+- "[topic] in [service]" → e.g., "docs in confluence" → BOTH retrieval + confluence.search_content
+- "find [topic] on [service]" → BOTH retrieval + matching service search tool
+- "[topic] tickets/issues/pages" (service resource noun) → BOTH retrieval + matching service search tool
 
 **⚠️ SERVICE NOUN OVERRIDE:** When the query contains a service-specific resource noun (tickets, issues, bugs, epics, stories, pages, spaces, emails, messages; or in GitHub context: repos, repositories, issue, PR, pull request), it ALWAYS triggers the matching service tool — even if the query otherwise seems ambiguous or like a general information request. The "retrieval DEFAULT" rule does NOT apply when a service noun is present.
 
 **Important:** Service data might also be indexed in the knowledge base. When it is:
 - User uses a service resource noun ("[topic] tickets", "[topic] pages") → BOTH retrieval + service search tool (parallel)
+- User mentions "[topic] from/in [service]" (service name) → BOTH retrieval + service search tool (parallel)
 - User wants current/live data with filters (status, assigned, sprint) → Service tools only
-- User wants information/explanation with no service resource noun → Retrieval only
+- User wants information/explanation with no service reference → Retrieval only
+
+**⚠️ TOPIC DISCOVERY RULE (HIGHEST PRIORITY):**
+
+When the user query contains a **topic, keyword, or concept** AND requests discovery of related items (list, find, show, search, browse), perform **hybrid search** by calling ALL available search dimensions in parallel:
+
+1. **Metadata search** → `knowledgehub.list_files` (finds items by name/metadata in the index)
+2. **Semantic content search** → service search tools like `*.search_content`, `*.search_issues`, etc (searches within documents via live API)
+3. **Content retrieval** → `retrieval.search_internal_knowledge` (searches within indexed document content)
+
+**Apply this rule regardless of:**
+- Which specific word the user uses ("files", "pages", "docs", "items", etc.)
+- Whether the user names a specific service or not
+- Whether the topic matches a known service noun or not
+
+**Only skip a dimension if its tool is not available.**
+
+**When NOT to apply (use specific tools instead):**
+- Exact ID lookup → live API only ("get page 12345")
+- Write actions → live API write tool only ("create a page")
+- Filtered stateful queries → live API only ("my open tickets this sprint")
+- Simple greetings/meta-questions → can_answer_directly
 
 ## Available Tools
 {available_tools}
@@ -2439,7 +2869,7 @@ User: "from the all above conversations what is all that we have discussed and w
 Action: Set can_answer_directly: true, answer from conversation history, NO tools
 ```
 
-**General rule:** Conversation context beats tool calls. Meta-questions about conversation = direct answer.
+**General rule:** Reuse applies only to data that was actually fetched and shown. Acknowledgments and injected context are not reusable data.
 
 ## Content Generation for Action Tools
 
@@ -2523,8 +2953,21 @@ Generate:
 {outlook_guidance}
 {teams_guidance}
 {github_guidance}
+{clickup_guidance}
+{mariadb_guidance}
+{redshift_guidance}
+{zoom_guidance}
+{salesforce_guidance}
 
 ## Planning Best Practices
+
+**Search Query Formulation (CRITICAL):**
+- Use concise, natural-language search queries (2-5 words)
+- DO NOT stuff multiple synonyms into one query — this reduces search relevance
+- For broader coverage, make MULTIPLE tool calls with DIFFERENT focused queries
+- For optional parameters you don't need: OMIT them entirely, do not pass empty strings ""
+  - ❌ WRONG: {{"space_id": ""}}
+  - ✅ CORRECT: {{}} (omit space_id)
 
 **Retrieval:**
 - Max 2-3 calls per request
@@ -2615,8 +3058,14 @@ WRONG (don't do this):
 ```
 
 **User asking about themselves:**
-- Use provided user info directly
-- Set `can_answer_directly: true`
+- Only applies when the user's message is **explicitly asking about their own identity/profile** (e.g., "who am I?", "what's my email?", "what's my account type?")
+- The `## Current User Information` block is **injected system context** for your use in queries — its presence does NOT mean the user is asking about themselves
+- If the conversation context establishes a pending data retrieval (e.g., user asked for Jira issues, Confluence pages), the current user info is just context to help build queries — execute the retrieval
+- Set `can_answer_directly: true` **only** for pure self-info questions with no other data retrieval intent
+
+**User asking about capabilities:**
+- When users ask about capabilities, available tools, knowledge sources, or what actions you can perform
+- Set `can_answer_directly: true` and answer using the Capability Summary section below
 
 ## Output (JSON only)
 {{
@@ -2852,80 +3301,130 @@ Examples:
 
 ONEDRIVE_GUIDANCE = r"""
 ## OneDrive-Specific Guidance
-
-### ⚠️ CRITICAL: drive_id Resolution — ALWAYS Call `get_drives` First
-
-Almost every OneDrive tool requires a `drive_id` parameter. **NEVER ask the user for a drive_id.** Resolve it automatically:
-
-1. Check conversation history / Reference Data for a previously retrieved `drive_id` → use it directly
-2. If unknown → call `onedrive.get_drives` first, then use the result in subsequent tools
-
-**The `drive_id` is an internal Graph API identifier (e.g., `b!xxxx...`). Users don't know it. Always resolve it via `get_drives`.**
-
-### ⚠️ CRITICAL: item_id Resolution — Use `search_files` or `get_files`
-
-File operations (rename, delete, move, copy, etc.) require an `item_id`. **NEVER ask the user for an item_id.** Resolve it automatically:
-
-1. Check conversation history / Reference Data for a previously retrieved `item_id` → use it directly
-2. If the user mentions a file name → call `onedrive.search_files` to find it
-3. If browsing → call `onedrive.get_files` or `onedrive.get_folder_children`
-
-### Cascading Patterns (CRITICAL)
-
-**Pattern: Rename a file by name**
-User says: "rename X to Y"
-```json
-{{
-  "tools": [
-    {{"name": "onedrive.get_drives", "args": {{}}}},
-    {{"name": "onedrive.search_files", "args": {{"drive_id": "{{{{onedrive.get_drives.data.value[0].id}}}}", "query": "X"}}}},
-    {{"name": "onedrive.rename_item", "args": {{"drive_id": "{{{{onedrive.get_drives.data.value[0].id}}}}", "item_id": "{{{{onedrive.search_files.data.value[0].id}}}}", "new_name": "Y"}}}}
-  ]
-}}
+### ⚠️ CRITICAL Rules
+- **NEVER ask the user for `drive_id` or `item_id`** — always resolve them via API calls.
+- **NEVER skip prerequisites** — each tool below lists exactly what must be called before it.
+- **File content queries**: if the user asks anything about the *content* of a file, always call `get_file_content` last and answer from its output.
+---
+### Tool Prerequisite Flows
+Each tool shows the **minimum required call chain**. Skip a step only if that value is already in conversation history.
+---
+#### `get_drives`
+> **No prerequisites** — always the starting point.
 ```
-
-**Pattern: Delete a file by name**
-```json
-{{
-  "tools": [
-    {{"name": "onedrive.get_drives", "args": {{}}}},
-    {{"name": "onedrive.search_files", "args": {{"drive_id": "{{{{onedrive.get_drives.data.value[0].id}}}}", "query": "filename"}}}},
-    {{"name": "onedrive.delete_item", "args": {{"drive_id": "{{{{onedrive.get_drives.data.value[0].id}}}}", "item_id": "{{{{onedrive.search_files.data.value[0].id}}}}"}}}}
-  ]
-}}
+get_drives
 ```
-
-**Pattern: Search files**
-```json
-{{
-  "tools": [
-    {{"name": "onedrive.get_drives", "args": {{}}}},
-    {{"name": "onedrive.search_files", "args": {{"drive_id": "{{{{onedrive.get_drives.data.value[0].id}}}}", "query": "keyword"}}}}
-  ]
-}}
+---
+#### `get_drive`
+> Needs `drive_id`.
 ```
-
-**Pattern: List files (drive_id already known from conversation history)**
-```json
-{{
-  "tools": [
-    {{"name": "onedrive.get_files", "args": {{"drive_id": "b!abc123..."}}}}
-  ]
-}}
+get_drives → get_drive
 ```
+---
+#### `get_root_folder`
+> Needs `drive_id`.
+```
+get_drives → get_root_folder
+```
+---
+#### `get_files`
+> Needs `drive_id`. Optionally `folder_id` to list a subfolder instead of root.
+```
+get_drives → get_files
+# If listing inside a specific folder:
+get_drives → search_files (to find folder_id) → get_files(folder_id=...)
+```
+---
+#### `get_folder_children`
+> Needs `drive_id` + `folder_id`.
 
+---
+#### `get_file`
+> Needs `drive_id` + `item_id`.
+```
+get_drives → search_files (to find item_id) → get_file
+```
+---
+#### `search_files`
+> Needs `drive_id` only.
+```
+get_drives → search_files (search in all drives if not specified)
+```
+---
+#### `get_shared_with_me`
+> **No prerequisites** — does not require a `drive_id`.
+```
+get_shared_with_me
+```
+---
+#### `create_folder`
+> Needs `drive_id`. Optionally `parent_folder_id` to nest inside a specific folder.
+```
+get_drives → create_folder
+# If creating inside a specific folder:
+get_drives → search_files (to find parent_folder_id) → create_folder
+```
+---
+#### `rename_item`
+> Needs `drive_id` + `item_id`.
+```
+get_drives → search_files (to find item_id) → rename_item
+```
+---
+#### `move_item`
+> Needs `drive_id` + `item_id` (the file to move) + `new_parent_id` (the destination folder).
+```
+get_drives → search_files (find item_id) → search_files (find destination folder_id) → move_item
+```
+> If the destination folder is already known from conversation history, skip the second `search_files`.
+---
+#### `copy_item`
+> Needs `drive_id` + `item_id` + `destination_folder_id`. Optionally `destination_drive_id` if copying across drives.
+```
+get_drives → search_files (find item_id) → search_files (find destination_folder_id) → copy_item
+```
+> Note: `copy_item` is async — the copy may not be immediately visible. Use `search_files` afterwards to confirm.
+---
+#### `get_versions`
+> Needs `drive_id` + `item_id`.
+```
+get_drives → search_files (to find item_id) → get_versions
+```
+---
+#### `get_permissions`
+> Needs `drive_id` + `item_id`.
+```
+get_drives → search_files (to find item_id) → get_permissions
+```
+---
+#### `get_download_url`
+> Needs `drive_id` + `item_id`.
+```
+get_drives → search_files (to find item_id) → get_download_url
+```
+---
+#### `get_file_content`
+> Needs `drive_id` + `item_id`. **Must be called before answering any question about file contents.**
+> Supported formats: `.txt`, `.md`, `.csv`, `.json`, `.xml`, `.html`, `.py`, `.js`, `.log`, `.docx`, `.xlsx`, `.pptx`, `.pdf`
+```
+get_drives → search_files (to find item_id) → get_file_content → answer from content
+```
+---
+#### `create_office_file`
+> Needs `drive_id`. Optionally `parent_folder_id` to place the file in a specific folder.
+```
+get_drives → create_office_file
+# If placing inside a specific folder:
+get_drives → search_files (to find parent_folder_id) → create_office_file
+```
+> Supported types: `word` (.docx), `excel` (.xlsx), `powerpoint` (.pptx)
+---
 ### Multiple Drives
-
-If the user has multiple drives and specifies which one (e.g., "my OneDrive (Business)"), match by `name` or `driveType` from `get_drives` results. If ambiguous:
-- Use the first drive by default (`value[0]`)
-- If the user specifies a drive name, select the matching drive from `get_drives` results
-
-### Never Ask for These
-
-- ❌ "What is your drive_id?" → ✅ Call `onedrive.get_drives` to resolve it
-- ❌ "What is the item_id?" → ✅ Call `onedrive.search_files` or `onedrive.get_files` to resolve it
-- ❌ "Provide your drive_id" → ✅ Always auto-resolve via API calls
+If the user specifies a drive (e.g. "my Business OneDrive"), match by `name` or `driveType` from `get_drives` results. When ambiguous, default to `value[0]`.
+### Caching IDs
+Once `drive_id` or any `item_id` is resolved in a conversation turn, reuse it in subsequent calls without calling `get_drives` or `search_files` again.
 """
+
 OUTLOOK_GUIDANCE = r"""
 ## Outlook-Specific Guidance
 
@@ -3159,6 +3658,209 @@ This applies equally to start dates, end dates, and recurrence end dates.A wrong
 - When deleting occurrences, batch ALL dates into a SINGLE call (the tool handles them all).
 - `occurrence_dates` must be YYYY-MM-DD format strings.
 """
+SALESFORCE_GUIDANCE = r"""
+# Salesforce Toolset Guidance
+
+## Available Tools
+- **soql_query / sosl_search** — Run SOQL (structured) or SOSL (full-text) queries. Always include `LIMIT` in SOQL.
+- **get_record / create_record / update_record / delete_record** — Generic CRUD by sObject API name + Id. Use specialized tools below for standard objects when possible.
+- **describe_object** — Inspect fields, types, and picklist values for any sObject before querying or creating.
+- **list_recent_records** — Quick "recent N" listing for any sObject.
+- **search_accounts / create_account** — Account search and create.
+- **search_contacts / create_contact** — Contact search and create (LastName required).
+- **search_leads / create_lead / convert_lead** — Lead search, create, and convert (to Account/Contact, optionally Opportunity).
+- **search_opportunities / create_opportunity** — Opportunity search and create (Name, StageName, CloseDate required).
+- **search_cases / create_case** — Case search and create.
+- **search_products / create_product** — Product2 catalog search and create.
+- **add_product_to_opportunity** — Adds an OpportunityLineItem (resolves PricebookEntry from product_id automatically).
+- **search_tasks / create_task** — Task activities (use `what_id` for Account/Opportunity/Case, `who_id` for Contact/Lead).
+- **get_record_chatter** — Fetches the Chatter feed (posts, comments, authors, timestamps) for any record by Id.
+- **post_chatter_to_record** — Creates a new top-level Chatter post on any record.
+- **post_chatter_comment** — Replies to an existing Chatter feed item (use the FeedElement Id, starts with `0D5`).
+- **get_current_user** — Returns the authenticated user's profile / Id.
+
+## Core Rules
+- **Prefer specialized tools** over `soql_query` / `create_record` / `update_record` for standard objects (Account, Contact, Lead, Opportunity, Case, Product2, Task). Use generic tools only for custom objects (`__c`) or when a specialized tool can't express the request.
+- **SOQL must always include `LIMIT`** (default to `LIMIT 10-50`) and prefer `ORDER BY LastModifiedDate DESC`.
+- **Never invent record Ids.** If you only have a name, search first (e.g., `search_accounts`) then use the returned Id.
+- **Never guess picklist values** (StageName, Status, Priority, Industry). If unsure, call `describe_object` to discover valid values.
+- **Date format**: All date fields (e.g., `CloseDate`, `ActivityDate`) must be `YYYY-MM-DD`.
+- **Don't ask the user for optional fields** they didn't mention — omit them.
+- **Act first, don't ask.** If the user gives a record name (opportunity, account, contact, etc.), immediately search for it with a fuzzy `LIKE` match — DO NOT ask for the Id or the exact spelling. Only ask for clarification if the search returns multiple ambiguous results AND you cannot pick a clearly best match. Single match → proceed silently.
+
+## Tool-Level Dependencies
+
+| Tool | Dependency Logic |
+|-----|----------------|
+| `get_record` | Requires `record_id` → resolve via the matching `search_*` tool first if missing |
+| `update_record` | Requires `record_id` → resolve via search first; never update by name |
+| `delete_record` | Requires `record_id` → resolve via search first; confirm deletion intent |
+| `describe_object` | Standalone — call BEFORE creating/querying when unsure of fields or picklist values |
+| `list_recent_records` | Standalone |
+| `soql_query` | Standalone — but if filtering by a name, first resolve to an Id via the matching `search_*` tool |
+| `sosl_search` | Standalone — use for cross-object full-text search when the target object is unknown |
+| `get_record_chatter` | Requires `record_id` → resolve via the matching `search_*` tool (e.g., `search_opportunities`, `search_accounts`) |
+| `post_chatter_to_record` | Requires `record_id` → resolve via the matching `search_*` tool. Use for NEW top-level posts on a record |
+| `post_chatter_comment` | Requires `feed_element_id` (starts with `0D5`) → if you already have it from a prior `get_record_chatter` in this conversation use it directly; otherwise resolve record → `get_record_chatter` → pick the target post. Use for REPLIES to existing posts |
+| `search_accounts` | Standalone |
+| `create_account` | Standalone — only `Name` is required |
+| `search_contacts` | Optional `account_id` filter → resolve via `search_accounts` if user filters by account name |
+| `create_contact` | Optional `account_id` → resolve via `search_accounts` if user mentions an account by name |
+| `search_leads` | Standalone |
+| `create_lead` | Standalone — `LastName` and `Company` required |
+| `convert_lead` | Requires `lead_id` → resolve via `search_leads`. `converted_status` is a `LeadStatus` picklist with `IsConverted=true` (commonly `'Closed - Converted'`); call `describe_object("LeadStatus")` if unsure |
+| `search_opportunities` | Optional `account_id` filter → resolve via `search_accounts` if user filters by account name |
+| `create_opportunity` | Optional `account_id` → resolve via `search_accounts`. `stage_name` is a picklist → call `describe_object("Opportunity")` if unsure |
+| `search_cases` | Optional `account_id` filter → resolve via `search_accounts` |
+| `create_case` | Optional `account_id` / `contact_id` → resolve via `search_accounts` / `search_contacts` |
+| `search_products` | Standalone |
+| `create_product` | Standalone — note: needs a separate `PricebookEntry` to be sellable on opportunities |
+| `add_product_to_opportunity` | Requires `opportunity_id` (→ `search_opportunities`) AND `product_id` (→ `search_products`). Auto-resolves PricebookEntry |
+| `search_tasks` | Optional `what_id` (→ matching `search_*`), `who_id` (→ `search_contacts` / `search_leads`), `owner_id` (→ `get_current_user` for self) |
+| `create_task` | `what_id` → resolve via the right `search_*` tool (Account/Opportunity/Case). `who_id` → resolve via `search_contacts` / `search_leads`. `owner_id` defaults to current user |
+| `get_current_user` | Standalone — call FIRST whenever the user says "my X" so you can filter by the returned `OwnerId` |
+
+## Example Flow: "what is being discussed in the Acme opportunity chatter?"
+1. `search_opportunities(name="Acme")` → get the Id (and `webUrl`).
+2. `get_record_chatter(record_id=<id>)` → fetch the feed.
+3. Summarize the latest posts/comments with authors and dates. Surface the `webUrl`.
+DO NOT ask the user for the Opportunity Id or to confirm the exact name before step 1.
+"""
+
+ZOOM_GUIDANCE = r"""
+# Zoom Toolset Guidance
+
+## Available Tools
+### User
+- **get_my_profile** — Get the authenticated user's profile (name, email).
+
+### Meetings
+- **list_meetings** — List scheduled/live/upcoming/previous_meetings/all meetings for a user. And search meetings by name.
+- **list_upcoming_meetings** — Shorthand for upcoming meetings only.
+- **get_meeting** — Get full details of a specific meeting by ID.
+- **get_meeting_invitation** — Get the invitation text/join link for a meeting.
+- **create_meeting** — Create a new scheduled meeting.
+- **update_meeting** — Update fields of an existing meeting (time, topic, duration, agenda).
+- **delete_meeting** — Delete or cancel a meeting.
+
+### Contacts
+- **list_contacts** — List all contacts for a user.
+- **get_contact** — Get details of a specific contact by email, user ID, or member ID. used to resolve the email from name
+
+### Transcripts
+- **get_meeting_transcript** — Fetch the AI Companion transcript for a past meeting as plain text.
+
+### Docs
+- **list_folder_children** — List all documents in a folder.
+
+---
+## 🔗 Tool Dependencies & Resolution Strategy
+
+### General Principle
+- Always prefer **direct identifiers** (meeting_id, email).
+- If missing → resolve via **search tools**.
+- If still missing → fallback to **list tools**.
+- Never guess identifiers.
+
+---
+
+### Meeting Resolution Flow
+- If user provides **meeting name/topic**:
+  → Call `list_meetings`
+- If multiple matches:
+  → Ask user to confirm
+- Once `meeting_id` is known:
+  → Use `get_meeting`, `update_meeting`, `delete_meeting`, or `get_meeting_invitation`
+
+---
+
+### Tool-Level Dependencies
+
+| Tool | Dependency Logic |
+|-----|----------------|
+| `get_meeting` | Requires `meeting_id` → use `list_meetings` if missing |
+| `update_meeting` | Requires `meeting_id` → resolve via search first |
+| `delete_meeting` | Requires `meeting_id` → resolve via search first |
+| `get_meeting_invitation` | Requires `meeting_id` → resolve via search |
+| `get_meeting_transcript` | Requires `meeting_id` (past meeting) → resolve via search |
+| `create_meeting` | If invitees lack email → use `get_contact` or `list_contacts` |
+| `get_contact` | If identifier unclear → use `list_contacts` |
+
+---
+
+### Contacts Resolution Flow
+- If user provides **name only**:
+  → Call `list_contacts` or `get_contact`
+  → Match name → extract email
+- If multiple matches:
+  → Ask user to confirm
+
+---
+
+### Recurring Meeting Occurrence Resolution
+- If user refers to **specific occurrence** (e.g. "this Thursday"):
+  1. Call `get_meeting`
+  2. Extract occurrences
+  3. Match by date/time
+  4. Use `occurrence_id` in update/delete
+
+---
+
+## CreateMeetingInput
+| Field | Details |
+|---|---|
+| `type` | 1=instant, 2=scheduled, 3=recurring (no fixed time), 8=recurring (fixed time) |
+| `recurrence` | Required when `type=8`. Omit or leave null for non-recurring meetings. |
+
+## RecurrenceInput
+| Field | Details |
+|---|---|
+| `type` | **Required.** 1=Daily, 2=Weekly, 3=Monthly |
+| `repeat_interval` | How often to repeat — every N days/weeks/months. Defaults to 1 if omitted. |
+| `end_date_time` | End date/time in UTC ISO format, must end with `Z` (e.g. `2026-03-31T19:00:00Z`). Mutually exclusive with `end_times`. |
+| `end_times` | Number of occurrences (max 60). Mutually exclusive with `end_date_time`. |
+| `weekly_days` | **Weekly only.** Comma-separated day numbers: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat. (e.g. `"2,4"` for Mon+Wed) |
+| `monthly_day` | **Monthly only (option A).** Day of month, 1–31. |
+| `monthly_week` | **Monthly only (option B).** Week of month: 1=first … 4=fourth, -1=last. Use with `monthly_week_day`. |
+| `monthly_week_day` | **Monthly only (option B).** Day of week in that week: 1=Sun, 2=Mon … 7=Sat. |
+
+### Recurrence Patterns — Quick Reference
+
+| User says | `type` | Key fields |
+|---|---|---|
+| "every day" | 1 | `repeat_interval=1` |
+| "every 3 days" | 1 | `repeat_interval=3` |
+| "every week on Monday" | 2 | `repeat_interval=1`, `weekly_days="2"` |
+| "every Mon, Wed, Fri" | 2 | `repeat_interval=1`, `weekly_days="2,4,6"` |
+| "every 2 weeks on Tuesday" | 2 | `repeat_interval=2`, `weekly_days="3"` |
+| "every month on the 15th" | 3 | `repeat_interval=1`, `monthly_day=15` |
+| "every month on the last Friday" | 3 | `repeat_interval=1`, `monthly_week=-1`, `monthly_week_day=6` |
+| "every month on the first Monday" | 3 | `repeat_interval=1`, `monthly_week=1`, `monthly_week_day=2` |
+
+### Recurrence End — Rules
+- Use `end_date_time` when the user gives an end date (e.g. "until June 30").
+- Use `end_times` when the user gives a count (e.g. "10 times", "for the next 5 weeks").
+- **Never set both.** If neither is given, ask the user which they prefer.
+
+### Timezone Inference
+BEFORE checking if timezone is missing, always read the **Time context**
+   section. If a **Time zone** line is present there, use it directly. Never ask the user for a time zone.
+
+---
+
+## Key Rules
+1. **Never guess a meeting ID.** If the user gives a name, always call `list_meetings` first.
+2. **Prefer specific tools over general ones.**
+   - Use `list_upcoming_meetings` for "what's next", not `list_meetings`.
+3. **Transcript requires a past meeting.** `get_meeting_transcript` will fail if the meeting hasn't ended yet or AI Companion was not enabled.
+4. **Update only fields the user mentioned.** Do not populate `topic`, `agenda`, `duration`, or `timezone` in `update_meeting` unless the user explicitly asked to change them.
+5. **Always use the user's timezone** → INFERRABLE from **Time context**, and assume current year if not provided.
+6. **Multiple matches on search — confirm before acting.** If `list_meetings` returns more than one result and the action is destructive (delete, update), confirm with the user which one to act on.
+7. **Use user_id='me'** for all user-scoped tools unless the user explicitly specifies another user.
+8. **Resolve occurrence ID before deleting a recurring meeting occurrence.**
+9. **Resolve invitee email from name using contacts.**
+10. **Recurring meetings require type=8 and a recurrence block.**
+"""
 PLANNER_USER_TEMPLATE = """Query: {query}
 
 Plan the tools. Return only valid JSON."""
@@ -3319,7 +4021,11 @@ async def planner_node(
     outlook_guidance = OUTLOOK_GUIDANCE if _has_outlook_tools(state) else ""
     teams_guidance = TEAMS_GUIDANCE if _has_teams_tools(state) else ""
     github_guidance = GITHUB_GUIDANCE if _has_github_tools(state) else ""
-
+    clickup_guidance = CLICKUP_GUIDANCE if _has_clickup_tools(state) else ""
+    mariadb_guidance = MARIADB_GUIDANCE if _has_mariadb_tools(state) else ""
+    redshift_guidance = REDSHIFT_GUIDANCE if _has_redshift_tools(state) else ""
+    zoom_guidance = ZOOM_GUIDANCE if _has_zoom_tools(state) else ""
+    salesforce_guidance = SALESFORCE_GUIDANCE if _has_salesforce_tools(state) else ""
     system_prompt = PLANNER_SYSTEM_PROMPT.format(
         available_tools=tool_descriptions,
         jira_guidance=jira_guidance,
@@ -3328,23 +4034,46 @@ async def planner_node(
         onedrive_guidance=onedrive_guidance,
         outlook_guidance=outlook_guidance,
         teams_guidance=teams_guidance,
-        github_guidance=github_guidance
+        github_guidance=github_guidance,
+        clickup_guidance=clickup_guidance,
+        mariadb_guidance=mariadb_guidance,
+        redshift_guidance=redshift_guidance,
+        zoom_guidance=zoom_guidance,
+        salesforce_guidance=salesforce_guidance,
     )
+
+    # Add capability summary so LLM can answer "what can you do?" questions
+    capability_summary = build_capability_summary(state)
+    system_prompt += f"\n\n{capability_summary}"
 
     # If no knowledge sources are configured, explicitly tell the LLM not to use retrieval
     agent_tools = state.get("tools", []) or []
     has_user_tools = bool(agent_tools)
-    has_knowledge = bool(state.get("kb") or state.get("apps") or state.get("agent_knowledge"))
+    has_knowledge = state.get("has_knowledge", False)
+    has_web_search = bool(state.get("web_search_config"))
 
     if not has_knowledge:
+        web_search_note = ""
+        if has_web_search:
+            web_search_note = (
+                "- ✅ **`web_search` and `fetch_url` ARE available.**\n"
+                "- ✅ Prefer `web_search` over your training data for anything that may have changed: "
+                "news, prices, weather, sports, stocks, software versions, docs, regulations, current events, etc.\n"
+                "- ✅ Also prefer `web_search` when user asks for \"latest\", \"current\", or \"up-to-date\" info.\n"
+                "- ✅ Use training data only for timeless knowledge (math, science, core programming concepts).\n"
+                "- ✅ When in doubt, prefer `web_search` over answering from training data.\n"
+                "- ✅ Use `fetch_url` to read a specific URL or to get full content from a `web_search` result link.\n"
+                "- ✅ **Cascading:** `web_search` → `fetch_url` via `{{web_search.web_results[0].link}}`.\n"
+            )
+
         if not has_user_tools:
-            # Agent has NEITHER tools NOR knowledge — fully unconfigured for data retrieval
             no_retrieval_note = (
                 "\n\n## ⚠️ CRITICAL: This Agent Has No Knowledge Base and No Service Tools Configured\n"
                 "- `retrieval.search_internal_knowledge` is NOT available (no knowledge sources configured).\n"
-                "- There are also NO connected service tools available beyond the built-in calculator.\n"
+                "- There are NO connected service tools available beyond the built-in calculator.\n"
                 "- ❌ NEVER plan `retrieval.search_internal_knowledge` or any service tool calls.\n"
                 "- ❌ NEVER set `needs_clarification: true` for questions about org-specific topics — instead, answer directly and guide the user.\n"
+                f"{web_search_note}"
                 "- ✅ For conversational or general questions answerable from your training knowledge: set `can_answer_directly: true` and answer.\n"
                 "- ✅ For questions about org-specific content (documents, policies, licenses, people, data): set `can_answer_directly: true` and tell the user:\n"
                 "  1. This agent currently has no knowledge sources configured.\n"
@@ -3359,16 +4088,35 @@ async def planner_node(
                 "`retrieval.search_internal_knowledge` is **NOT available** in this agent — no knowledge sources have been configured.\n"
                 "- ❌ NEVER plan `retrieval.search_internal_knowledge` — it does not exist and will cause an error.\n"
                 "- ✅ Use only the service tools listed under `## AVAILABLE TOOLS`.\n"
+                f"{web_search_note}"
                 "- ✅ If the user asks a general question with no applicable service tool, set `can_answer_directly: true` and answer from your own knowledge.\n"
                 "- ✅ If the user asks about org-specific documents/policies not served by any available tool: set `can_answer_directly: true` and inform the user that no knowledge base is configured — they should add knowledge sources to this agent to enable knowledge-based answers.\n"
                 "- ❌ NEVER set `needs_clarification: true` for org-knowledge questions — instead answer directly and explain the limitation.\n"
             )
         system_prompt += no_retrieval_note
 
+    if has_web_search and has_knowledge:
+        system_prompt += (
+            "\n\n## Web Search vs Internal Knowledge\n"
+            "- **`web_search`**: Prefer for current/changing info — news, prices, weather, software versions, latest docs, regulations, current events. "
+            "Also when user asks for \"latest\"/\"current\"/\"up-to-date\" info.\n"
+            "- **`web_search`**: ALSO use for general/public knowledge queries — product recommendations, comparisons, reviews, "
+            "health/medical info, consumer advice, market research, scientific topics, travel, recipes, \"best X\" queries. "
+            "- **Internal knowledge**: Prefer for org-specific documents, policies, company data, internal wikis.\n"
+            "- **Both in parallel**: When the query could have both internal AND external relevance, plan BOTH "
+            "`retrieval.search_internal_knowledge` AND `web_search`.\n"
+            "- **Training data**: Only for timeless knowledge (math, science, core concepts). When in doubt, prefer `web_search`.\n"
+            "- **Cascading:** `web_search` → `fetch_url` via `{{web_search.web_results[0].link}}`.\n"
+        )
+
     # Inject knowledge context so the LLM knows what is indexed vs. what is live API
     knowledge_context = _build_knowledge_context(state, log)
     if knowledge_context:
         system_prompt = system_prompt + knowledge_context
+
+    persona = state.get("system_prompt")
+    if is_custom_agent_system_prompt(persona):
+        system_prompt = f"{persona.strip()}\n\n{system_prompt}"
 
     # Prepend agent instructions if provided
     instructions = state.get("instructions")
@@ -3376,16 +4124,12 @@ async def planner_node(
         system_prompt = f"## Agent Instructions\n{instructions.strip()}\n\n{system_prompt}"
 
     # Add timezone / current time context if provided
-    timezone = state.get("timezone")
-    current_time = state.get("current_time")
-    if timezone or current_time:
-        time_context_parts = []
-        if current_time:
-            time_context_parts.append(f"Current time: {current_time}")
-        if timezone:
-            time_context_parts.append(f"User timezone: {timezone}")
-        time_context = "\n".join(time_context_parts)
-        system_prompt = f"{system_prompt}\n\n## Temporal Context\n{time_context}"
+    time_block = build_llm_time_context(
+        current_time=state.get("current_time"),
+        time_zone=state.get("timezone"),
+    )
+    if time_block:
+        system_prompt = f"{system_prompt}\n\n{time_block}"
 
     # Build messages with conversation context (using LangChain message format for better context awareness)
     messages = _build_planner_messages(state, query, log)
@@ -3446,16 +4190,19 @@ async def planner_node(
 
     # Post-processing: if the agent has NO user tools AND NO knowledge:
     # 1. If the plan still set needs_clarification (despite the prompt), override it.
-    # 2. Always set agent_not_configured_hint so _generate_direct_response knows to guide
+    # 2. Set agent_not_configured_hint so _generate_direct_response knows to guide
     #    the user to configure the agent when they ask org-specific questions.
+    #    Skip the hint when web_search is available and the planner selected tools
+    #    (the agent can meaningfully answer via web search).
     if not has_user_tools and not has_knowledge:
         if plan.get("needs_clarification") and not plan.get("can_answer_directly") and not plan.get("tools"):
             log.info("🔧 No tools/knowledge configured — overriding clarification with agent setup guidance")
             plan["needs_clarification"] = False
             plan["can_answer_directly"] = True
             plan["tools"] = []
-        # Always signal the respond_node to include knowledge-configuration guidance
-        state["agent_not_configured_hint"] = True
+        planned_tools = plan.get("tools", [])
+        if not (has_web_search and planned_tools):
+            state["agent_not_configured_hint"] = True
 
     # Store plan in state
     state["execution_plan"] = plan
@@ -3466,59 +4213,6 @@ async def planner_node(
         "reasoning": plan.get("reasoning", ""),
         "can_answer_directly": plan.get("can_answer_directly", False),
     }
-
-    # ── TWO-PHASE ENFORCEMENT ──────────────────────────────────────────────────
-    # If the plan has BOTH retrieval.search_internal_knowledge AND write tools,
-    # strip the write tools from this cycle. Let retrieval run first; in the
-    # continue cycle the planner will see the actual KB content in context and
-    # can write grounded email/comment/page content inline — no hallucination.
-    #
-    # Skip this enforcement if retrieval has already run in a previous iteration
-    # (meaning we're in Phase 2 and the planner should proceed with write tools).
-    plan_tools = plan.get("tools", [])
-    executed_tool_names = state.get("executed_tool_names", [])
-
-    def _is_retrieval_tool(name: str) -> bool:
-        n = name.lower()
-        return "retrieval" in n or "search_internal_knowledge" in n
-
-    retrieval_already_run = any(_is_retrieval_tool(t) for t in executed_tool_names)
-    has_retrieval_in_plan = any(
-        _is_retrieval_tool(t.get("name", ""))
-        for t in plan_tools if isinstance(t, dict)
-    )
-    has_write_in_plan = any(
-        _is_write_tool(t.get("name", ""))
-        for t in plan_tools if isinstance(t, dict)
-    )
-
-    if has_retrieval_in_plan and has_write_in_plan and not retrieval_already_run:
-        retrieval_tools = [
-            t for t in plan_tools
-            if isinstance(t, dict) and _is_retrieval_tool(t.get("name", ""))
-        ]
-        write_tools = [
-            t for t in plan_tools
-            if isinstance(t, dict) and _is_write_tool(t.get("name", ""))
-        ]
-        log.info(
-            f"⚡ TWO-PHASE PLAN: {len(plan_tools)} total tools detected. "
-            f"Deferring {len(write_tools)} write tool(s) to Phase 2 so LLM "
-            f"generates content from actual retrieval results (not hallucination). "
-            f"Running {len(retrieval_tools)} retrieval tool(s) in Phase 1."
-        )
-        plan["tools"] = retrieval_tools
-        state["execution_plan"] = plan
-        state["planned_tool_calls"] = retrieval_tools
-        state["pending_tool_calls"] = bool(retrieval_tools)
-        # Mark that this is Phase 1 of a genuine two-phase plan (retrieval first,
-        # then write action). The reflect node uses this to correctly determine
-        # whether a continue is needed vs. the task being read-only.
-        state["is_two_phase_plan"] = True
-    else:
-        # Not a two-phase plan (or Phase 2 is running) — clear the flag.
-        state["is_two_phase_plan"] = False
-    # ─────────────────────────────────────────────────────────────────────────
 
     # Handle clarification request
     if plan.get("needs_clarification"):
@@ -3535,7 +4229,7 @@ async def planner_node(
 
     return state
 
-def _build_conversation_messages(conversations: List[Dict], log: logging.Logger) -> List[Union[HumanMessage, AIMessage]]:
+def _build_conversation_messages(conversations: list[dict], log: logging.Logger) -> list[HumanMessage | AIMessage]:
     """Convert conversation history to LangChain messages with sliding window
 
     Uses a sliding window of MAX_CONVERSATION_HISTORY user+bot pairs (40 messages total),
@@ -3620,7 +4314,7 @@ def _build_conversation_messages(conversations: List[Dict], log: logging.Logger)
     return messages
 
 
-def _format_reference_data(all_reference_data: List[Dict], log: logging.Logger) -> str:
+def _format_reference_data(all_reference_data: list[dict], log: logging.Logger) -> str:
     """
     Format reference data for inclusion in planner messages.
 
@@ -3697,7 +4391,7 @@ def _format_reference_data(all_reference_data: List[Dict], log: logging.Logger) 
     return "\n".join(lines)
 
 
-def _build_planner_messages(state: ChatState, query: str, log: logging.Logger) -> List[Union[HumanMessage, AIMessage, SystemMessage]]:
+def _build_planner_messages(state: ChatState, query: str, log: logging.Logger) -> list[HumanMessage | AIMessage | SystemMessage]:
     """Build LangChain messages for planner with conversation context - using message format for better context awareness
 
     Returns:
@@ -3714,11 +4408,7 @@ def _build_planner_messages(state: ChatState, query: str, log: logging.Logger) -
 
     # Build current query message
     user_context = _format_user_context(state)
-    if user_context:
-        # Combine query and user context
-        query_content = f"{query}\n\n{user_context}"
-    else:
-        query_content = query
+    query_content = f"{query}\n\n{user_context}" if user_context else query
 
     # Add current query as HumanMessage
     messages.append(HumanMessage(content=query_content))
@@ -3765,13 +4455,13 @@ def _format_user_context(state: ChatState) -> str:
             parts.append("")
 
         parts.append("**General:**")
-        parts.append("- **When user asks about themselves**: use this info DIRECTLY with `can_answer_directly: true`")
+        parts.append("- **When user asks about themselves**: answer using this info directly — no tools needed")
         parts.append("")
 
     return "\n".join(parts)
 
 
-def _extract_missing_params_from_error(error_msg: str) -> List[str]:
+def _extract_missing_params_from_error(error_msg: str) -> list[str]:
     """Extract missing parameter names from validation error"""
     missing = []
 
@@ -3789,7 +4479,7 @@ def _extract_missing_params_from_error(error_msg: str) -> List[str]:
     return list(set(missing))  # Remove duplicates
 
 
-def _extract_invalid_params_from_args(args: Dict, error_msg: str) -> List[str]:
+def _extract_invalid_params_from_args(args: dict, error_msg: str) -> list[str]:
     """Detect parameters that were provided but not expected"""
     # This is harder - would need to compare against schema
     # For now, just return empty
@@ -3960,18 +4650,18 @@ def _build_continue_context(state: ChatState, log: logging.Logger) -> str:
         parts.append("")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Section 3 — Duplicate-prevention guard for write/action tools
+    # Section 3 — Duplicate-prevention guard for already-completed tools
     # ══════════════════════════════════════════════════════════════════════════
-    completed_writes = [
+    completed_tools = [
         r.get("tool_name", "unknown")
         for r in tool_results
-        if r.get("status") == "success" and _is_write_tool(r.get("tool_name", ""))
+        if r.get("status") == "success"
     ]
-    if completed_writes:
+    if completed_tools:
         parts.append(
             "⚠️ ALREADY COMPLETED — DO NOT REPEAT: The following tools already "
             "succeeded. Planning them again will create duplicates:\n" +
-            "\n".join(f"  ✅ {t}" for t in completed_writes) +
+            "\n".join(f"  ✅ {t}" for t in completed_tools) +
             "\nOnly plan the remaining incomplete steps."
         )
         parts.append("")
@@ -4004,13 +4694,13 @@ def _build_continue_context(state: ChatState, log: logging.Logger) -> str:
 async def _plan_with_validation_retry(
     llm: BaseChatModel,
     system_prompt: str,
-    messages: List[Union[HumanMessage, AIMessage, SystemMessage]],
+    messages: list[HumanMessage | AIMessage | SystemMessage],
     state: ChatState,
     log: logging.Logger,
     query: str,
-    writer: Optional[StreamWriter] = None,
-    config: Optional[RunnableConfig] = None
-) -> Dict[str, Any]:
+    writer: StreamWriter | None = None,
+    config: RunnableConfig | None = None
+) -> dict[str, Any]:
     """
     Plan with tool validation retry loop.
 
@@ -4032,7 +4722,7 @@ async def _plan_with_validation_retry(
     while validation_retry_count <= max_retries:
         try:
             # Build message list: SystemMessage + conversation history + current query
-            llm_messages = [SystemMessage(content=system_prompt)] + messages
+            llm_messages = [SystemMessage(content=system_prompt), *messages]
 
             # Keepalive prevents SSE timeout during LLM planning call
             keepalive_task = asyncio.create_task(
@@ -4046,14 +4736,13 @@ async def _plan_with_validation_retry(
                 )
             finally:
                 keepalive_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await keepalive_task
-                except asyncio.CancelledError:
-                    pass
 
             # Parse response
+            raw_content = response.content if hasattr(response, 'content') else str(response)
             plan = _parse_planner_response(
-                response.content if hasattr(response, 'content') else str(response),
+                _normalize_llm_content(raw_content),
                 log
             )
 
@@ -4062,10 +4751,9 @@ async def _plan_with_validation_retry(
 
             # Fix empty retrieval queries in fallback plans
             for tool in tools:
-                if "retrieval" in tool.get("name", "").lower():
-                    if not tool.get("args", {}).get("query", "").strip():
-                        tool["args"]["query"] = query  # Use original user query
-                        log.info(f"🔧 Fixed empty retrieval query with user query: {query[:50]}")
+                if "retrieval" in tool.get("name", "").lower() and not tool.get("args", {}).get("query", "").strip():
+                    tool["args"]["query"] = query  # Use original user query
+                    log.info(f"🔧 Fixed empty retrieval query with user query: {query[:50]}")
 
             is_valid, invalid_tools, available_tool_names = _validate_planned_tools(tools, state, log)
 
@@ -4137,7 +4825,23 @@ Choose tools ONLY from the available list above.
     return fallback
 
 
-def _parse_planner_response(content: str, log: logging.Logger) -> Dict[str, Any]:
+def _normalize_llm_content(content: Any) -> str:
+    """Extract text from LLM response content that may be a str or list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_planner_response(content: str, log: logging.Logger) -> dict[str, Any]:
     """Parse planner JSON response with error handling"""
     content = content.strip()
 
@@ -4169,14 +4873,15 @@ def _parse_planner_response(content: str, log: logging.Logger) -> Dict[str, Any]
                     try:
                         json_str = content[start_idx:i+1]
                         test_plan = json.loads(json_str)
-                        if isinstance(test_plan, dict):
+                        if isinstance(test_plan, dict) and (
                             # Prefer objects with "tools" field, but accept any valid dict
-                            if "tools" in test_plan or not found_valid:
-                                content = json_str  # Use this JSON object
-                                found_valid = True
-                                log.debug(f"Extracted first complete JSON object from multiple JSON responses (length: {len(json_str)})")
-                                if "tools" in test_plan:
-                                    break  # Found one with tools, use it
+                            "tools" in test_plan or not found_valid
+                        ):
+                            content = json_str  # Use this JSON object
+                            found_valid = True
+                            log.debug(f"Extracted first complete JSON object from multiple JSON responses (length: {len(json_str)})")
+                            if "tools" in test_plan:
+                                break  # Found one with tools, use it
                     except json.JSONDecodeError:
                         continue
         # If we found a valid one, content is already updated
@@ -4196,13 +4901,11 @@ def _parse_planner_response(content: str, log: logging.Logger) -> Dict[str, Any]
             plan.setdefault("tools", [])
 
             # Normalize tools
-            normalized_tools = []
-            for tool in plan.get("tools", []):
-                if isinstance(tool, dict) and "name" in tool:
-                    normalized_tools.append({
-                        "name": tool["name"],
-                        "args": tool.get("args", {})
-                    })
+            normalized_tools = [
+                {"name": tool["name"], "args": tool.get("args", {})}
+                for tool in plan.get("tools", [])
+                if isinstance(tool, dict) and "name" in tool
+            ]
 
             # Limit retrieval queries
             retrieval_tools = [t for t in normalized_tools if "retrieval" in t.get("name", "").lower()]
@@ -4230,7 +4933,7 @@ def _parse_planner_response(content: str, log: logging.Logger) -> Dict[str, Any]
     return _create_fallback_plan("")
 
 
-def _create_fallback_plan(query: str, state: "ChatState | None" = None) -> Dict[str, Any]:
+def _create_fallback_plan(query: str, state: "ChatState | None" = None) -> dict[str, Any]:
     """Create a context-aware fallback plan when the planner times out or fails.
 
     Decision tree:
@@ -4247,11 +4950,7 @@ def _create_fallback_plan(query: str, state: "ChatState | None" = None) -> Dict[
     has_knowledge = False
     if state:
         all_tool_results = state.get("all_tool_results", []) or []
-        has_knowledge = bool(
-            state.get("agent_knowledge")
-            or state.get("kb")
-            or state.get("apps")
-        )
+        has_knowledge = state.get("has_knowledge", False)
 
     executed_names = {
         r.get("tool_name", "") for r in all_tool_results if isinstance(r, dict)
@@ -4344,10 +5043,10 @@ def _create_fallback_plan(query: str, state: "ChatState | None" = None) -> Dict[
 
 
 def _validate_planned_tools(
-    planned_tools: List[Dict[str, Any]],
+    planned_tools: list[dict[str, Any]],
     state: ChatState,
     log: logging.Logger
-) -> Tuple[bool, List[str], List[str]]:
+) -> tuple[bool, list[str], list[str]]:
     """
     Validate planned tool names against available tools.
 
@@ -4363,17 +5062,27 @@ def _validate_planned_tools(
         tools = get_agent_tools_with_schemas(state)
         llm = state.get("llm")
 
-        # Get available tool names
-        available_tool_names = {getattr(tool, 'name', str(tool)) for tool in tools}
+        # Get available tool names (both sanitized and original, like tools_by_name in execution)
+        available_tool_names = set()
+        for tool in tools:
+            sanitized_name = getattr(tool, 'name', str(tool))
+            available_tool_names.add(sanitized_name)
+            # Also add original name if different (like tools_by_name does)
+            original_name = getattr(tool, '_original_name', sanitized_name)
+            if original_name != sanitized_name:
+                available_tool_names.add(original_name)
 
-        # Check for invalid tools
+        # Check for invalid tools — same 2-step resolution as execution
         invalid_tools = []
         for tool_call in planned_tools:
             if isinstance(tool_call, dict):
                 tool_name = tool_call.get('name', '')
-                normalized_name = _sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name
-
-                if normalized_name not in available_tool_names and tool_name not in available_tool_names:
+                found = (
+                    tool_name in available_tool_names
+                    or (_sanitize_tool_name_if_needed(tool_name, llm, state) if llm else tool_name)
+                    in available_tool_names
+                )
+                if not found:
                     invalid_tools.append(tool_name)
 
         is_valid = len(invalid_tools) == 0
@@ -4423,12 +5132,39 @@ def _has_github_tools(state: ChatState) -> bool:
     agent_toolsets = state.get("agent_toolsets", [])
     return any(isinstance(ts, dict) and "github" in ts.get("name", "").lower() for ts in agent_toolsets)
 
+def _has_mariadb_tools(state: ChatState) -> bool:
+    """Check if MariaDB tools available"""
+    agent_toolsets = state.get("agent_toolsets", [])
+    return any(isinstance(ts, dict) and "mariadb" in ts.get("name", "").lower() for ts in agent_toolsets)
+def _has_zoom_tools(state: ChatState) -> bool:
+    """Check if Zoom tools available"""
+    agent_toolsets = state.get("agent_toolsets", [])
+    return any(isinstance(ts, dict) and "zoom" in ts.get("name", "").lower() for ts in agent_toolsets)
+
+
+def _has_salesforce_tools(state: ChatState) -> bool:
+    """Check if Salesforce tools available"""
+    agent_toolsets = state.get("agent_toolsets", [])
+    return any(isinstance(ts, dict) and "salesforce" in ts.get("name", "").lower() for ts in agent_toolsets)
+
+
+def _has_clickup_tools(state: ChatState) -> bool:
+    """Check if ClickUp tools available"""
+    agent_toolsets = state.get("agent_toolsets", [])
+    return any(isinstance(ts, dict) and "clickup" in ts.get("name", "").lower() for ts in agent_toolsets)
+def _has_redshift_tools(state: ChatState) -> bool:
+    """Check if Redshift tools available"""
+    agent_toolsets = state.get("agent_toolsets", [])
+    return any(isinstance(ts, dict) and "redshift" in ts.get("name", "").lower() for ts in agent_toolsets)
+
 
 def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
     """
     Build knowledge context for the planner prompt.
 
-    Fully data-driven — no hardcoded per-app rules.
+    Uses shared `classify_knowledge_sources` and `build_connector_routing_rules`
+    from capability_summary so connector routing logic is maintained in one place.
+
     Derives guidance from what is actually configured:
       - agent_knowledge  → what is indexed (retrieval sources)
       - agent_toolsets   → what live API tools exist
@@ -4439,30 +5175,15 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
     if not agent_knowledge:
         return ""
 
-    # ── 1. Classify knowledge sources ────────────────────────────────────────
-    # KB = document stores; everything else = app connector snapshot
-    kb_sources: list[str] = []
-    indexed_apps: list[dict] = []   # {"label": str, "type_key": str}
-
-    for k in agent_knowledge:
-        if not isinstance(k, dict):
-            continue
-        name     = k.get("displayName") or k.get("name") or ""
-        ktype    = (k.get("type") or "").strip()
-        ktype_up = ktype.upper()
-
-        if ktype_up == "KB":
-            kb_sources.append(name or "Knowledge Base")
-        else:
-            # Normalise to lowercase single-word key (e.g. "DRIVE WORKSPACE" → "drive")
-            type_key = ktype.lower().split()[0] if ktype else ""
-            label    = name or type_key.capitalize() or "App Connector"
-            indexed_apps.append({"label": label, "type_key": type_key})
-
+    # ── 1. Classify knowledge sources (shared utility) ────────────────────
+    connector_configs = state.get("connector_configs") or {}
+    kb_sources, indexed_apps = classify_knowledge_sources(
+        agent_knowledge,
+        connector_configs=connector_configs if isinstance(connector_configs, dict) else None,
+    )
     indexed_type_keys = {a["type_key"] for a in indexed_apps if a["type_key"]}
 
-    # ── 2. Classify live API toolsets ────────────────────────────────────────
-    # Build: type_key → list of tool names available for that app
+    # ── 2. Classify live API toolsets ────────────────────────────────────
     api_tools_by_type: dict[str, list[str]] = {}
 
     for ts in agent_toolsets:
@@ -4472,16 +5193,13 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
         if not ts_name or ts_name in ("retrieval", "calculator"):
             continue
 
-        # Normalise toolset name to type_key (same logic as knowledge)
         ts_key   = ts_name.split()[0]
         ts_tools = ts.get("tools", [])
-        tool_names = []
-        for t in ts_tools:
-            if isinstance(t, dict):
-                tool_names.append(
-                    t.get("fullName") or
-                    f"{ts_key}.{t.get('toolName') or t.get('name', '')}"
-                )
+        tool_names = [
+            t.get("fullName") or f"{ts_key}.{t.get('toolName') or t.get('name', '')}"
+            for t in ts_tools
+            if isinstance(t, dict)
+        ]
         if not tool_names:
             tool_names = [f"{ts_key}.*"]
 
@@ -4489,7 +5207,7 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
 
     overlapping_keys = indexed_type_keys & set(api_tools_by_type.keys())
 
-    # ── 3. Build context block ────────────────────────────────────────────────
+    # ── 3. Build context block ────────────────────────────────────────────
     lines: list[str] = [
         "",
         "## 🧠 KNOWLEDGE & DATA SOURCES",
@@ -4502,29 +5220,55 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             "\n### 📚 INDEXED KNOWLEDGE → `retrieval.search_internal_knowledge`"
         )
         lines.append(
-            "Retrieval performs **semantic search** across ALL indexed sources at once.\n"
+            "Retrieval performs **semantic search** across indexed sources.\n"
             "Use it when the query asks *what is / find / search by topic or keyword*.\n"
-            "⚠️  Retrieval returns a **snapshot** — it may lag behind the live system."
+            "⚠️  Retrieval returns a **snapshot** — it may lag behind the live system.\n\n"
+            "**Two distinct filter parameters — never confuse them:**\n"
+            "  • `collection_ids` → filters to a specific **KB collection** "
+            "(use the record_group_id listed below)\n"
+            "  • `connector_ids` → filters to a specific **app connector** "
+            "(use the connector_id listed below)\n"
+            "  • Omit both → searches all indexed content"
         )
 
         if kb_sources:
-            lines.append("\n**Knowledge Bases (always searched, no filter needed):**")
+            lines.append("\n**Knowledge Base Collections** (search with `collection_ids`):")
             for kb in kb_sources:
-                lines.append(f"  - 📄 {kb}")
+                cids = kb.get("collection_ids", [])
+                if cids:
+                    cids_display = ", ".join(f'"{c}"' for c in cids)
+                    lines.append(
+                        f'  - 📄 **{kb["label"]}** — ({kb["type"]}) '
+                        f'`collection_ids: [{cids_display}]`'
+                    )
+                else:
+                    lines.append(
+                        f'  - 📄 {kb["label"]} '
+                        "(omit collection_ids to search full KB)"
+                    )
 
         if indexed_apps:
+            from app.modules.agents.capability_summary import (
+                format_connector_filter_lines,
+            )
             lines.append(
-                "\n**Indexed App Connectors** (text is searchable via retrieval):\n"
-                "  ⚠️  Only these app names are valid in `filters.apps` for retrieval:"
+                "\n**Indexed App Connectors** (search with `connector_ids`):"
             )
             for app in indexed_apps:
-                lines.append(f"  - 🔗 `{app['type_key']}` ({app['label']})")
-        else:
-            lines.append(
-                "\n⚠️  **NO app connectors are indexed** — only Knowledge Bases above are available.\n"
-                "  → When calling `retrieval.search_internal_knowledge`, do NOT set `filters.apps`.\n"
-                "  → Use `filters: {{}}` or omit filters entirely so the KB is searched."
-            )
+                line = f"  - 🔗 **{app['label']}** (app: {app['type_key']}) — connector_id: `{app['connector_id']}`"
+                fls = format_connector_filter_lines(app.get("filters"))
+                if fls:
+                    line += f" [indexed: {'; '.join(fls)}]"
+                lines.append(line)
+
+        # ── Routing rules (handles KB-only, connector-only, and mixed) ──
+        routing = build_connector_routing_rules(
+            indexed_apps,
+            kb_sources=kb_sources,
+            call_format="planner",
+        )
+        if routing:
+            lines.append(routing)
 
     # --- Live API toolsets ---
     if api_tools_by_type:
@@ -4539,10 +5283,9 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             "  • **Write actions** — create, update, delete, comment, send, assign"
         )
         for ts_key, tool_names in api_tools_by_type.items():
-            # Show up to 5 representative tool names
             MAX_TOOLS = 5
-            sample = ", ".join(tool_names[:5])
-            more   = f" … (+{len(tool_names)-5} more)" if len(tool_names) > MAX_TOOLS else ""
+            sample = ", ".join(tool_names[:MAX_TOOLS])
+            more   = f" … (+{len(tool_names) - MAX_TOOLS} more)" if len(tool_names) > MAX_TOOLS else ""
             lines.append(f"  - 🛠️ **{ts_key.capitalize()}**: {sample}{more}")
 
     # --- Overlap guidance (apps with BOTH indexed AND live API) ---
@@ -4556,12 +5299,12 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             "\n"
             "| User intent | What to use |\n"
             "|---|---|\n"
-            "| **SERVICE NOUN** without explicit search verb — '[topic] tickets', '[topic] issues', '[topic] pages' | BOTH retrieval + live API search (parallel) |\n"
-            "| **FIND / SEARCH** content by topic or keyword — 'find pages about X', 'search for issues about Y' | BOTH retrieval + live API search (parallel) |\n"
-            "| **LIVE / CURRENT** data — 'list my open tickets', 'show recent changes', 'assigned to me' | live API only |\n"
+            "| **SERVICE NOUN** — '[topic] tickets', '[topic] pages' (no explicit verb) | BOTH retrieval + live API search (parallel) |\n"
+            "| **FIND / SEARCH** content by topic or keyword | BOTH retrieval + live API search (parallel) |\n"
+            "| **LIVE / CURRENT** data — 'list my open tickets', 'assigned to me' | live API only |\n"
             "| **LOOKUP** by exact ID or key — PA-123, page id 12345 | live API only |\n"
-            "| **WRITE ACTION** — create, update, delete, comment, send, assign | live API write tool only |\n"
-            "| **INFORMATION** — 'what is X', 'tell me about Y', 'explain Z' (no service resource noun) | retrieval only |\n"
+            "| **WRITE ACTION** — create, update, delete, comment, assign | live API write tool only |\n"
+            "| **INFORMATION** — 'what is X', 'explain Z' (no service resource noun) | retrieval only |\n"
         )
         for key in sorted(overlapping_keys):
             label = next(
@@ -4572,19 +5315,15 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             lines.append(
                 f"  **{label}**: retrieval → topic/historical search; "
                 f"live API ({', '.join(tool_sample)}) → current data, exact IDs, write actions; "
-                f"BOTH → when user uses a service resource noun ('[topic] tickets', '[topic] issues', '[topic] pages') OR explicitly asks to find/search content by topic"
+                f"BOTH → service resource noun ('[topic] tickets', '[topic] pages') "
+                f"OR explicit find/search by topic"
             )
 
-    # --- Hybrid search guidance: when to combine retrieval + live search APIs ---
-    # Only relevant when user explicitly wants to find/search/discover content.
+    # --- Hybrid search guidance ---
     has_retrieval = bool(kb_sources or indexed_apps)
-    # Collect search-capable tools from non-overlapping toolsets
     non_overlap_search_tools: dict[str, list[str]] = {}
     for ts_key, tool_names in api_tools_by_type.items():
-        search_tools = [
-            t for t in tool_names
-            if "search" in t.split(".")[-1].lower()
-        ]
+        search_tools = [t for t in tool_names if "search" in t.split(".")[-1].lower()]
         if search_tools:
             non_overlap_search_tools[ts_key] = search_tools
 
@@ -4600,10 +5339,6 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             "  • User asks 'find pages/tickets/docs about [topic]'\n"
             "  • User asks 'search [app] for [X]' or 'is there anything about [topic] in [app]'\n"
             "\n"
-            "**Do NOT use live search APIs for:**\n"
-            "  • General information queries ('what is X', 'tell me about Y') with NO service resource noun — retrieval is sufficient\n"
-            "  • Queries with no service reference and no service noun — use retrieval only\n"
-            "\n"
             "**Available live search APIs:**"
         )
         for ts_key, search_tools in sorted(non_overlap_search_tools.items()):
@@ -4611,20 +5346,20 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
             lines.append(f"  - 🔍 **{ts_key.capitalize()}**: {tool_list}")
 
         lines.append(
-            "\n**EXAMPLE** — 'find pages about OneDrive configuration' (explicit search in service):\n"
-            "```json\n"
-            "[\n"
-            "  {{\"name\": \"retrieval.search_internal_knowledge\", \"args\": {{\"query\": \"OneDrive configuration\", \"filters\": {{}}}}}},\n"
-            "  {{\"name\": \"confluence.search_content\", \"args\": {{\"query\": \"OneDrive configuration\"}}}}\n"
-            "]\n"
-            "```\n"
-            "**EXAMPLE** — 'what is our OneDrive configuration?' (information query, NOT explicit search):\n"
-            "```json\n"
-            "[{{\"name\": \"retrieval.search_internal_knowledge\", \"args\": {{\"query\": \"OneDrive configuration\"}}}}]\n"
-            "```"
+            "\n**EXAMPLE** — 'find pages about OneDrive configuration':\n"
+            '```json\n'
+            '[\n'
+            '  {"name": "retrieval.search_internal_knowledge", "args": {"query": "OneDrive configuration"}},\n'
+            '  {"name": "confluence.search_content", "args": {"query": "OneDrive configuration"}}\n'
+            ']\n'
+            '```\n'
+            "**EXAMPLE** — 'what is our OneDrive configuration?' (information only):\n"
+            '```json\n'
+            '[{"name": "retrieval.search_internal_knowledge", "args": {"query": "OneDrive configuration"}}]\n'
+            '```'
         )
 
-    # --- Universal decision rule (always shown) ---
+    # --- Universal decision rule (always shown at the end) ---
     lines.append(
         "\n### 🎯 TOOL SELECTION SUMMARY\n"
         "```\n"
@@ -4634,13 +5369,18 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
         "Lookup by exact ID or key (e.g. PA-123)                                        →  live API read tool\n"
         "[topic] tickets / [topic] issues / [topic] pages (service noun, dual-source)   →  BOTH retrieval + live search API (parallel)\n"
         "FIND/SEARCH [service] content by topic or keyword                              →  BOTH retrieval + live search API (parallel)\n"
+        "External website/URL (Wikipedia, SO, GitHub, MDN, any public site, or a URL)   →  web_search / fetch_url\n"
         "General information query — 'what is X', 'tell me about Y' (no service noun)   →  retrieval (DEFAULT)\n"
         "Ambiguous / unclear intent                                                     →  retrieval (DEFAULT)\n"
         "```\n"
-        "⚠️ **RETRIEVAL FILTER RULE**:\n"
-        "   • `filters.apps` should ONLY contain app names listed in 'Indexed App Connectors' above.\n"
-        "   • If no app connectors are indexed (only KB), use `\"filters\": {{}}` (empty).\n"
-        "   • NEVER set `filters.apps` to a live-API-only service.\n"
+        "⚠️ **RETRIEVAL CONNECTOR RULE**:\n"
+        "   • Reason about the query to determine which connector(s) it targets.\n"
+        "   • **Connector(s) identified → search only those** — one parallel call per identified connector.\n"
+        "   • **Cannot identify a connector (general / ambiguous) → search ALL configured connectors in parallel.**\n"
+        "   • Default when uncertain: search ALL connectors.\n"
+        "   • Each call sets `connector_ids` to exactly ONE connector_id — never combine them.\n"
+        "   • If only KB sources are indexed (no app connectors), omit `connector_ids`.\n"
+        "   • NEVER set `connector_ids` to a live-API-only service connector.\n"
         "\n"
         "⚠️ **EFFICIENCY**: If a previous tool already returned IDs/keys, use them\n"
         "   directly in the next write tool. Do NOT re-fetch items you already have."
@@ -4650,7 +5390,7 @@ def _build_knowledge_context(state: ChatState, log: logging.Logger) -> str:
     return "\n".join(lines)
 
 # Tool description caching
-_tool_description_cache: Dict[str, str] = {}
+_tool_description_cache: dict[str, str] = {}
 
 
 def _get_cached_tool_descriptions(state: ChatState, log: logging.Logger) -> str:
@@ -4659,7 +5399,7 @@ def _get_cached_tool_descriptions(state: ChatState, log: logging.Logger) -> str:
     agent_toolsets = state.get("agent_toolsets", [])
     llm = state.get("llm")
 
-    has_knowledge = bool(state.get("kb") or state.get("apps") or state.get("agent_knowledge"))
+    has_knowledge = state.get("has_knowledge", False)
 
     from app.modules.agents.qna.tool_system import (
         _requires_sanitized_tool_names,
@@ -4689,7 +5429,7 @@ def _get_cached_tool_descriptions(state: ChatState, log: logging.Logger) -> str:
         return "### retrieval.search_internal_knowledge\n  ✅ Use: Search company knowledge"
 
 
-def _get_field_type_name(field_info) -> str:
+def _get_field_type_name(field_info: object) -> str:
     """Get type name from Pydantic v2 field"""
     try:
         annotation = field_info.annotation
@@ -4709,13 +5449,12 @@ def _get_field_type_name(field_info) -> str:
         else:
             type_str = str(annotation).lower()
             # Clean up common type representations
-            type_str = type_str.replace('<class ', '').replace('>', '').replace("'", "")
-            return type_str
+            return type_str.replace('<class ', '').replace('>', '').replace("'", "")
     except Exception:
         return "any"
 
 
-def _get_field_type_name_v1(field_info) -> str:
+def _get_field_type_name_v1(field_info: object) -> str:
     """Get type name from Pydantic v1 field"""
     try:
         type_ = field_info.outer_type_
@@ -4734,7 +5473,7 @@ def _get_field_type_name_v1(field_info) -> str:
         return "any"
 
 
-def _extract_parameters_from_schema(schema: Union[Dict[str, Any], type], log: logging.Logger) -> Dict[str, Dict[str, Any]]:
+def _extract_parameters_from_schema(schema: dict[str, Any] | type, log: logging.Logger) -> dict[str, dict[str, Any]]:
     """
     Extract parameter information from Pydantic schema.
 
@@ -4808,7 +5547,7 @@ def _extract_parameters_from_schema(schema: Union[Dict[str, Any], type], log: lo
     return {}
 
 
-def _format_tool_descriptions(tools: List, log: logging.Logger) -> str:
+def _format_tool_descriptions(tools: list, log: logging.Logger) -> str:
     """
     Format tool descriptions for planner with parameter schemas.
 
@@ -4828,7 +5567,7 @@ def _format_tool_descriptions(tools: List, log: logging.Logger) -> str:
         lines.append(f"### {name}")
         if description:
             # Truncate long descriptions
-            desc_text = description[:MAX_TOOL_DESCRIPTION_LENGTH] if len(description) > MAX_TOOL_DESCRIPTION_LENGTH else description
+            desc_text = description
             lines.append(f"  {desc_text}")
 
         # Extract parameter schema
@@ -4837,6 +5576,8 @@ def _format_tool_descriptions(tools: List, log: logging.Logger) -> str:
             if schema:
                 params_info = _extract_parameters_from_schema(schema, log)
                 if params_info:
+                    # Add blank line between description and parameters
+                    lines.append("")
                     lines.append("  **Parameters:**")
                     for param_name, param_info in params_info.items():
                         required_marker = "**required**" if param_info.get("required") else "optional"
@@ -4845,7 +5586,7 @@ def _format_tool_descriptions(tools: List, log: logging.Logger) -> str:
 
                         # Format: - param_name (required): description [TYPE]
                         if param_desc:
-                            lines.append(f"  - `{param_name}` ({required_marker}): {param_desc[:80]} [{param_type}]")
+                            lines.append(f"  - `{param_name}` ({required_marker}): {param_desc} [{param_type}]")
                         else:
                             lines.append(f"  - `{param_name}` ({required_marker}) [{param_type}]")
         except Exception as e:
@@ -4941,12 +5682,17 @@ async def execute_node(
         tools = get_agent_tools_with_schemas(state)
         llm = state.get("llm")
 
-        # Build tool mapping
+        # Build tool mapping: both sanitized (underscore) and original (dot) names.
+        # _underscore_to_dotted is NOT applied here because it only replaces the
+        # first underscore, which is wrong for multi-word app names like
+        # knowledge_hub (knowledge_hub_list_files → knowledge.hub_list_files ✗).
+        # The two-entry map (sanitized + original) is sufficient: the LLM outputs
+        # either the sanitized or the original name and step-1 lookup always hits.
         tools_by_name = {}
         for t in tools:
             sanitized_name = getattr(t, 'name', str(t))
-            tools_by_name[sanitized_name] = t
             original_name = getattr(t, '_original_name', sanitized_name)
+            tools_by_name[sanitized_name] = t
             if original_name != sanitized_name:
                 tools_by_name[original_name] = t
 
@@ -4960,14 +5706,35 @@ async def execute_node(
     )
 
     # Build tool messages
+    from app.utils.tool_handlers import ToolHandlerRegistry
+
     tool_messages = []
+    ref_mapper = state.get("citation_ref_mapper")
+    handler_context = {
+        "ref_mapper": ref_mapper,
+        "config_service": state.get("config_service"),
+        "is_multimodal_llm": state.get("is_multimodal_llm", False),
+    }
     for result in tool_results:
         if result.get("tool_id"):
-            content_str = format_result_for_llm(result.get("result", ""), result.get("tool_name", ""))
-            tool_messages.append(ToolMessage(
-                content=content_str,
-                tool_call_id=result.get("tool_id", "")
-            ))
+            tool_result_data = result.get("result", "")
+            if (
+                isinstance(tool_result_data, dict)
+                and tool_result_data.get("ok")
+                and tool_result_data.get("result_type") in ("web_search", "url_content")
+            ):
+                handler = ToolHandlerRegistry.get_handler(tool_result_data)
+                tool_msg_content = await handler.format_message(tool_result_data, handler_context)
+                tool_messages.append(ToolMessage(
+                    content=tool_msg_content,
+                    tool_call_id=result.get("tool_id", ""),
+                ))
+            else:
+                content_str = format_result_for_llm(tool_result_data, result.get("tool_name", ""))
+                tool_messages.append(ToolMessage(
+                    content=content_str,
+                    tool_call_id=result.get("tool_id", ""),
+                ))
 
     # Update state
     # IMPORTANT: accumulate across iterations so that retrieval results from
@@ -5029,14 +5796,48 @@ async def reflect_node(
     # Count successes and failures
     successful = [r for r in tool_results if r.get("status") == "success"]
     failed = [r for r in tool_results if r.get("status") == "error"]
+    cascade_errors = [r for r in tool_results if r.get("status") == "cascade_error"]
 
-    log.info(f"📊 Tool results: {len(successful)} ✓, {len(failed)} ✗")
+    log.info(f"📊 Tool results: {len(successful)} ✓, {len(failed)} ✗, {len(cascade_errors)} cascade")
 
     # Log details for debugging
     for r in successful:
         log.info(f"  ✅ {r.get('tool_name')}")
     for r in failed:
-        log.info(f"  ❌ {r.get('tool_name')}: {str(r.get('result', ''))}")
+        log.info(f"  ❌ {r.get('tool_name')}: {str(r.get('result', ''))[:300]}")
+    for r in cascade_errors:
+        log.info(f"  🔗❌ {r.get('tool_name')}: cascade broken")
+
+    # ========================================================================
+    # PRE-CHECK: Orchestration failures override all other decisions
+    # ========================================================================
+
+    cascade_broken = [r for r in tool_results
+                      if r.get("orchestration_status") == ORCHESTRATION_STATUS_CASCADE_BROKEN]
+    empty_cascade_sources = [r for r in tool_results
+                             if r.get("orchestration_status") == "empty_cascade_source"]
+
+    if cascade_errors or cascade_broken:
+        log.info(f"🔗 ORCHESTRATION FAILURE: {len(cascade_errors)} cascade errors detected")
+        state["reflection_decision"] = "respond_error"
+        state["reflection"] = {
+            "decision": "respond_error",
+            "reasoning": (
+                f"Cascading tool chain broke: "
+                f"{[r.get('tool_name') for r in (cascade_errors or cascade_broken)]}. "
+                f"A multi-step operation failed because intermediate results were unavailable."
+            ),
+            "error_context": "cascade_broken",
+            "task_complete": False,
+        }
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        log.info(f"⚡ Reflect: respond_error (cascade) - {duration_ms:.0f}ms")
+        return state
+
+    if empty_cascade_sources:
+        log.info(f"🔗 EMPTY CASCADE SOURCE: {[r.get('tool_name') for r in empty_cascade_sources]}")
+        # Don't hard-fail — mark state so downstream reflection knows
+        state["_cascade_source_empty"] = True
 
     # ========================================================================
     # DECISION 1: Partial Success (some succeeded, some failed)
@@ -5103,25 +5904,49 @@ async def reflect_node(
 
     planned_tools = state.get("planned_tool_calls", [])
     if planned_tools and len(planned_tools) > 0 and len(successful) > 0:
-        primary_tool_name = planned_tools[0].get("name", "").lower()
+        # GUARD: If this is a cascading chain, primary tool success alone
+        # does NOT mean the task is complete.  Check the LAST tool instead.
+        has_cascading = PlaceholderResolver.has_placeholders({"tools": planned_tools})
 
-        # Check if primary (first) tool succeeded
-        for result in successful:
-            tool_name = result.get("tool_name", "").lower()
-            normalized_primary = primary_tool_name.replace('.', '_')
-            normalized_tool = tool_name.replace('.', '_')
-
-            if tool_name == primary_tool_name or normalized_tool == normalized_primary:
-                log.info(f"✅ Primary action succeeded: {tool_name}")
+        if has_cascading:
+            # For cascading chains, success = last tool succeeded with meaningful data
+            last_result = tool_results[-1] if tool_results else None
+            if (last_result
+                    and last_result.get("status") == "success"
+                    and not _is_semantically_empty(last_result.get("result"))):
+                log.info("✅ Cascading chain completed: last tool has data")
                 state["reflection_decision"] = "respond_success"
                 state["reflection"] = {
                     "decision": "respond_success",
-                    "reasoning": "Primary action succeeded (dependent tools failed but task complete)",
+                    "reasoning": "Cascading chain completed — last tool returned meaningful data",
                     "task_complete": True
                 }
                 duration_ms = (time.perf_counter() - start_time) * 1000
-                log.info(f"⚡ Reflect: respond_success (primary) - {duration_ms:.0f}ms")
+                log.info(f"⚡ Reflect: respond_success (cascade complete) - {duration_ms:.0f}ms")
                 return state
+            else:
+                log.info("🔗 Cascading chain: last tool empty/failed — skipping primary-success shortcut")
+                # Fall through to error handling / LLM reflection
+        else:
+            # Non-cascading: original primary tool check
+            primary_tool_name = planned_tools[0].get("name", "").lower()
+
+            for result in successful:
+                tool_name = result.get("tool_name", "").lower()
+                normalized_primary = primary_tool_name.replace('.', '_')
+                normalized_tool = tool_name.replace('.', '_')
+
+                if tool_name == primary_tool_name or normalized_tool == normalized_primary:
+                    log.info(f"✅ Primary action succeeded: {tool_name}")
+                    state["reflection_decision"] = "respond_success"
+                    state["reflection"] = {
+                        "decision": "respond_success",
+                        "reasoning": "Primary action succeeded (dependent tools failed but task complete)",
+                        "task_complete": True
+                    }
+                    duration_ms = (time.perf_counter() - start_time) * 1000
+                    log.info(f"⚡ Reflect: respond_success (primary) - {duration_ms:.0f}ms")
+                    return state
 
     # ========================================================================
     # DECISION 4: Fast Path Error Detection
@@ -5241,12 +6066,10 @@ async def reflect_node(
             )
         finally:
             keepalive_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await keepalive_task
-            except asyncio.CancelledError:
-                pass
 
-        reflection = _parse_reflection_response(response.content, log)
+        reflection = _parse_reflection_response(_normalize_llm_content(response.content), log)
 
     except asyncio.TimeoutError:
         log.warning("⏱️ Reflect timeout")
@@ -5272,7 +6095,7 @@ async def reflect_node(
     return state
 
 
-def _parse_reflection_response(content: str, log: logging.Logger) -> Dict[str, Any]:
+def _parse_reflection_response(content: str, log: logging.Logger) -> dict[str, Any]:
     """Parse reflection JSON response"""
     content = content.strip()
 
@@ -5307,7 +6130,7 @@ def _parse_reflection_response(content: str, log: logging.Logger) -> Dict[str, A
     }
 
 
-def _check_primary_tool_success(query: str, successful: List[Dict], log: logging.Logger) -> bool:
+def _check_primary_tool_success(query: str, successful: list[dict], log: logging.Logger) -> bool:
     """
     In a partial-success scenario (some tools succeeded, some failed), determine
     whether the *primary* / most important tool for the user's intent succeeded.
@@ -5329,7 +6152,7 @@ def _check_primary_tool_success(query: str, successful: List[Dict], log: logging
 
     # Intent verb → tool-name segment that signals the primary action completed.
     # Order matters: more specific intents first.
-    intent_to_tool_segment: List[tuple] = [
+    intent_to_tool_segment: list[tuple] = [
         # (query keywords that signal this intent, tool-name segment to look for)
         (["create", "new"],              "create"),
         (["update", "modify", "change", "edit"], "update"),
@@ -5362,140 +6185,45 @@ def _check_primary_tool_success(query: str, successful: List[Dict], log: logging
     return len(successful) > 0
 
 
-def _is_write_tool(tool_name: str) -> bool:
-    """
-    Return True if the tool performs a write / action / side-effect operation.
-
-    Detection is done by inspecting the verb prefix of the tool's action segment
-    (the part after the service prefix, e.g. "slack.", "jira.", "confluence.").
-    Prefix matching is reliable because all service tools follow the convention
-    <service>.<verb>_<object> (e.g. slack.send_message, jira.create_issue).
-    """
-    name = tool_name.lower()
-    # Strip service prefix (e.g. "slack.", "jira.", "confluence.", "retrieval.")
-    if "." in name:
-        name = name.split(".", 1)[1]
-    _WRITE_PREFIXES = (
-        "create_", "update_", "delete_", "add_", "send_", "reply_",
-        "set_", "assign_", "transition_", "publish_", "post_",
-        "remove_", "move_", "archive_", "upload_", "comment_",
-        "edit_", "modify_", "write_", "submit_",
-    )
-    return any(name.startswith(p) for p in _WRITE_PREFIXES)
-
-
-def _is_read_tool(tool_name: str) -> bool:
-    """
-    Return True if the tool is a read-only / information-gathering operation.
-    """
-    name = tool_name.lower()
-    if "." in name:
-        name = name.split(".", 1)[1]
-    _READ_PREFIXES = (
-        "get_", "search_", "list_", "fetch_", "retrieve_",
-        "find_", "query_", "read_",
-    )
-    return any(name.startswith(p) for p in _READ_PREFIXES)
-
-
-# Compiled regex for detecting write-action intent in the user query.
-# Design: match ONLY when the verb is used as an action command, not a noun/modifier.
-# - We require the write verb to appear either at the sentence start (after optional
-#   polite preamble) OR after a conjunction ("and", "then", "also").
-# - Removed "upload", "message", "write", "comment", "add" from the top-level match
-#   because they appear routinely as nouns/adjectives in search queries
-#   (e.g. "upload failure tickets", "comment count", "write permission error").
-# - "set status" is kept as a phrase since it's always an action.
-_WRITE_INTENT_RE = re.compile(
-    r"(?:"
-    # Pattern A: verb at start of sentence (optional polite prefix)
-    r"^(?:please\s+|can\s+you\s+|could\s+you\s+|i\s+(?:need|want|would\s+like)\s+(?:you\s+)?to\s+)?"
-    r"\b(send|reply|create|update|publish|notify|assign|post|set\s+status)\b"
-    r"|"
-    # Pattern B: verb after a conjunction (e.g. "find X and then send email")
-    r"\b(?:and|then|also|after\s+that)\b\s+\b(send|reply|create|update|publish|notify|assign|post|set\s+status)\b"
-    r")",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Additional fallback: explicit write-action verbs that are unambiguous anywhere
-_UNAMBIGUOUS_WRITE_RE = re.compile(
-    r"\b(add\s+comment|add\s+a\s+comment|leave\s+a\s+comment|write\s+(?:an?\s+)?email|"
-    r"upload\s+(?:the\s+)?file|comment\s+on\s+(?:the\s+|this\s+)?(?:ticket|issue|pr|pull\s+request))\b",
-    re.IGNORECASE,
-)
-
-
 def _check_if_task_needs_continue(
     query: str,
-    executed_tools: List[str],
-    tool_results: List[Dict[str, Any]],
+    executed_tools: list[str],
+    tool_results: list[dict[str, Any]],
     log: logging.Logger,
-    state: Optional[Dict[str, Any]] = None
+    state: dict[str, Any] | None = None
 ) -> bool:
     """
-    Determine whether the agent needs another planning cycle to complete the task.
+    Determine whether the agent needs another planning cycle.
 
-    Logic (in order):
-    1. If at least one write/action tool already executed → task action phase done.
-    2. If this is Phase 1 of a genuine two-phase plan (retrieval before write) →
-       continue so the planner can execute the write action in Phase 2.
-    3. If the planner planned ONLY retrieval tools (no write plan at all) →
-       this is a read-only task regardless of what the regex detects. Return False.
-    4. If the query clearly signals a write/action intent (via tightened regex)
-       and no write tool has run yet → continue.
-    5. Default → False (task complete or read-only).
+    Returns True if there are planned tools that have not yet been executed.
+    Returns False if all planned tools have been executed.
     """
-    query_lower = (query or "").lower()
-    state = state or {}
-
-    # ── 1. Was any write/action tool executed? ────────────────────────────────
-    action_completed = any(_is_write_tool(t) for t in executed_tools)
-    if action_completed:
-        log.debug(
-            "Task complete: write/action tool already executed → no continue needed. "
-            f"Executed: {executed_tools}"
-        )
+    if not state:
         return False
 
-    # ── 2. Is this Phase 1 of a genuine two-phase plan? ─────────────────────
-    # The planner_node sets is_two_phase_plan=True when it strips write tools
-    # from the plan so that retrieval can run first. In that case we MUST continue
-    # to execute the deferred write tools in Phase 2.
-    if state.get("is_two_phase_plan"):
-        log.debug(
-            "Task incomplete: two-phase plan in Phase 1 — write tools deferred to Phase 2. "
-            f"Executed: {executed_tools}"
-        )
+    planned_tools = state.get("planned_tool_calls", [])
+    if not planned_tools:
+        return False
+
+    # Normalize tool names for comparison (handle both dotted and underscored formats)
+    planned_names = set()
+    for tool in planned_tools:
+        if isinstance(tool, dict):
+            name = tool.get("name", "")
+            planned_names.add(name)
+            planned_names.add(name.replace(".", "_"))
+            planned_names.add(name.replace("_", "."))
+
+    executed_names = set(executed_tools)
+    for tool_name in executed_tools:
+        executed_names.add(tool_name.replace(".", "_"))
+        executed_names.add(tool_name.replace("_", "."))
+
+    if not planned_names.issubset(executed_names):
+        missing = planned_names - executed_names
+        log.debug(f"Some planned tools not yet executed: {missing}")
         return True
 
-    # ── 3. Did the planner choose ONLY retrieval tools (read-only signal)? ───
-    # planned_tool_calls reflects what the planner actually decided to do.
-    # If it contains ONLY retrieval tools, the LLM determined this is a read-only
-    # task — trust it and don't force a continuation based on regex alone.
-    planned_tools = state.get("planned_tool_calls", []) or []
-    if planned_tools:
-        all_planned_are_retrieval = all(
-            _is_retrieval_tool(t.get("name", "")) if isinstance(t, dict)
-            else "retrieval" in str(t).lower()
-            for t in planned_tools
-        )
-        if all_planned_are_retrieval:
-            log.debug(
-                "Task complete: planner only planned retrieval tools → read-only task. "
-                f"Executed: {executed_tools}"
-            )
-            return False
-
-    # ── 4. Does the query signal a write/action intent (tightened regex)? ────
-    if _WRITE_INTENT_RE.search(query_lower) or _UNAMBIGUOUS_WRITE_RE.search(query_lower):
-        log.debug(
-            "Task incomplete: query indicates a write/action intent but no action "
-            f"tool has executed yet. Executed: {executed_tools}"
-        )
-        return True
-
-    # ── 5. Default: task is complete (read-only or already handled) ───────────
     return False
 
 
@@ -5522,14 +6250,15 @@ async def prepare_retry_node(
 
     # Extract errors
     tool_results = state.get("all_tool_results", [])
-    errors = []
-    for r in tool_results:
-        if r.get("status") == "error":
-            errors.append({
-                "tool_name": r.get("tool_name", "unknown"),
-                "args": r.get("args", {}),
-                "error": str(r.get("result", ""))[:300]
-            })
+    errors = [
+        {
+            "tool_name": r.get("tool_name", "unknown"),
+            "args": r.get("args", {}),
+            "error": str(r.get("result", ""))[:300],
+        }
+        for r in tool_results
+        if r.get("status") == "error"
+    ]
 
     state["execution_errors"] = errors
 
@@ -5603,110 +6332,6 @@ async def prepare_continue_node(
     log.info(f"➡️ Continue {state['iteration_count']}/{max_iterations}")
 
     return state
-
-
-# ============================================================================
-# MERGE AND NUMBER RETRIEVAL RESULTS (OPTION B)
-# ============================================================================
-
-def merge_and_number_retrieval_results(
-    final_results: List[Dict[str, Any]],
-    log: logging.Logger
-) -> List[Dict[str, Any]]:
-    """
-    Merge and deduplicate retrieval results from multiple parallel calls.
-
-    OPTION B: This function is called ONCE after all parallel retrieval
-    calls are complete. It:
-    1. Deduplicates blocks by (virtual_record_id, block_index)
-    2. Groups blocks by document, ordering documents by their best relevance
-       score (most relevant first). Within each document, blocks are ordered
-       by block_index for readability.
-
-    Sorting by relevance score (not by UUID string) ensures that R1 always
-    refers to the most relevant document. This matters critically for
-    fetch_full_record tool calls — when the LLM calls fetch_full_record(["R1"])
-    it should retrieve the most relevant document, not an arbitrarily-ordered one.
-
-    NOTE: Block numbering is done by get_message_content() (same as chatbot).
-    This function only merges and sorts - no numbering here.
-
-    Args:
-        final_results: List of result dicts from multiple retrieval calls
-        log: Logger instance
-
-    Returns:
-        Deduplicated and relevance-sorted results (block numbers assigned later
-        by get_message_content)
-    """
-    if not final_results:
-        return []
-
-    # Step 1: Deduplicate by (virtual_record_id, block_index)
-    seen_blocks: Dict[tuple, Any] = {}
-    # Track the best score seen for each document (used for document ordering)
-    doc_best_score: Dict[str, float] = {}
-    # Track the earliest position each document appeared in the results list
-    doc_first_position: Dict[str, int] = {}
-
-    for position, result in enumerate(final_results):
-        virtual_record_id = result.get("virtual_record_id")
-        if not virtual_record_id:
-            virtual_record_id = result.get("metadata", {}).get("virtualRecordId")
-
-        if not virtual_record_id:
-            continue
-
-        block_index = result.get("block_index", 0)
-        block_key = (virtual_record_id, block_index)
-        score = float(result.get("score", 0.0))
-
-        # Track best score per document for ordering
-        if virtual_record_id not in doc_best_score or score > doc_best_score[virtual_record_id]:
-            doc_best_score[virtual_record_id] = score
-
-        # Track earliest position per document as tiebreaker
-        if virtual_record_id not in doc_first_position:
-            doc_first_position[virtual_record_id] = position
-
-        # Keep the first occurrence (or the one with highest score if duplicate)
-        if block_key not in seen_blocks:
-            seen_blocks[block_key] = result
-        else:
-            existing_score = seen_blocks[block_key].get("score", 0.0)
-            if score > existing_score:
-                seen_blocks[block_key] = result
-
-    # Step 2: Sort documents by relevance (best score desc, then earliest position asc)
-    # Within each document, sort blocks by block_index for natural reading order.
-    deduplicated = list(seen_blocks.values())
-
-    def sort_key(x: Dict[str, Any]) -> tuple:
-        vid = x.get("virtual_record_id") or x.get("metadata", {}).get("virtualRecordId", "")
-        best_score = doc_best_score.get(vid, 0.0)
-        first_pos = doc_first_position.get(vid, 999999)
-        block_idx = x.get("block_index", 0)
-        # Primary: highest score first (-best_score), Secondary: earliest position, Tertiary: block_index
-        return (-best_score, first_pos, block_idx)
-
-    deduplicated.sort(key=sort_key)
-
-    # Step 3: Count unique records for logging
-    seen_virtual_record_ids = set()
-    for result in deduplicated:
-        virtual_record_id = result.get("virtual_record_id")
-        if not virtual_record_id:
-            virtual_record_id = result.get("metadata", {}).get("virtualRecordId")
-        if virtual_record_id:
-            seen_virtual_record_ids.add(virtual_record_id)
-
-    log.info(
-        f"✅ Merged {len(deduplicated)} blocks from {len(seen_virtual_record_ids)} records "
-        f"(deduplicated from {len(final_results)} raw results, sorted by relevance score). "
-        f"Block numbering will be done by get_message_content()."
-    )
-
-    return deduplicated
 
 
 # ============================================================================
@@ -5828,6 +6453,7 @@ async def respond_node(
     final_results = state.get("final_results", [])
     virtual_record_map = state.get("virtual_record_id_to_result", {})
     query = state.get("query", "")
+    org_id = state.get("org_id", "")
 
     # ================================================================
     # FAST PATH: API-only results with sub-agent analyses
@@ -5866,10 +6492,13 @@ async def respond_node(
         "Fast-path check: analyses=%d, final_results=%d, virtual_map=%d, tool_results=%d",
         len(sub_agent_analyses), len(final_results), len(virtual_record_map), len(tool_results),
     )
+    _prior_web_records = _extract_web_records_from_tool_results(tool_results, org_id)
+
     if (
         sub_agent_analyses
         and not final_results
         and not virtual_record_map
+        and not _prior_web_records
     ):
         log.info("⚡ Fast-path: API-only results with sub-agent analysis, using lightweight response")
         try:
@@ -5884,23 +6513,6 @@ async def respond_node(
             log.warning(f"Fast-path failed, falling back to standard: {e}")
             # Fall through to standard path
 
-    # ================================================================
-    # Merge and deduplicate retrieval results from parallel calls.
-    # Then sort by (virtual_record_id, block_index) — the SAME ordering
-    # the chatbot uses so that get_message_content() assigns consistent
-    # R-labels (R1 = first record's blocks, R2 = second record, etc.)
-    # ================================================================
-    if final_results:
-        final_results = merge_and_number_retrieval_results(final_results, log)
-        # Mirror chatbot sort: group by record then by block order within record
-        final_results = sorted(
-            final_results,
-            key=lambda x: (
-                x.get("virtual_record_id") or x.get("metadata", {}).get("virtualRecordId", ""),
-                x.get("block_index", 0),
-            ),
-        )
-        state["final_results"] = final_results
 
     log.info(f"📚 Citation data: {len(final_results)} results, {len(virtual_record_map)} records")
 
@@ -5908,9 +6520,9 @@ async def respond_node(
     # Use get_message_content() — the EXACT same function the chatbot
     # uses — to build the user message with knowledge context.
     # This ensures:
-    #   • Consistent R{record_number}-{block_index} block labels
+    #   • Consistent block indices and block web URLs
     #   • The same rich context_metadata per record
-    #   • The same tool instructions (fetch_full_record with R-labels)
+    #   • The same tool instructions (fetch_full_record with record IDs)
     #   • The same output-format instructions
     # The formatted content is stored in state["qna_message_content"]
     # and consumed by create_response_messages() below.
@@ -5940,21 +6552,16 @@ async def respond_node(
                     "Please provide accurate and relevant information."
                 )
 
-        qna_content = _get_msg_content(
-            final_results, virtual_record_map, user_data, query, log, "json"
+        from app.utils.chat_helpers import CitationRefMapper as _CitationRefMapper
+        _ref_mapper = state.get("citation_ref_mapper") or _CitationRefMapper()
+        qna_content, _ref_mapper = _get_msg_content(
+            final_results, virtual_record_map, user_data, query, "json",is_multimodal_llm=state.get("is_multimodal_llm", False), ref_mapper=_ref_mapper, has_sql_connector=state.get("has_sql_connector", False) and state.get("has_sql_knowledge", False)
         )
+        state["citation_ref_mapper"] = _ref_mapper
         state["qna_message_content"] = qna_content
         log.debug("✅ Built qna_message_content via get_message_content() (chatbot-identical format)")
     else:
         state["qna_message_content"] = None
-
-    # Build R-label → virtual_record_id mapping AFTER sorting so the numbering
-    # matches what get_message_content() assigned above.
-    from app.modules.qna.response_prompt import build_record_label_mapping
-    record_label_map: dict = build_record_label_mapping(final_results) if final_results else {}
-    if record_label_map:
-        log.debug(f"📌 Record label mapping: {record_label_map}")
-    state["record_label_to_uuid_map"] = record_label_map
 
     # Build messages (create_response_messages uses qna_message_content as user msg)
     messages = create_response_messages(state)
@@ -5965,49 +6572,25 @@ async def respond_node(
         r for r in tool_results
         if r.get("status") == "success"
         and "retrieval" not in r.get("tool_name", "").lower()
-        and "knowledge" not in r.get("tool_name", "").lower()
     ]
     failed_results = [r for r in tool_results if r.get("status") == "error"]
 
-    # Check for sub-agent analyses (deep agent: pre-analyzed domain summaries)
-    # These are available even when tool_results is empty (complex tasks produce
-    # domain summaries instead of raw tool results).
-    _sub_analyses = sub_agent_analyses if sub_agent_analyses else state.get("sub_agent_analyses", [])
     has_api_results = non_retrieval_results or (failed_results and not any(r.get("status") == "success" for r in tool_results))
 
-    if has_api_results or _sub_analyses:
+    if has_api_results:
         # Build context for API tool results.
         # When qna_message_content is set, retrieval blocks are already embedded in the
         # user message — pass [] to avoid duplication but set has_retrieval_in_context=True
         # so the LLM is instructed to use MODE 3 (inline citations + referenceData).
         qna_has_retrieval = bool(state.get("qna_message_content"))
-        context = _build_tool_results_context(
+        context = (await _build_tool_results_context(
             tool_results,
             [] if qna_has_retrieval else final_results,
             has_retrieval_in_context=qna_has_retrieval,
-        ) if has_api_results else ""
-
-        # Include sub-agent analyses (deep agent: pre-analyzed summaries)
-        if _sub_analyses:
-            analyses_text = "\n## Sub-Agent Analysis\n\n"
-            analyses_text += (
-                "The following detailed analysis was produced by specialized sub-agents "
-                "that studied the raw data in depth. "
-            )
-            if has_api_results:
-                analyses_text += (
-                    "Preserve ALL items and findings from this analysis in your response. "
-                    "Cross-reference with the raw API data above for exact details, links, "
-                    "and any additional information.\n\n"
-                )
-            else:
-                analyses_text += (
-                    "Preserve ALL items and findings from this analysis in your response. "
-                    "Include every data point, link, and detail.\n\n"
-                )
-            for analysis in _sub_analyses[:5]:
-                analyses_text += f"{analysis}\n\n"
-            context = analyses_text + context
+            ref_mapper=state.get("citation_ref_mapper"),
+            config_service=state.get("config_service"),
+            is_multimodal_llm=state.get("is_multimodal_llm", False),
+        )) if has_api_results else ""
 
         if context.strip():
             if messages and isinstance(messages[-1], HumanMessage):
@@ -6029,6 +6612,14 @@ async def respond_node(
         org_id = state.get("org_id", "")
         graph_provider = state.get("graph_provider")
         is_multimodal_llm = state.get("is_multimodal_llm", False)
+        is_service_account = bool(state.get("is_service_account", False))
+        # Build agent-scoped filter_groups for the service-account fallback retrieval
+        # (mirrors what retrieval.py builds from state["filters"])
+        agent_filters = state.get("filters") or {}
+        agent_filter_groups = {
+            "apps": list(set(agent_filters.get("apps", []) or [])),
+            "kb": [k for k in (agent_filters.get("kb", []) or []) if k and k != "NO_KB_SELECTED"],
+        } if is_service_account else None
 
         # blob_store is not set by retrieval.py (which creates its own local instance);
         # create one here so stream_llm_response_with_tools can use it when the token
@@ -6052,12 +6643,10 @@ async def respond_node(
         config_service = state.get("config_service")
         context_length = DEFAULT_CONTEXT_LENGTH
         if config_service:
-            try:
+            with contextlib.suppress(Exception):
                 # Try to get context length from LLM config if available
                 # This is a fallback - ideally it should be stored in state
                 context_length = DEFAULT_CONTEXT_LENGTH
-            except Exception:
-                pass
 
         # Construct all_queries from state
         query = state.get("query", "")
@@ -6074,32 +6663,76 @@ async def respond_node(
         # formats them via record_to_message_content() — identical to chatbot).
         tools = []
         if virtual_record_map:
-            from app.utils.agent_fetch_full_record import (
-                create_agent_fetch_full_record_tool,
+            from app.utils.fetch_full_record import (
+                create_fetch_full_record_tool,
             )
-            fetch_tool = create_agent_fetch_full_record_tool(
+            fetch_tool = create_fetch_full_record_tool(
                 virtual_record_map,
-                label_to_virtual_record_id=record_label_map if record_label_map else None,
+                org_id=org_id,
+                graph_provider=graph_provider,
             )
             tools = [fetch_tool]
             log.debug(
                 f"Added agent fetch_full_record tool "
                 f"({len(virtual_record_map)} records available, "
-                f"{len(record_label_map)} labels mapped)"
             )
 
+        # Add web tools (fetch_url always, web_search if configured)
+        has_web_search_tool = False
+        try:
+            from app.modules.agents.qna.tool_system import _create_web_tools
+            web_tools = _create_web_tools(state)
+            tools.extend(web_tools)
+            has_web_search_tool = any(
+                getattr(t, 'name', '') == 'web_search' for t in web_tools
+            )
+            if web_tools:
+                log.debug(f"Added {len(web_tools)} web tool(s) to respond_node")
+        except Exception as e:
+            log.warning(f"Failed to add web tools to respond_node: {e}")
+
+        # Instruct the LLM to use web tools when retrieval results are insufficient.
+        # This is the safety net: even if the planner didn't select web_search,
+        # the respond-phase LLM can still call it when the provided context
+        # clearly does not answer the user's question.
+        if has_web_search_tool and messages:
+            web_tool_hint = (
+                "\n\n## Web Tools Available (CRITICAL — READ BEFORE RESPONDING)\n"
+                "You have `web_search` and `fetch_url` tools available.\n\n"
+                "**MANDATORY RULE**: If the retrieved knowledge blocks above do NOT contain "
+                "sufficient information to answer the user's question, you MUST use "
+                "`web_search` (and/or `fetch_url` for specific URLs) to find the answer "
+                "from the web BEFORE responding. "
+                "Always attempt a web search first.\n\n"
+            )
+            from langchain_core.messages import SystemMessage as _SysMsg
+            if isinstance(messages[0], _SysMsg):
+                messages[0] = _SysMsg(content=messages[0].content + web_tool_hint)
+            else:
+                messages.insert(0, _SysMsg(content=web_tool_hint))
+        
+      
+      
         # Create tool_runtime_kwargs
         tool_runtime_kwargs = {
             "blob_store": blob_store,
             "graph_provider": graph_provider,
             "org_id": org_id,
+            "conversation_id": state.get("conversation_id"),
+            "config_service": config_service,
         }
+
+        # Pre-seed web_records from prior tool execution so that web citations
+        # are available even when the LLM does not re-invoke tools during streaming.
+        if _prior_web_records:
+            log.info("Pre-seeded %d web records from prior tool execution", len(_prior_web_records))
 
         answer_text = ""
         citations = []
         reason = None
         confidence = None
         reference_data = []
+        _captured_web_records: list[dict] = list(_prior_web_records)
 
         async for stream_event in stream_llm_response_with_tools(
             llm=llm,
@@ -6117,25 +6750,24 @@ async def respond_node(
             tool_runtime_kwargs=tool_runtime_kwargs,
             target_words_per_chunk=1,
             mode="json",
-            is_agent=True,  # Use agent schemas (with referenceData support)
+            conversation_id=state.get("conversation_id"),
+            is_service_account=is_service_account,
+            filter_groups=agent_filter_groups,
+            ref_mapper=state.get("citation_ref_mapper"),
+            initial_web_records=_prior_web_records,
         ):
             event_type = stream_event.get("event")
             event_data = stream_event.get("data", {})
 
-            # ── Agent-side citation enrichment (no streaming.py changes) ────────
-            # streaming.py's normalize_citations_and_chunks extracts citations from
-            # inline [R#-#] markers in the LLM answer text.  In combined (MODE 3)
-            # responses the LLM may skip inline markers and rely only on blockNumbers.
-            # streaming.py does not forward blockNumbers in the complete event, so we
-            # apply a second-pass extraction here — before the event reaches the client.
-            #
-            # Pass 1: re-run inline marker extraction in case streaming.py received
-            #         stale/empty final_results (safety net for edge cases).
-            # Pass 2: if the LLM DID write inline markers they are already extracted
-            #         by streaming.py; citations will be non-empty and we skip below.
+            if event_type == "tool_execution_complete":
+                _captured_web_records = event_data.get("web_records", []) or []
+
+            # ── Agent-side citation enrichment ──────────────────────────────────
+            # Second-pass fallback: if streaming.py returned empty citations on
+            # the complete event, re-run extraction here with web_records support.
             if (
                 event_type == "complete"
-                and final_results
+                and (final_results or _captured_web_records)
                 and not event_data.get("citations")
             ):
                 _raw_answer = event_data.get("answer", "")
@@ -6145,17 +6777,21 @@ async def respond_node(
                         from app.utils.citations import (
                             normalize_citations_and_chunks_for_agent as _ncc_agent,
                         )
-                        _, _enriched = _ncc_agent(_raw_answer, final_results, virtual_record_map, [])
+                        _ref_to_url = state.get("citation_ref_mapper")
+                        _ref_to_url = _ref_to_url.ref_to_url if _ref_to_url else None
+                        _, _enriched = _ncc_agent(
+                            _raw_answer, final_results, virtual_record_map, [],
+                            ref_to_url=_ref_to_url, web_records=_captured_web_records,
+                        )
                         if _enriched:
                             log.info(
-                                "🔖 Citation enrichment (respond_node): "
+                                "Citation enrichment (respond_node): "
                                 "extracted %d citations from inline markers",
                                 len(_enriched),
                             )
                     except Exception as _ce:
                         log.debug("Citation enrichment error: %s", _ce)
                 if _enriched:
-                    # Shallow-copy so we never mutate the yielded stream_event dict
                     event_data = {**event_data, "citations": _enriched}
             # ────────────────────────────────────────────────────────────────────
 
@@ -6238,11 +6874,17 @@ async def _generate_direct_response(
     Streams the LLM response to the frontend, sends the completion event,
     and stores the result in state. Fully self-contained — the caller just
     needs to ``return state`` after this returns.
+
+    When ``state["response"]`` is set by a prior node (e.g. ReAct), the full text is
+    embedded in the user message; ``stream_llm_response`` still runs so citation
+    normalization, chunking, and other streaming behavior stay unchanged.
     """
-    from app.utils.streaming import stream_llm_response
 
     query = state.get("query", "")
     previous = state.get("previous_conversations", [])
+
+    _pr = state.get("response")
+    prior_react: str | None = _pr if isinstance(_pr, str) and _pr.strip() else None
 
     # Build messages with full conversation history (same as planner)
     messages = []
@@ -6258,7 +6900,7 @@ async def _generate_direct_response(
 
     base_system_prompt = state.get("system_prompt", "")
     role_prefix = ""
-    if base_system_prompt and base_system_prompt.strip() and base_system_prompt != "You are an enterprise questions answering expert":
+    if is_custom_agent_system_prompt(base_system_prompt):
         role_prefix = f"{base_system_prompt.strip()}\n\n"
 
     # If the agent has no knowledge and no tools, use a specialized system prompt that
@@ -6285,9 +6927,34 @@ async def _generate_direct_response(
         if user_context:
             system_content += "\n\nIMPORTANT: When user asks about themselves, use provided info DIRECTLY."
     else:
-        system_content = f"{instructions_prefix}{role_prefix}You are a helpful, friendly AI assistant. Respond naturally and concisely."
+        system_content = (
+            f"{instructions_prefix}{role_prefix}"
+            "You are a helpful, friendly AI assistant. Respond naturally and concisely.\n\n"
+            "⚠️ NEVER expose internal system terms (such as `can_answer_directly`, `needs_clarification`, "
+            "`connector_ids`, `collection_ids`, JSON keys, tool names, or planning details) in your response. "
+            "Write as if you are naturally conversing with the user.\n\n"
+            "⚠️ NEVER ask clarifying questions or present a numbered menu of options. "
+            "If the user sends a short topic or keyword, respond with what you know from context. "
+            "Do not ask 'what do you mean?' — just respond helpfully."
+        )
         if user_context:
-            system_content += "\n\nIMPORTANT: When user asks about themselves, use provided info DIRECTLY."
+            system_content += "\n\nWhen the user asks about themselves, use the provided user info directly."
+
+    if prior_react:
+        system_content += (
+            "\n\nIf the user message includes a **draft / preliminary assistant response** from the ReAct step "
+            "in this turn, your final answer must follow its substance and structure; adjust wording only."
+        )
+
+    # Add capability summary so direct responses can answer "what can you do?"
+    capability_summary = build_capability_summary(state)
+    system_content += f"\n\n{capability_summary}"
+    system_content += f"\n\n{build_direct_answer_time_context(state)}"
+    system_content += (
+        "\n\nRender dates/times in human-readable form using the **Time zone** from the Time context "
+        "(e.g., 'April 28, 2026 at 3:45 PM IST'). Convert any epoch/numeric or ISO timestamp fields "
+        "(`ts`, `timestamp`, `created_at`, `updated_at`, etc.) — never output raw epoch numbers, ISO strings, or `ts`-style columns."
+    )
 
     messages.append(SystemMessage(content=system_content))
 
@@ -6297,10 +6964,18 @@ async def _generate_direct_response(
         messages.extend(conversation_messages)
         log.debug(f"Using {len(conversation_messages)} messages from {len(previous)} conversations for direct response (sliding window applied)")
 
-    # Current query
+    # Current user turn (include full ReAct handoff in full when present; no truncation)
     user_content = query
     if user_context:
         user_content += f"\n\n{user_context}"
+    if prior_react:
+        user_content = (
+            "## Draft output\n\n"
+            f"{prior_react}\n\n"
+            "---\n\n"
+            "## User message\n\n"
+            f"{user_content}"
+        )
     messages.append(HumanMessage(content=user_content))
 
     answer_text = ""
@@ -6313,7 +6988,6 @@ async def _generate_direct_response(
             final_results=[],
             logger=log,
             target_words_per_chunk=1,
-            mode="simple",
         ):
             event_type = stream_event.get("event")
             event_data = stream_event.get("data", {})
@@ -6350,8 +7024,8 @@ async def _generate_fast_api_response(
     state: ChatState,
     llm: BaseChatModel,
     query: str,
-    tool_results: List[Dict],
-    sub_agent_analyses: List[str],
+    tool_results: list[dict],
+    sub_agent_analyses: list[str],
     log: logging.Logger,
     writer: StreamWriter,
     config: RunnableConfig,
@@ -6370,20 +7044,22 @@ async def _generate_fast_api_response(
     analyses_text = "\n\n".join(sub_agent_analyses)
 
     # Include raw API data for reference
+
     non_retrieval = [
         r for r in tool_results
         if r.get("status") == "success"
         and "retrieval" not in r.get("tool_name", "").lower()
     ]
+    ref_mapper = state.get("citation_ref_mapper")
     raw_data_parts = []
     for r in non_retrieval[:5]:
         tool_name = r.get("tool_name", "unknown")
         content = ToolResultExtractor.extract_data_from_result(r.get("result", ""))
+        
         if isinstance(content, (dict, list)):
             content_str = json.dumps(content, indent=2, default=str)
         else:
             content_str = str(content)
-        # Limit raw data size to keep the prompt small
         if len(content_str) > _RAW_DATA_SIZE_LIMIT:
             content_str = content_str[:_RAW_DATA_SIZE_LIMIT] + "\n... (truncated)"
         raw_data_parts.append(f"### {tool_name}\n```json\n{content_str}\n```")
@@ -6398,7 +7074,7 @@ async def _generate_fast_api_response(
 
     base_system_prompt = state.get("system_prompt", "")
     role_prefix = ""
-    if base_system_prompt and base_system_prompt.strip() and base_system_prompt != "You are an enterprise questions answering expert":
+    if is_custom_agent_system_prompt(base_system_prompt):
         role_prefix = f"{base_system_prompt.strip()}\n\n"
 
     system_prompt = (
@@ -6427,6 +7103,9 @@ async def _generate_fast_api_response(
         "- **Actionable**: Surface critical items prominently (overdue, high-priority, errors, "
         "action required). Include follow-ups and recommendations where supported by data\n"
         "- **No fabrication**: Only use data that is explicitly provided\n"
+        "- **Human-readable dates/times**: render every date/time using the **Time zone** from the Time context "
+        "(e.g., 'April 28, 2026 at 3:45 PM IST'). Convert any epoch/numeric or ISO timestamp fields "
+        "(`ts`, `timestamp`, `created_at`, `updated_at`, etc.) — never output raw epoch numbers, ISO strings, or `ts`-style columns\n"
         "- Output ONLY markdown — no JSON wrapper, no code fences around the whole response\n"
     )
 
@@ -6457,7 +7136,6 @@ async def _generate_fast_api_response(
             final_results=[],
             logger=log,
             target_words_per_chunk=1,
-            mode="simple",
         ):
             event_type = stream_event.get("event")
             event_data = stream_event.get("data", {})
@@ -6481,8 +7159,19 @@ async def _generate_fast_api_response(
         content = r.get("result", "")
         _extract_urls_for_reference_data(content, reference_data)
 
+    answer_text = full_content.strip()
+    conversation_id = state.get("conversation_id")
+    if conversation_id:
+        try:
+            from app.utils.conversation_tasks import await_and_collect_results
+            from app.utils.streaming import _append_task_markers
+            task_results = await await_and_collect_results(conversation_id)
+            answer_text = _append_task_markers(answer_text, task_results)
+        except Exception as e:
+            log.warning("Fast-path: conversation tasks failed: %s", e)
+
     completion_data = {
-        "answer": full_content.strip(),
+        "answer": answer_text,
         "citations": [],
         "confidence": "High",
         "answerMatchType": "Derived From Tool Execution",
@@ -6491,12 +7180,44 @@ async def _generate_fast_api_response(
         completion_data["referenceData"] = reference_data
 
     safe_stream_write(writer, {"event": "complete", "data": completion_data}, config)
-    state["response"] = full_content.strip()
+    state["response"] = answer_text
     state["completion_data"] = completion_data
     return True
 
 
-def _extract_urls_for_reference_data(content: object, reference_data: List[Dict]) -> None:
+def _extract_web_records_from_tool_results(
+    tool_results: list[dict], org_id: str,
+) -> list[dict]:
+    """Build web_records from web_search / fetch_url tool results that were
+    executed in the agent's execution phase (before respond_node).
+
+    Delegates to ToolHandlerRegistry.extract_records — the same path that
+    streaming.py's execute_tool_calls uses for live tool output — so citation
+    URLs are generated identically (text-fragment URLs for fetch_url blocks,
+    plain links for web_search snippets).
+    """
+    from app.utils.tool_handlers import ToolHandlerRegistry
+
+    web_records: list[dict] = []
+    for r in tool_results:
+        if r.get("status") != "success":
+            continue
+        result = r.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if not isinstance(result, dict):
+            continue
+        handler = ToolHandlerRegistry.get_handler(result)
+        for rec in handler.extract_records(result, org_id=org_id):
+            if rec.get("source_type") == "web":
+                web_records.append(rec)
+    return web_records
+
+
+def _extract_urls_for_reference_data(content: object, reference_data: list[dict]) -> None:
     """Extract URLs from tool result content and add to referenceData list."""
     if isinstance(content, str):
         try:
@@ -6518,10 +7239,14 @@ def _extract_urls_for_reference_data(content: object, reference_data: List[Dict]
             _extract_urls_for_reference_data(item, reference_data)
 
 
-def _build_tool_results_context(
-    tool_results: List[Dict],
-    final_results: List[Dict],
+async def _build_tool_results_context(
+    tool_results: list[dict],
+    final_results: list[dict],
+    *,
     has_retrieval_in_context: bool = False,
+    ref_mapper: object | None = None,
+    config_service: ConfigurationService | None = None,
+    is_multimodal_llm: bool = False,
 ) -> str:
     """Build context from tool results for response generation.
 
@@ -6535,12 +7260,17 @@ def _build_tool_results_context(
                        the user message (qna_message_content). This tells the LLM to
                        use MODE 3 (combined citations + referenceData) even though the
                        blocks aren't repeated in this tool-results section.
+        ref_mapper: CitationRefMapper for building tiny citation URLs.
     """
     successful = [r for r in tool_results if r.get("status") == "success"]
     failed = [r for r in tool_results if r.get("status") == "error"]
     # has_retrieval is True when blocks are in final_results OR already in context
     has_retrieval = bool(final_results) or has_retrieval_in_context
     non_retrieval = [r for r in successful if "retrieval" not in r.get("tool_name", "").lower()]
+    has_web_results = any(
+        r.get("tool_name", "").lower() in ("web_search", "fetch_url")
+        for r in non_retrieval
+    )
 
     parts = []
 
@@ -6563,40 +7293,80 @@ def _build_tool_results_context(
         else:
             parts.append("\n## 📚 Internal Knowledge in Context\n\n")
             parts.append(
-                "Internal knowledge blocks (with R-labels like R1-0, R2-3) are present "
+                "Internal knowledge blocks (with Citation IDs) are present "
                 "in the conversation above.\n"
             )
         parts.append(
-            "**MANDATORY**: Cite IMMEDIATELY after each fact from internal knowledge: [R1-0], [R2-3]\n"
-            "Include ALL cited block labels in `blockNumbers`.\n\n"
+            "Cite key facts from internal knowledge using markdown links: [source](ref1). Use the EXACT Citation ID from the context. Limit to the most relevant citations — do NOT cite every sentence.\n"
+            "Do NOT manually number citations — the system assigns numbers automatically.\n"
+            "If unsure of the exact Citation ID, omit the citation rather than guessing.\n"
         )
 
     if non_retrieval:
-        parts.append("\n## 🔧 API Tool Results\n\n")
-        parts.append(
-            "Transform raw data into professional, informative markdown. Follow these rules:\n"
-            "- **Be specific**: Show exact values (dates, times, names, emails, statuses) — never summarize vaguely.\n"
-            "- **Include links**: Extract ALL URL fields from the data and render as clickable markdown links.\n"
-            "- **People fields**: Show names WITH email addresses when available: `Name (email@example.com)`.\n"
-            "- **For single items**: Show all relevant fields as detailed field-value pairs.\n"
-            "- **For lists**: Use clean, scannable markdown tables with the most important fields. "
-            "Prioritize user-actionable, business-relevant data. Include custom fields that have values.\n"
-            "- **Exclude**: Internal system metadata, aggregate calculations, empty/null fields, technical IDs "
-            "that aren't user-facing. Show user-facing IDs/keys, hide internal ones.\n"
-            "- Store all IDs, keys, and links in referenceData.\n\n"
-        )
+        from app.utils.tool_handlers import ToolHandlerRegistry
 
+        web_tool_results: list[tuple[dict, Any]] = []
+        api_tool_results: list[tuple[dict, Any]] = []
         for r in non_retrieval:
-            tool_name = r.get('tool_name', 'unknown')
             content = ToolResultExtractor.extract_data_from_result(r.get("result", ""))
-
-            if isinstance(content, (dict, list)):
-                content_str = json.dumps(content, indent=2, default=str)
+            result_type = content.get("result_type", "") if isinstance(content, dict) else ""
+            if result_type in ("web_search", "url_content") or (
+                isinstance(content, dict) and ("web_results" in content or "blocks" in content)
+            ):
+                web_tool_results.append((r, content))
             else:
-                content_str = str(content)
+                api_tool_results.append((r, content))
 
-            parts.append(f"### {tool_name}\n")
-            parts.append(f"```json\n{content_str}\n```\n\n")
+        if web_tool_results:
+            parts.append("\n## 🌐 Web Results\n\n")
+            for r, content in web_tool_results:
+                tool_name = r.get("tool_name", "unknown")
+                handler = ToolHandlerRegistry.get_handler(content)
+                formatted_blocks = await handler.format_message(
+                    content, {"ref_mapper": ref_mapper, "config_service": config_service, "is_multimodal_llm": is_multimodal_llm}
+                )
+                parts.append(f"### {tool_name}\n")
+                for block in formatted_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block["text"] + "\n\n")
+
+            has_only_snippets = all(
+                (isinstance(c, dict) and c.get("result_type") == "web_search")
+                for _, c in web_tool_results
+            )
+            if has_only_snippets:
+                parts.append(
+                    "\n**⚠️ IMPORTANT — fetch_url tool available:**\n"
+                    "The web results above are **search snippets only**. "
+                    "You MUST call the `fetch_url` tool on the most relevant URL(s) to retrieve "
+                    "the full page content before answering.\n\n"
+                )
+
+        if api_tool_results:
+            parts.append("\n## 🔧 API Tool Results\n\n")
+            parts.append(
+                "Transform raw data into professional, informative markdown. Follow these rules:\n"
+                "- **Be specific**: Show exact values (dates, times, names, emails, statuses) — never summarize vaguely.\n"
+                "- **Include links**: Extract ALL URL fields from the data and render as clickable markdown links.\n"
+                "- **People fields**: Show names WITH email addresses when available: `Name (email@example.com)`.\n"
+                "- **For single items**: Show all relevant fields as detailed field-value pairs.\n"
+                "- **For lists**: Use clean, scannable markdown tables with the most important fields. "
+                "Prioritize user-actionable, business-relevant data. Include custom fields that have values.\n"
+                "- **Exclude**: Internal system metadata, aggregate calculations, empty/null fields, technical IDs "
+                "that aren't user-facing. Show user-facing IDs/keys, hide internal ones.\n"
+                "- Store all IDs, keys, and links in referenceData.\n\n"
+            )
+
+            for r, content in api_tool_results:
+                tool_name = r.get('tool_name', 'unknown')
+
+                if isinstance(content, (dict, list)):
+                    content_str = json.dumps(content, indent=2, default=str)
+                else:
+                    content_str = str(content)
+
+                parts.append(f"### {tool_name}\n")
+                parts.append(f"```json\n{content_str}\n```\n\n")
 
 
 
@@ -6605,27 +7375,44 @@ def _build_tool_results_context(
     if has_retrieval and non_retrieval:
         parts.append(
             "**⚠️ MODE 3 — COMBINED RESPONSE (MANDATORY)**\n"
-            "You have BOTH internal knowledge blocks (R-labels in context) AND API tool results.\n"
+            "You have BOTH internal knowledge blocks (with Citation IDs) AND API tool results.\n"
             "This is the MOST ACCURATE mode — you have both indexed historical content AND live current data.\n"
             "You MUST:\n"
             "  1. Synthesize BOTH sources into ONE coherent, comprehensive answer\n"
             "  2. Use retrieval results for historical context, background, and comprehensive coverage\n"
             "  3. Use API results for current state, real-time data, and exact IDs/keys\n"
             "  4. When sources conflict, prioritize API results for current state, but mention historical context from retrieval\n"
-            "  5. Cite every fact from internal knowledge inline: [R1-0], [R2-3]\n"
-            "  6. Include all cited labels in `blockNumbers`\n"
-            "  7. Format all API items as clickable links and include them in `referenceData`\n"
-            "  8. Combine insights: \"Based on our indexed knowledge [R1-0], and current live data, here's the complete picture...\"\n\n"
+            "  5. Cite key facts from internal knowledge using markdown links: [source](ref1). Limit to the most relevant citations — do NOT cite every sentence.\n"
         )
+        if has_web_results:
+            parts.append(
+                "  6. Cite web search results using the url/citation id.\n"
+                "  7. Format all API items as clickable links and include them in `referenceData`\n"
+            )
+        else:
+            parts.append(
+                "  6. Format all API items as clickable links and include them in `referenceData`\n"
+            )
     elif has_retrieval:
         parts.append(
-            "**INTERNAL KNOWLEDGE**: Use knowledge blocks with inline citations [R1-0].\n"
-            "Include all cited labels in `blockNumbers`.\n"
+            "**INTERNAL KNOWLEDGE**: Use knowledge blocks with inline citations [source](ref1). The system assigns citation numbers automatically.\n"
+        )
+    elif has_web_results:
+        parts.append(
+            "**WEB SEARCH DATA**: Cite web search results using the url/citation id.\n"
+            "Use EXACTLY the URL/citation id from the tool results.\n"
         )
     else:
         parts.append(
             "**API DATA**: Transform into professional markdown. "
             "Show user-facing IDs (keys), hide internal IDs.\n"
+        )
+
+    if len(non_retrieval) > 1:
+        parts.append(
+            "\n**IMPORTANT**: You have results from MULTIPLE tools. "
+            "Merge and present results from ALL tools — do NOT ignore any tool's output. "
+            "Deduplicate overlapping items but ensure every unique result is included.\n"
         )
 
     parts.append(
@@ -6644,24 +7431,22 @@ def _build_tool_results_context(
     if has_retrieval and non_retrieval:
         parts.append(
             "Return ONLY JSON matching MODE 3:\n"
-            "{\"answer\": \"...with inline [R1-0] citations...\", "
-            "\"confidence\": \"High\", "
+            "{\"answer\": \"...with inline [source](/record/abc/preview#blockIndex=0)[source](/record/def/preview#blockIndex=3) citations...\", "
+            "\"confidence\": \"<Very High | High | Medium | Low>\", "
             "\"answerMatchType\": \"Derived From Blocks\", "
-            "\"blockNumbers\": [\"R1-0\", \"R2-3\"], "
             "\"referenceData\": [{\"name\": \"...\", \"key\": \"...\", \"type\": \"...\", \"url\": \"...\"}]}\n"
         )
     elif has_retrieval:
         parts.append(
             "Return ONLY JSON:\n"
-            "{\"answer\": \"...with inline [R1-0] citations...\", "
-            "\"confidence\": \"High\", "
+            "{\"answer\": \"...with inline [source](/record/abc/preview#blockIndex=0)[source](/record/def/preview#blockIndex=3) citations...\", "
+            "\"confidence\": \"<Very High | High | Medium | Low>\", "
             "\"answerMatchType\": \"Derived From Blocks\", "
-            "\"blockNumbers\": [\"R1-0\", \"R2-3\"]}\n"
         )
     else:
         parts.append(
             "Return ONLY JSON:\n"
-            "{\"answer\": \"...\", \"confidence\": \"High\", "
+            "{\"answer\": \"...\", \"confidence\": \"<Very High | High | Medium | Low>\", "
             "\"answerMatchType\": \"Derived From Tool Execution\", "
             "\"referenceData\": [{\"name\": \"...\", \"key\": \"...\", \"type\": \"...\", \"url\": \"...\"}]}\n"
         )
@@ -6715,8 +7500,14 @@ def check_for_error(state: ChatState) -> Literal["error", "continue"]:
 def _process_retrieval_output(result: object, state: ChatState, log: logging.Logger) -> str:
     """Process retrieval tool output (accumulates results from multiple retrieval calls)"""
     try:
+        # Fast path: tool already wrote to state and returned pre-formatted content
+        if isinstance(result, str) and "<record>" in result:
+            log.info("Retrieval returned pre-formatted content (state already updated by tool)")
+            return result
+
         from app.agents.actions.retrieval.retrieval import RetrievalToolOutput
 
+        # Legacy/fallback path: parse JSON and extract data
         retrieval_output = None
 
         if isinstance(result, dict) and "content" in result and "final_results" in result:
@@ -6819,9 +7610,8 @@ def _detect_tool_result_status(result_content: object) -> str:
                 return "error"
 
         # Check tuple-style: (False, "error message")
-        if isinstance(parsed, (list, tuple)) and len(parsed) >= TOOL_RESULT_TUPLE_LENGTH:
-            if parsed[0] is False:
-                return "error"
+        if isinstance(parsed, (list, tuple)) and len(parsed) >= TOOL_RESULT_TUPLE_LENGTH and parsed[0] is False:
+            return "error"
 
     except Exception:
         pass  # If we can't parse it, assume success
@@ -6847,9 +7637,9 @@ class _ToolStreamingCallback(AsyncCallbackHandler):
         self.writer = writer
         self.config = config
         self.log = log
-        self._tool_names: Dict[str, str] = {}  # run_id -> tool_name
+        self._tool_names: dict[str, str] = {}  # run_id -> tool_name
 
-    def _write_event(self, event_data: Dict[str, Any]) -> bool:
+    def _write_event(self, event_data: dict[str, Any]) -> bool:
         """Write event to the outer graph's stream with context restoration."""
         token = var_child_runnable_config.set(self.config)
         try:
@@ -6862,7 +7652,7 @@ class _ToolStreamingCallback(AsyncCallbackHandler):
             var_child_runnable_config.reset(token)
 
     async def on_tool_start(
-        self, serialized: Dict[str, Any], input_str: str, *, run_id, **kwargs
+        self, serialized: dict[str, Any], input_str: str, *, run_id: UUID, **kwargs: object
     ) -> None:
         tool_name = serialized.get("name", kwargs.get("name", "unknown"))
         self._tool_names[str(run_id)] = tool_name
@@ -6873,7 +7663,7 @@ class _ToolStreamingCallback(AsyncCallbackHandler):
             "data": {"status": "executing", "message": status_msg}
         })
 
-    async def on_tool_end(self, output, *, run_id, **kwargs) -> None:
+    async def on_tool_end(self, output: object, *, run_id: UUID, **kwargs: object) -> None:
         tool_name = self._tool_names.pop(str(run_id), kwargs.get("name", "unknown"))
         tool_status = _detect_tool_result_status(output)
         result_preview = str(output)[:MAX_TOOL_RESULT_PREVIEW_LENGTH]
@@ -6898,7 +7688,7 @@ class _ToolStreamingCallback(AsyncCallbackHandler):
             }
         })
 
-    async def on_tool_error(self, error, *, run_id, **kwargs) -> None:
+    async def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: object) -> None:
         tool_name = self._tool_names.pop(str(run_id), kwargs.get("name", "unknown"))
         error_msg = str(error)[:200]
         self.log.info(f"Streaming tool error: {tool_name} -> {error_msg}")
@@ -6999,10 +7789,8 @@ async def react_agent_node(
             )
         finally:
             keepalive_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await keepalive_task
-            except asyncio.CancelledError:
-                pass
 
         # Extract messages from the agent result
         final_messages = result.get("messages", [])
@@ -7014,17 +7802,18 @@ async def react_agent_node(
                 tool_name = msg.name if hasattr(msg, 'name') else "unknown"
                 result_content = msg.content
 
+                # Parse JSON strings back to dicts so downstream code
+                # (_build_tool_results_context, _extract_web_records_from_tool_results)
+                # can access structured fields like result_type, blocks, web_results.
+                if isinstance(result_content, str):
+                    try:
+                        result_content = json.loads(result_content)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
                 # Process retrieval tool results to extract final_results
                 if "retrieval" in tool_name.lower():
-                    try:
-                        if isinstance(result_content, str):
-                            parsed = json.loads(result_content)
-                            _process_retrieval_output(parsed, state, log)
-                        elif isinstance(result_content, dict):
-                            _process_retrieval_output(result_content, state, log)
-                    except Exception as e:
-                        log.warning(f"Failed to process retrieval output: {e}")
-                        _process_retrieval_output(result_content, state, log)
+                    _process_retrieval_output(result_content, state, log)
 
                 # Detect actual tool success/failure from result content
                 tool_status = _detect_tool_result_status(result_content)
@@ -7083,10 +7872,12 @@ async def react_agent_node(
         }
 
         execution_plan = state.get("execution_plan") or {}
-        # Temporary guard: do not let respond_node take direct-answer shortcut
-        # after ReAct handoff; this avoids fallback-style responses when ReAct
-        # decides not to call tools in the first pass.
-        execution_plan["can_answer_directly"] = False
+        # When react agent answered directly without calling any tools (e.g.
+        # capability questions, greetings), let respond_node use the
+        # _generate_direct_response path which has the capability summary and
+        # user context.  When tools WERE called, keep can_answer_directly=False
+        # so the full synthesis pipeline runs with citations and tool results.
+        execution_plan["can_answer_directly"] = (total_tools == 0)
         state["execution_plan"] = execution_plan
 
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -7320,7 +8111,12 @@ def _build_react_system_prompt(state: ChatState, log: logging.Logger) -> str:
     if agent_instructions and agent_instructions.strip():
         instructions_prefix = f"## Agent Instructions\n{agent_instructions.strip()}\n\n"
 
-    base_prompt = instructions_prefix + """You are an intelligent AI assistant that uses tools to help users accomplish tasks. You follow a structured reasoning process for every action to ensure correctness and reliability.
+    persona = state.get("system_prompt")
+    role_prefix = ""
+    if is_custom_agent_system_prompt(persona):
+        role_prefix = f"{persona.strip()}\n\n"
+
+    base_prompt = instructions_prefix + role_prefix + """You are an intelligent AI assistant that uses tools to help users accomplish tasks. You follow a structured reasoning process for every action to ensure correctness and reliability.
 
 ## Reasoning Protocol (MANDATORY)
 
@@ -7366,6 +8162,8 @@ You MUST follow this protocol for EVERY tool interaction. Think step-by-step.
 ### Before giving your final response:
 1. **COMPLETENESS CHECK**: Did I accomplish EVERYTHING the user asked for? Don't stop partway.
 2. **DATA ACCURACY**: Am I presenting accurate data from actual tool results? Never fabricate data.
+   - **NEVER generate fake data from conversation history.** If user asks for "more results", "next page", or "page 2", you MUST call the tool again with updated pagination parameters (e.g., page=2, limit=50). Do NOT invent rows from memory.
+   - Previous tool results in conversation history are READ-ONLY context — use them to understand what was already shown, but ALWAYS call tools to fetch new data.
 3. **FORMATTING**: Use clear, professional markdown formatting.
 
 ## Write-Action Field Quick Reference
@@ -7428,16 +8226,35 @@ When a tool call returns an error, DO NOT give up immediately. Follow this proce
    - "update"/"modify"/"change"/"extend"/"reschedule" → UPDATE tools
    - "delete"/"remove"/"cancel" → DELETE tools
 
-3. **ID Resolution — NEVER ask users for internal IDs**:
+3. **Topic Discovery — Hybrid Search** (HIGHEST PRIORITY):
+   When the user query contains a topic/keyword and asks to discover related items
+   (list, find, show, search, browse), call ALL available search dimensions in parallel:
+   - `knowledgehub.list_files` → finds items by name/metadata in the index
+   - Service search tools → searches live data via the service API
+   - `retrieval_search_internal_knowledge` → searches within indexed document content
+
+   This applies regardless of what word the user uses ("files", "pages", "docs", "data", etc.)
+   and regardless of whether they name a specific service.
+   Only skip a dimension if its tool is not available.
+
+   **Exceptions (use specific tools only):**
+   - Exact ID lookup → live API only
+   - Write actions → live API write tool only
+   - Filtered stateful queries ("my open tickets this sprint") → live API only
+   - Pure greetings or arithmetic → can answer directly
+
+4. **ID Resolution — NEVER ask users for internal IDs**:
    - Users don't know event_id, message_id, page_id, space_id, drive_id, etc.
    - ALWAYS resolve IDs by searching/listing first, then using the result.
    - Check conversation history and reference data for previously retrieved IDs before searching again.
 
-4. **Task Completion**: Continue calling tools until the user's request is FULLY satisfied. Do not stop partway through a multi-step task.
+5. **Task Completion**: Continue calling tools until the user's request is FULLY satisfied. Do not stop partway through a multi-step task.
 
-5. **Response Format**:
+6. **Pagination**: When the user asks for "more", "next page", or additional results from a previous tool call, you MUST call the same tool again with the correct pagination parameters (page, limit, offset). NEVER fabricate additional results from memory or conversation history.
+
+7. **Response Format**:
    - For API tool results: Transform data into professional markdown (tables, lists, summaries).
-   - For retrieval/internal knowledge: Include inline citations like [R1-1] after each fact.
+   - For retrieval/internal knowledge: Include inline citations as markdown links [source](ref1) after key facts. Limit to the most relevant citations — do NOT cite every sentence. The system assigns citation numbers automatically.
    - Store technical IDs in referenceData for follow-up queries.
 
 ## Execution Policy (MANDATORY)
@@ -7462,7 +8279,7 @@ When a tool call returns an error, DO NOT give up immediately. Follow this proce
   unavailable if execution returns an explicit auth/connection error.
 - **Date normalization is mandatory before tool calls**:
    - Convert ALL relative date phrases to absolute ISO dates (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS) before calling tools.
-   - Use user's timezone and current time from the Temporal Context section.
+   - Use **Current time** and **Time zone** (when present) from the **Time context** section.
    - Do NOT ask user to provide dates when relative dates are resolvable.
    - Common mappings:
      - "today" → current date
@@ -7483,6 +8300,34 @@ When a tool call returns an error, DO NOT give up immediately. Follow this proce
      b) Execute each step in order, using results from previous steps.
      c) If one step fails, try to recover (Error Recovery Protocol) before giving up.
      d) Report the complete result at the end, not after each step.
+
+## Knowledge Search (MANDATORY — apply before any other decision)
+
+When `retrieval_search_internal_knowledge` is available and knowledge sources are configured:
+
+**ALWAYS search for ANY of these:**
+- A topic, keyword, concept, name, or phrase (even a single bare word)
+- An information or documentation request ("what is X", "how does Y work", "tell me about Z")
+- Any question that could be answered from indexed documents or connected services
+- A short phrase with no explicit verb — treat it as a topic to search for
+
+**NEVER skip retrieval and answer directly for the above.** Zero tool calls for a substantive
+topic query is WRONG — it means the user gets no information from the knowledge base.
+
+**Default: when the query has a topic, SEARCH in parallel across all configured sources.**
+Use the routing signals in the Knowledge & Data Sources section to select which connector(s)
+to target. If unsure → search ALL sources.
+
+**Skip retrieval ONLY for:**
+- Pure greetings or thanks ("hi", "thanks")
+- Simple arithmetic or date calculations
+- User asking about their own identity/profile
+- Write actions where you have all required parameters already
+
+## Response Hygiene (CRITICAL)
+- **NEVER** expose internal system terms in your response: `can_answer_directly`, `needs_clarification`.
+- **NEVER** echo back the `## Current User Information` block or its Usage section verbatim — it is system context for you, not content to repeat to the user.
+- Write all responses as natural, professional prose as if you are conversing directly with the user.
 """
 
     # ── Build Available Tools section with full schemas ──────────────────────
@@ -7515,19 +8360,36 @@ When a tool call returns an error, DO NOT give up immediately. Follow this proce
     final_results = state.get("final_results", [])
     has_retrieval = bool(final_results)
 
+    has_web_search = bool(state.get("web_search_config"))
+
     if has_retrieval:
         base_prompt += """
-## Citation Rules (CRITICAL)
+## Citation Rules
 
 When you have internal knowledge from retrieval tools:
-1. Put citation IMMEDIATELY after each fact: "Revenue grew 29% [R1-1]."
-2. One citation per bracket: [R1-1][R2-3] NOT [R1-1, R2-3]
-3. Include ALL cited blocks in your response
-4. Do NOT put citations at end of paragraph — inline after each fact
+1. Cite key facts inline: "Revenue grew 29% [source](ref5)." Focus on the most important claims — do NOT cite every sentence.
+2. Use the EXACT Citation ID from the context as a markdown link: [source](ref1). Do NOT manually number citations — the system assigns numbers automatically.
+3. One citation per markdown link. Do NOT club multiple Citation IDs in one link.
+4. Limit to the most relevant citations overall.
+5. Do NOT put citations at end of paragraph — inline after the specific fact
+6. If you cannot find the Citation ID for a fact, omit the citation rather than guessing.
+"""
+
+    if has_web_search:
+        base_prompt += """
+## Web Search Rules
+
+- Prefer `web_search` over training data for anything that may have changed: news, prices, weather, sports, stocks, software versions, docs, regulations, current events.
+- Also prefer `web_search` when user asks for "latest", "current", or "up-to-date" info.
+- Prefer `web_search` for general/public knowledge queries: product recommendations, comparisons, reviews, health/medical info, consumer advice, market research, "best X" queries, travel, recipes, scientific research.
+- Use training data only for timeless knowledge (math, science, core concepts). When in doubt, prefer `web_search`.
+- When a query could have BOTH internal AND external relevance, use BOTH `retrieval.search_internal_knowledge` AND `web_search` in parallel.
+- **MANDATORY**: If the available context or retrieval results do NOT contain sufficient information to answer the user's question, you MUST use `web_search` to find relevant information BEFORE telling the user that you don't have enough information or context.
+- Cite web results as [source](URL/citation id). Use EXACTLY the URL/citation id shown.
 """
 
     # ── Hybrid search strategy ──────────────────────────────────────────────
-    has_knowledge = bool(state.get("agent_knowledge"))
+    has_knowledge = state.get("has_knowledge", False)
     has_service_tools = any([
         _has_jira_tools(state),
         _has_confluence_tools(state),
@@ -7535,6 +8397,8 @@ When you have internal knowledge from retrieval tools:
         _has_outlook_tools(state),
         _has_slack_tools(state),
         _has_teams_tools(state),
+        _has_github_tools(state),
+        _has_clickup_tools(state),
     ])
 
     if has_knowledge and has_service_tools:
@@ -7564,12 +8428,16 @@ Use this decision tree to choose the right approach:
 - **Cross-service summaries**: "What happened in last quarter's planning?"
   → Retrieval may have indexed content from multiple sources.
 
+### When to use `web_search`:
+- Current/changing info (news, prices, weather, software versions, latest docs, regulations) or when user asks for "latest"/"current"/"up-to-date" info.
+- When in doubt whether internal knowledge or training data is current enough → prefer `web_search`.
+
 ### How to merge hybrid results:
-1. Call both tools (retrieval + service API).
-2. Analyze both results for overlapping and unique information.
-3. Present a unified answer that combines insights from both sources.
-4. Use citations [R1-1] for retrieval-sourced facts.
-5. Clearly attribute live API data (e.g., "According to your Outlook calendar..." or "From Confluence...").
+1. Call the appropriate tools (retrieval + service API + web_search as needed).
+2. Present a unified answer combining insights from all sources.
+4. For internal knowledge (retrieval): cite as [source](ref1) using the Citation ID from the context blocks.
+5. For web search/fetch_url results: cite as [source](URL/citation id) using the URL/citation id.
+6. Clearly attribute live API data (e.g., "According to your Outlook calendar..." or "From Confluence...").
 """
 
     # Add tool-specific guidance
@@ -7584,6 +8452,19 @@ Use this decision tree to choose the right approach:
 
     if _has_outlook_tools(state):
         base_prompt += "\n" + OUTLOOK_GUIDANCE
+
+    if _has_zoom_tools(state):
+        base_prompt += "\n" + ZOOM_GUIDANCE
+
+    if _has_salesforce_tools(state):
+        base_prompt += "\n" + SALESFORCE_GUIDANCE
+
+    if _has_clickup_tools(state):
+        base_prompt += "\n" + CLICKUP_GUIDANCE
+    if _has_mariadb_tools(state):
+        base_prompt += "\n" + MARIADB_GUIDANCE
+    if _has_redshift_tools(state):
+        base_prompt += "\n" + REDSHIFT_GUIDANCE
 
     # ── Multi-step workflow patterns ─────────────────────────────────────────
     workflow_patterns = _build_workflow_patterns(state)
@@ -7600,15 +8481,16 @@ Use this decision tree to choose the right approach:
         base_prompt += "\n" + TEAMS_GUIDANCE
 
     # Add timezone / current time context if provided
-    timezone = state.get("timezone")
-    current_time = state.get("current_time")
-    if timezone or current_time:
-        time_parts = []
-        if current_time:
-            time_parts.append(f"Current time: {current_time}")
-        if timezone:
-            time_parts.append(f"User timezone: {timezone}")
-        base_prompt += "\n\n## Temporal Context\n" + "\n".join(time_parts)
+    time_block = build_llm_time_context(
+        current_time=state.get("current_time"),
+        time_zone=state.get("timezone"),
+    )
+    if time_block:
+        base_prompt += "\n\n" + time_block
+
+    # ── Capability summary ────────────────────────────────────────────────────
+    capability_summary = build_capability_summary(state)
+    base_prompt += "\n\n" + capability_summary
 
     # ── User context ─────────────────────────────────────────────────────────
     user_context = _format_user_context(state)
@@ -7671,100 +8553,7 @@ def _get_tool_status_message(tool_name: str) -> str:
     return f"{action_readable}..."
 
 
-def _process_react_chunk(
-    chunk: Dict,
-    writer: StreamWriter,
-    config: RunnableConfig,
-    state: ChatState,
-    log: logging.Logger
-) -> None:
-    """
-    Process ReAct agent chunk for streaming.
-
-    Streams rich status events to the frontend matching the legacy planner's
-    format: descriptive status messages for each tool call, error detection
-    on results, and AI reasoning/content streaming.
-    """
-    try:
-        messages = chunk.get("messages", [])
-
-        for msg in messages:
-            # Stream tool calls with descriptive status messages
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                for tool_call in msg.tool_calls:
-                    tool_name = tool_call.get("name", "unknown")
-
-                    # Stream a human-readable status event (like legacy planner)
-                    status_msg = _get_tool_status_message(tool_name)
-                    safe_stream_write(writer, {
-                        "event": "status",
-                        "data": {"status": "executing", "message": status_msg}
-                    }, config)
-
-                    # Also stream the detailed tool_call event
-                    safe_stream_write(writer, {
-                        "event": "tool_call",
-                        "data": {
-                            "tool": tool_name,
-                            "args": tool_call.get("args", {}),
-                            "id": tool_call.get("id", "")
-                        }
-                    }, config)
-
-            # Stream tool results with error detection
-            if isinstance(msg, ToolMessage):
-                tool_name = getattr(msg, 'name', 'unknown')
-                tool_status = _detect_tool_result_status(msg.content)
-
-                # Stream status update based on result
-                if tool_status == "error":
-                    safe_stream_write(writer, {
-                        "event": "status",
-                        "data": {
-                            "status": "executing",
-                            "message": f"Retrying {tool_name.split('.', 1)[-1].replace('_', ' ')} with corrected parameters..."
-                        }
-                    }, config)
-
-                safe_stream_write(writer, {
-                    "event": "tool_result",
-                    "data": {
-                        "tool": tool_name,
-                        "result": msg.content[:MAX_TOOL_RESULT_PREVIEW_LENGTH] if len(msg.content) > MAX_TOOL_RESULT_PREVIEW_LENGTH else msg.content,
-                        "status": tool_status
-                    }
-                }, config)
-
-            # Stream AI reasoning and responses
-            if isinstance(msg, AIMessage) and msg.content:
-                # If the message also has tool_calls, this is reasoning before a tool call
-                # Stream it as a thinking/status event rather than content
-                if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                    # This is the LLM's reasoning text before making a tool call
-                    reasoning = msg.content.strip()
-                    if reasoning:
-                        safe_stream_write(writer, {
-                            "event": "status",
-                            "data": {
-                                "status": "thinking",
-                                "message": reasoning[:_REASONING_DISPLAY_LEN] + ("..." if len(reasoning) > _REASONING_DISPLAY_LEN else "")
-                            }
-                        }, config)
-                else:
-                    # This is the final response — stream as content chunks
-                    content = msg.content
-                    chunk_size = 10
-                    for i in range(0, len(content), chunk_size):
-                        chunk_text = content[i:i + chunk_size]
-                        safe_stream_write(writer, {
-                            "event": "content",
-                            "data": {"text": chunk_text}
-                        }, config)
-    except Exception as e:
-        log.warning(f"Error processing ReAct chunk: {e}")
-
-
-def _extract_final_response(messages: List, log: logging.Logger) -> str:
+def _extract_final_response(messages: list, log: logging.Logger) -> str:
     """Extract final response from agent messages"""
     # Find last AIMessage with content that is NOT a tool-calling message
     # (tool-calling messages have non-empty tool_calls lists — their content is reasoning, not the answer)
@@ -7783,353 +8572,6 @@ def _extract_final_response(messages: List, log: logging.Logger) -> str:
     return "I completed the task, but couldn't generate a response."
 
 
-def _extract_citations_and_metadata(
-    tool_results: List[Dict],
-    final_results: List[Dict],
-    has_retrieval: bool,
-    api_tools: List[Dict],
-    response: str,
-    log: logging.Logger,
-    virtual_record_map: Optional[Dict[str, Dict[str, Any]]] = None
-) -> tuple[List[Dict], List[str], List[Dict], str]:
-    """
-    Extract citations, block numbers, reference data, and determine answerMatchType.
-
-    Returns:
-        Tuple of (citations, block_numbers, reference_data, answer_match_type)
-    """
-    citations = []
-    block_numbers = []
-    reference_data = []
-
-    # Extract block numbers from response (e.g., [R1-1], [R2-3])
-    import re
-    block_pattern = re.compile(r'\[R(\d+)-(\d+)\]')
-    matches = block_pattern.findall(response)
-    for match in matches:
-        block_num = f"R{match[0]}-{match[1]}"
-        if block_num not in block_numbers:
-            block_numbers.append(block_num)
-
-    # Extract citations from retrieval results (same as old system)
-    if has_retrieval and final_results:
-        # Use block_number from results if available (set by retrieval tool)
-        for result in final_results:
-            block_num = result.get("block_number")
-            if not block_num:
-                # Fallback: generate block number from virtual_record_id
-                virtual_id = result.get("virtual_record_id", "")
-                if virtual_id and virtual_record_map:
-                    # Try to get record number from virtual_record_map
-                    record_data = virtual_record_map.get(virtual_id, {})
-                    record_num = record_data.get("record_number", 1)
-                    block_index = result.get("block_index", 0)
-                    block_num = f"R{record_num}-{block_index}"
-                else:
-                    # Last resort: use index
-                    idx = final_results.index(result) if result in final_results else 0
-                    block_num = f"R1-{idx+1}"
-
-            citations.append({
-                "source": result.get("source", "internal_knowledge"),
-                "type": "retrieval",
-                "content": str(result.get("content", ""))[:200],
-                "virtual_id": result.get("virtual_record_id", ""),
-                "block_id": block_num
-            })
-
-            # Add to block_numbers if not already there
-            if block_num and block_num not in block_numbers:
-                block_numbers.append(block_num)
-
-    # Extract reference data from API tool results
-    for tool_result in api_tools:
-        if tool_result.get("status") == "success":
-            result = tool_result.get("result", "")
-            ref_data = _extract_reference_data_from_result(result, tool_result.get("tool_name", ""))
-            if ref_data:
-                reference_data.extend(ref_data)
-
-    # Determine answerMatchType
-    if has_retrieval and api_tools:
-        answer_match_type = "Derived From Blocks"  # Mixed: retrieval + API
-    elif has_retrieval:
-        answer_match_type = "Derived From Blocks"  # Only retrieval
-    elif api_tools:
-        answer_match_type = "Derived From Tool Execution"  # Only API tools
-    else:
-        answer_match_type = "Direct Answer"  # No tools used
-
-    return citations, block_numbers, reference_data, answer_match_type
-
-
-def _extract_reference_data_from_result(result: object, tool_name: str) -> List[Dict]:
-    """
-    Extract reference data (IDs, keys, timestamps) from tool results so they can
-    be surfaced to the planner for follow-up queries.
-
-    Each returned dict has at minimum: {"type": str, "name": str} and usually "id"
-    and/or "key" fields that the planner can reference directly.
-    """
-    reference_data = []
-    tn_lower = tool_name.lower()
-
-    try:
-        # ── Normalise result to a Python object ─────────────────────────────
-        if isinstance(result, str):
-            try:
-                result = json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                return reference_data
-
-        # Unwrap tuple format (success, data)
-        # Tools return (bool, str) tuple - extract the data part
-        if isinstance(result, tuple) and len(result) == TOOL_RESULT_TUPLE_LENGTH:
-            result = result[1]
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except (json.JSONDecodeError, ValueError):
-                    return reference_data
-
-        # ── Confluence spaces ────────────────────────────────────────────────
-        # confluence.get_spaces → {"data": {"results": [{id, key, name, _links, ...}]}}
-        if "confluence" in tn_lower and "space" in tn_lower:
-            if isinstance(result, dict):
-                data = result.get("data", {})
-                spaces_list: List = []
-                # Extract base URL from the root _links (Confluence v2 API)
-                confluence_base_url = ""
-                if isinstance(data, dict):
-                    root_links = data.get("_links", {})
-                    if isinstance(root_links, dict):
-                        confluence_base_url = root_links.get("base", "")
-                    spaces_list = data.get("results", [])
-                elif isinstance(data, list):
-                    spaces_list = data
-                for space in spaces_list:
-                    if not isinstance(space, dict):
-                        continue
-                    # Confluence v2 API may return id as integer or string
-                    raw_id = space.get("id")
-                    space_id = str(raw_id).strip() if raw_id is not None else ""
-                    space_key = space.get("key", "")
-                    space_name = space.get("name", "")
-                    # Build web URL from _links.webui
-                    space_url = ""
-                    space_links = space.get("_links", {})
-                    if isinstance(space_links, dict):
-                        webui = space_links.get("webui", "")
-                        if webui and confluence_base_url:
-                            space_url = f"{confluence_base_url.rstrip('/')}{webui}"
-                        elif webui:
-                            space_url = webui
-                    if space_id or space_key:
-                        ref_entry: Dict[str, Any] = {
-                            "name": space_name,
-                            "id": space_id,
-                            "key": space_key,
-                            "type": "confluence_space",
-                        }
-                        if space_url:
-                            ref_entry["url"] = space_url
-                        reference_data.append(ref_entry)
-            return reference_data
-
-        # ── Confluence pages ─────────────────────────────────────────────────
-        # confluence.get_pages_in_space / search_pages / get_page_content
-        if "confluence" in tn_lower and any(k in tn_lower for k in ("page", "search", "child")):
-            if isinstance(result, dict):
-                data = result.get("data", {})
-                pages_list: List = []
-                # Extract base URL from the root _links (Confluence v2 API)
-                confluence_base_url = ""
-                if isinstance(data, dict):
-                    root_links = data.get("_links", {})
-                    if isinstance(root_links, dict):
-                        confluence_base_url = root_links.get("base", "")
-                    pages_list = data.get("results", [])
-                    # Single-page result: get_page_content embeds metadata in data
-                    if not pages_list and "id" in data:
-                        pages_list = [data]
-                elif isinstance(data, list):
-                    pages_list = data
-                for page in pages_list:
-                    if not isinstance(page, dict):
-                        continue
-                    raw_id = page.get("id")
-                    page_id = str(raw_id).strip() if raw_id is not None else ""
-                    page_title = page.get("title", "") or page.get("name", "")
-                    space_key = ""
-                    if isinstance(page.get("space"), dict):
-                        space_key = page["space"].get("key", "")
-                    if page_id:
-                        reference_data.append({
-                            "name": page_title,
-                            "id": page_id,
-                            "key": space_key,
-                            "type": "confluence_page",
-                        })
-            return reference_data
-
-        # ── Slack channels ───────────────────────────────────────────────────
-        if "slack" in tn_lower and "channel" in tn_lower:
-            if isinstance(result, dict):
-                data = result.get("data", {})
-                channels_list: List = []
-                if isinstance(data, dict):
-                    channels_list = data.get("channels", data.get("results", []))
-                elif isinstance(data, list):
-                    channels_list = data
-                for ch in channels_list:
-                    if not isinstance(ch, dict):
-                        continue
-                    ch_id = ch.get("id", "")
-                    ch_name = ch.get("name", "")
-                    # Slack deep link for channels (workspace-agnostic)
-                    ch_url = ch.get("permalink") or ch.get("url", "")
-                    if ch_id:
-                        ref_entry = {
-                            "name": f"#{ch_name}" if ch_name else ch_id,
-                            "id": ch_id,
-                            "type": "slack_channel",
-                        }
-                        if ch_url:
-                            ref_entry["url"] = ch_url
-                        reference_data.append(ref_entry)
-            return reference_data
-
-        # ── Slack messages / threads ─────────────────────────────────────────
-        # send_message / reply_to_message return the message timestamp ("ts")
-        # which is needed for threading (reply_to_message thread_ts).
-        if "slack" in tn_lower and any(k in tn_lower for k in ("message", "reply", "send")):
-            if isinstance(result, dict):
-                data = result.get("data", {})
-                if not isinstance(data, dict):
-                    data = {}
-                ts = data.get("ts") or result.get("ts", "")
-                channel = data.get("channel") or result.get("channel", "")
-                permalink = data.get("permalink") or result.get("permalink", "")
-                if ts:
-                    msg_ref: Dict[str, Any] = {
-                        "name": "Posted message timestamp",
-                        "id": str(ts),
-                        "type": "slack_message_ts",
-                    }
-                    if permalink:
-                        msg_ref["url"] = permalink
-                    reference_data.append(msg_ref)
-                if channel:
-                    reference_data.append({
-                        "name": channel,
-                        "id": channel,
-                        "type": "slack_channel",
-                    })
-            return reference_data
-
-        # ── Jira ─────────────────────────────────────────────────────────────
-        # Only process Jira data when the tool is actually a Jira tool.
-        # Without this guard, Confluence results that happen to contain a "key"
-        # field would be misclassified as Jira entities.
-        if "jira" in tn_lower and isinstance(result, dict):
-            data = result.get("data", {})
-
-            # Issues list: {"data": {"issues": [...]}}
-            if isinstance(data, dict):
-                issues = data.get("issues", [])
-                if isinstance(issues, list):
-                    for issue in issues:
-                        if not isinstance(issue, dict):
-                            continue
-                        issue_id = issue.get("id", "")
-                        issue_key = issue.get("key", "")
-                        issue_url = issue.get("url", "")
-                        if issue_key or issue_id:
-                            ref: Dict[str, Any] = {
-                                "name": issue.get("summary", ""),
-                                "key": issue_key,
-                                "type": "jira_issue",
-                            }
-                            if issue_id:
-                                ref["id"] = str(issue_id)
-                            if issue_url:
-                                ref["url"] = issue_url
-                            reference_data.append(ref)
-
-            # Single issue at data level (get_issue / create_issue response)
-            if isinstance(data, dict) and "key" in data:
-                issue_key = data.get("key", "")
-                issue_id = data.get("id", "")
-                issue_url = data.get("url", "")
-                if issue_key or issue_id:
-                    ref = {
-                        "name": data.get("summary", ""),
-                        "key": issue_key,
-                        "type": "jira_issue",
-                    }
-                    if issue_id:
-                        ref["id"] = str(issue_id)
-                    if issue_url:
-                        ref["url"] = issue_url
-                    reference_data.append(ref)
-
-            # Projects list: {"data": [...]}
-            if isinstance(data, list):
-                for project in data:
-                    if not isinstance(project, dict):
-                        continue
-                    project_id = project.get("id", "")
-                    project_key = project.get("key", "")
-                    if project_key or project_id:
-                        ref = {
-                            "name": project.get("name", ""),
-                            "key": project_key,
-                            "type": "jira_project",
-                        }
-                        if project_id:
-                            ref["id"] = str(project_id)
-                        reference_data.append(ref)
-
-            # Direct issue / project at result top-level (e.g. create_issue response)
-            if "key" in result:
-                item_id = result.get("id", "")
-                item_key = result.get("key", "")
-                item_url = result.get("url", "")
-                if item_key or item_id:
-                    ref = {
-                        "name": result.get("summary") or result.get("name", ""),
-                        "key": item_key,
-                        "type": "jira_issue" if "summary" in result else "jira_project",
-                    }
-                    if item_id:
-                        ref["id"] = str(item_id)
-                    if item_url:
-                        ref["url"] = item_url
-                    reference_data.append(ref)
-
-        elif "jira" in tn_lower and isinstance(result, list):
-            for item in result:
-                if not isinstance(item, dict) or "key" not in item:
-                    continue
-                item_id = item.get("id", "")
-                item_key = item.get("key", "")
-                item_url = item.get("url", "")
-                if item_key or item_id:
-                    ref = {
-                        "name": item.get("summary") or item.get("name", ""),
-                        "key": item_key,
-                        "type": "jira_issue" if "summary" in item else "jira_project",
-                    }
-                    if item_id:
-                        ref["id"] = str(item_id)
-                    if item_url:
-                        ref["url"] = item_url
-                    reference_data.append(ref)
-
-    except Exception as e:
-        logger.debug(f"Error extracting reference data from {tool_name}: {e}")
-
-    return reference_data
 
 
 # ============================================================================

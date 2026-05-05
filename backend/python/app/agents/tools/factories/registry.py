@@ -2,12 +2,20 @@
 Registry for managing client factories.
 """
 
-from typing import Dict, Optional
+from typing import Optional
 
 from app.agents.tools.config import ToolDiscoveryConfig
 from app.agents.tools.factories.base import ClientFactory
+from app.agents.tools.factories.clickup import ClickUpClientFactory
 from app.agents.tools.factories.confluence import ConfluenceClientFactory
 from app.agents.tools.factories.dropbox import DropboxClientFactory
+from app.agents.tools.factories.google import GoogleClientFactory
+from app.agents.tools.factories.jira import JiraClientFactory
+from app.agents.tools.factories.linear import LinearClientFactory
+from app.agents.tools.factories.lumos import LumosClientFactory
+from app.agents.tools.factories.microsoft import MSGraphClientFactory
+from app.agents.tools.factories.notion import NotionClientFactory
+from app.agents.tools.factories.slack import SlackClientFactory
 
 # from app.agents.tools.factories.linkedin import LinkedInClientFactory
 # from app.agents.tools.factories.freshdesk import FreshDeskClientFactory
@@ -23,9 +31,13 @@ from app.agents.tools.factories.github import GitHubClientFactory
 from app.agents.tools.factories.google import GoogleClientFactory
 from app.agents.tools.factories.jira import JiraClientFactory
 from app.agents.tools.factories.linear import LinearClientFactory
+from app.agents.tools.factories.mariadb import MariaDBClientFactory
 from app.agents.tools.factories.microsoft import MSGraphClientFactory
 from app.agents.tools.factories.notion import NotionClientFactory
+from app.agents.tools.factories.redshift import RedshiftClientFactory
 from app.agents.tools.factories.slack import SlackClientFactory
+from app.agents.tools.factories.salesforce import SalesforceClientFactory
+from app.agents.tools.factories.zoom import ZoomClientFactory
 
 # from app.agents.tools.factories.gitlab import GitLabClientFactory
 
@@ -37,7 +49,7 @@ class ClientFactoryRegistry:
     Provides centralized access to client factories and automatic initialization.
     """
 
-    _factories: Dict[str, ClientFactory] = {}
+    _factories: dict[str, ClientFactory] = {}
     _initialized: bool = False
 
     @classmethod
@@ -131,6 +143,9 @@ class ClientFactoryRegistry:
             elif app_name == "notion":
                 cls.register(app_name, NotionClientFactory())
 
+            elif app_name == "clickup":
+                cls.register(app_name, ClickUpClientFactory())
+
             elif app_name == "microsoft":
                 # Register factories for Microsoft sub-services
                 for subdir in config.subdirectories:
@@ -147,6 +162,13 @@ class ClientFactoryRegistry:
 
             elif app_name == "linear":
                 cls.register(app_name, LinearClientFactory())
+
+            elif app_name == "mariadb":
+                cls.register(app_name, MariaDBClientFactory())
+            elif app_name == "lumos":
+                cls.register(app_name, LumosClientFactory())
+            elif app_name == "redshift":
+                cls.register(app_name, RedshiftClientFactory())
 
             # elif app_name == "linkedin":
             #     cls.register(app_name, LinkedInClientFactory())
@@ -183,6 +205,12 @@ class ClientFactoryRegistry:
 
             elif app_name == "github":
                 cls.register(app_name, GitHubClientFactory())
+
+            elif app_name == "zoom":
+                cls.register(app_name, ZoomClientFactory())
+
+            elif app_name == "salesforce":
+                cls.register(app_name, SalesforceClientFactory())
 
             # elif app_name == "gitlab":
             #     cls.register(app_name, GitLabClientFactory())
