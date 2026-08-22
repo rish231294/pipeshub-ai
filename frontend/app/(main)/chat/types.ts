@@ -802,6 +802,8 @@ export interface StreamChatRequest {
   };
   timezone?: string;
   currentTime?: string;
+  /** BCP-47 tag from the Language setting; omitted when it is the default (see utils/response-language.ts). */
+  responseLanguage?: string;
   appliedFilters?: AppliedFilters;
   conversationId?: string;
   /** When set, the stream uses /api/v1/agents/:id/conversations/.../stream */

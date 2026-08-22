@@ -124,6 +124,7 @@ class TestBuildInitialState:
             "instructions": "Focus on finance",
             "timezone": "America/New_York",
             "currentTime": "2025-01-01T00:00:00",
+            "responseLanguage": "de-DE",
             "outputFilePath": "/tmp/out.txt",
             "conversationId": "conv-123",
             "previousConversations": [{"role": "user_query", "content": "hi"}],
@@ -141,9 +142,22 @@ class TestBuildInitialState:
         assert state["instructions"] == "Focus on finance"
         assert state["timezone"] == "America/New_York"
         assert state["current_time"] == "2025-01-01T00:00:00"
+        assert state["response_language"] == "de-DE"
         assert state["output_file_path"] == "/tmp/out.txt"
         assert state["conversation_id"] == "conv-123"
         assert len(state["previous_conversations"]) == 1
+
+    def test_response_language_defaults_to_none(self, mock_deps, minimal_user_info):
+        state = build_initial_state(chat_query={"query": "q"}, user_info=minimal_user_info, **mock_deps)
+        assert state["response_language"] is None
+
+    def test_malformed_response_language_is_dropped_not_raised(self, mock_deps, minimal_user_info):
+        state = build_initial_state(
+            chat_query={"query": "q", "responseLanguage": "not a locale"},
+            user_info=minimal_user_info,
+            **mock_deps,
+        )
+        assert state["response_language"] is None
 
     def test_with_toolsets(self, mock_deps, minimal_user_info):
         cq = {

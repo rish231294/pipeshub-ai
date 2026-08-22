@@ -50,6 +50,7 @@ from app.modules.agents.context.knowledge_context import _build_knowledge_contex
 from app.modules.agents.context.tool_surface import ToolSurfaces
 from app.modules.agents.context.user_context import _format_user_context
 from app.modules.agents.qna.chat_state import is_custom_agent_system_prompt
+from app.utils.response_language import build_llm_response_language_context
 from app.utils.time_conversion import build_llm_time_context
 
 if TYPE_CHECKING:
@@ -590,6 +591,10 @@ class PipesHubPromptBuilder:
 
         # ── User context + skills (Band B) ────────────────────────────────────
         tpl.set("user_context", _format_user_context(state) or None)
+        tpl.set(
+            "response_language",
+            build_llm_response_language_context(self._context.response_language) or None,
+        )
         tpl.set("skills_overview", render_skills_overview(runtime) or None)
         tpl.set(
             "answer_confidence",

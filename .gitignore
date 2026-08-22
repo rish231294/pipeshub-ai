@@ -221,3 +221,4 @@ backend/python/.claude/settings.local.json
 loadtest/results/
 # Host + bearer token for a load-test target environment.
 .env.play
+docs/reviews

@@ -5917,6 +5917,15 @@ components:
           description: |
             ISO 8601 / RFC 3339 datetime from the client (top-level field; UTC `Z` or numeric offset).
           example: "2026-04-12T16:00:00+05:30"
+        responseLanguage:
+          type: string
+          pattern: '^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$'
+          description: |
+            BCP-47 language tag from the workspace Language setting (e.g. `de-DE`).
+            When present, the AI is instructed to write its final answer in that
+            language regardless of the language of the question or sources.
+            Omit to let the model follow the language of the question.
+          example: "de-DE"
         tools:
           type: array
           items:
@@ -6064,6 +6073,15 @@ components:
           description: |
             Client time in ISO 8601 / RFC 3339 format (UTC `Z` or numeric
             offset). Sent alongside `timezone` for time-aware answers.
+        responseLanguage:
+          type: string
+          pattern: '^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$'
+          description: |
+            BCP-47 language tag from the workspace Language setting (e.g. `de-DE`).
+            When present, the AI is instructed to write its final answer in that
+            language regardless of the language of the question or sources.
+            Omit to let the model follow the language of the question.
+          example: "de-DE"
         tools:
           type: array
           items:
@@ -6093,6 +6111,7 @@ components:
         chatMode: quick
         timezone: Asia/Kolkata
         currentTime: "2026-05-19T12:58:01+05:30"
+        responseLanguage: de-DE
         tools: []
         filters:
           apps:
@@ -6183,6 +6202,15 @@ components:
             ISO 8601 / RFC 3339 datetime from the client (UTC `Z` or numeric
             offset). Used to anchor any relative time references in the query.
           example: "2026-05-11T15:43:21+05:30"
+        responseLanguage:
+          type: string
+          pattern: '^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$'
+          description: |
+            BCP-47 language tag from the workspace Language setting (e.g. `de-DE`).
+            When present, the AI is instructed to write its final answer in that
+            language regardless of the language of the question or sources.
+            Omit to let the model follow the language of the question.
+          example: "de-DE"
         tools:
           type: array
           items:
@@ -6274,6 +6302,15 @@ components:
           description: |
             ISO 8601 / RFC 3339 datetime from the client (top-level field; UTC `Z` or numeric offset).
           example: "2026-04-12T16:00:00+05:30"
+        responseLanguage:
+          type: string
+          pattern: '^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$'
+          description: |
+            BCP-47 language tag from the workspace Language setting (e.g. `de-DE`).
+            When present, the AI is instructed to write its final answer in that
+            language regardless of the language of the question or sources.
+            Omit to let the model follow the language of the question.
+          example: "de-DE"
         tools:
           type: array
           items:
@@ -6426,6 +6463,15 @@ components:
           description: |
             Client time in ISO 8601 / RFC 3339 format (UTC `Z` or numeric
             offset). Sent alongside `timezone` for time-aware answers.
+        responseLanguage:
+          type: string
+          pattern: '^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$'
+          description: |
+            BCP-47 language tag from the workspace Language setting (e.g. `de-DE`).
+            When present, the AI is instructed to write its final answer in that
+            language regardless of the language of the question or sources.
+            Omit to let the model follow the language of the question.
+          example: "de-DE"
         tools:
           type: array
           items:
@@ -6455,6 +6501,7 @@ components:
         chatMode: quick
         timezone: Asia/Kolkata
         currentTime: "2026-05-19T12:58:01+05:30"
+        responseLanguage: de-DE
         tools: []
         filters:
           apps:

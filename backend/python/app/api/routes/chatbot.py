@@ -74,6 +74,7 @@ class ChatQuery(BaseModel):
     mode: str | None = "json"  # "json" for full metadata, "simple" for answer only
     timezone: str | None = None  # IANA timezone id from the client (e.g., "America/New_York")
     currentTime: str | None = None  # ISO 8601 datetime string from the client
+    responseLanguage: str | None = None  # BCP-47 tag from the workspace Language setting (e.g., "de-DE")
     conversationId: str | None = None  # Passed by Node.js layer for background task tracking
     attachments: list[dict[str, Any]] = []
     # AG-UI is the only supported SSE wire protocol. This field is
@@ -931,6 +932,7 @@ async def _generate_chat_stream_via_agent_loop(
         "chatMode": query_info.chatMode,
         "timezone": query_info.timezone,
         "currentTime": query_info.currentTime,
+        "responseLanguage": query_info.responseLanguage,
         "conversationId": query_info.conversationId,
         "attachments": query_info.attachments,
         "enableRecordIdShortening": query_info.enableRecordIdShortening,

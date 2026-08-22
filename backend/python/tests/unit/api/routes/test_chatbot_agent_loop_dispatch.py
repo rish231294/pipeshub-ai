@@ -149,6 +149,36 @@ class TestGenerateChatStreamViaAgentLoop:
         assert policy_arg is AGENT_POLICY
         assert call_args.kwargs["protocol"] == "agui"
 
+    async def test_response_language_forwarded_in_query_dict(self):
+        """`responseLanguage` (workspace Language setting) must reach
+        `run_chat_stream()` under the same key so `chat_state` can pick it up."""
+        from app.api.routes.chatbot import ChatQuery, _generate_chat_stream_via_agent_loop
+
+        request = self._mock_request({})
+        query_info = ChatQuery(query="hello", responseLanguage="de-DE")
+
+        async def _fake_run_chat_stream(*args, **kwargs):
+            yield "event: complete\ndata: {}\n\n"
+
+        with (
+            patch(
+                "app.api.routes.chatbot.get_llm_for_chat",
+                new=AsyncMock(return_value=(MagicMock(), {"provider": "openai", "isMultimodal": False}, {})),
+            ),
+            patch(
+                "app.api.routes.chatbot.run_chat_stream", side_effect=_fake_run_chat_stream,
+            ) as mock_run_chat_stream,
+        ):
+            [chunk async for chunk in _generate_chat_stream_via_agent_loop(
+                request, query_info, AsyncMock(), MagicMock(), AsyncMock(),
+            )]
+
+        query_dict = mock_run_chat_stream.call_args.args[0]
+        assert query_dict["responseLanguage"] == "de-DE"
+
+        # Default: absent → None, so untouched installs keep answering in the question's language.
+        assert ChatQuery(query="hello").responseLanguage is None
+
     async def test_enable_record_id_shortening_forwarded_when_requested(self):
         """Opt-in — see `ChatQuery.enableRecordIdShortening` — must reach
         `query_dict` unchanged when the caller explicitly sets it."""

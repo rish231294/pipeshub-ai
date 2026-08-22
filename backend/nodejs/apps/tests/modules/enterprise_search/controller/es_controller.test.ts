@@ -10628,6 +10628,56 @@ describe('Enterprise Search Controller', () => {
    // -----------------------------------------------------------------------
   // Agent Mode Tests - chatMode parsing with agent:mode format
   // -----------------------------------------------------------------------
+  describe('streamChat - responseLanguage forwarding', () => {
+    async function runStreamChat(body: Record<string, unknown>): Promise<any> {
+      const handler = streamChat(createMockAppConfig())
+      const mockDoc = createMockConversationDoc({
+        messages: [{ messageType: 'user_query', content: 'test query' }],
+      })
+      sinon.stub(Conversation.prototype, 'save').resolves(mockDoc)
+
+      let capturedBody: any = null
+      const mockStream = createMockStream()
+      sinon.stub(AIServiceCommand.prototype, 'executeStream').callsFake(async function (this: any) {
+        capturedBody = JSON.parse((this as any).body)
+        return mockStream
+      })
+
+      const req = createMockRequest({
+        body,
+        user: { userId: new mongoose.Types.ObjectId(VALID_OID), orgId: new mongoose.Types.ObjectId(VALID_OID2), email: 'test@test.com' },
+      })
+      const res = createMockResponse()
+      res.flush = sinon.stub()
+
+      const promise = handler(req, res)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      mockStream.emit('end')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await promise
+      return capturedBody
+    }
+
+    it('should forward responseLanguage to the AI service body alongside timezone/currentTime', async () => {
+      const capturedBody = await runStreamChat({
+        query: 'test query',
+        chatMode: 'internal_search',
+        timezone: 'Europe/Berlin',
+        currentTime: '2026-03-23T10:00:00Z',
+        responseLanguage: 'de-DE',
+      })
+      expect(capturedBody).to.not.be.null
+      expect(capturedBody.responseLanguage).to.equal('de-DE')
+      expect(capturedBody.timezone).to.equal('Europe/Berlin')
+    })
+
+    it('should send responseLanguage as null when the client omits it', async () => {
+      const capturedBody = await runStreamChat({ query: 'test query', chatMode: 'internal_search' })
+      expect(capturedBody).to.not.be.null
+      expect(capturedBody.responseLanguage).to.be.null
+    })
+  })
+
   describe('streamChat - agent mode parsing', () => {
     it('should parse agent:auto as agentMode=true and chatMode=auto', async () => {
       const handler = streamChat(createMockAppConfig())

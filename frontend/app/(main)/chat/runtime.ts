@@ -34,6 +34,7 @@ import {
   buildCitationMapsFromApi,
 } from './components/message-area/response-tabs/citations';
 import { getClientTimezone, getClientCurrentTime } from './utils/client-time';
+import { getResponseLanguage } from './utils/response-language';
 
 /** Non-empty query required by the chat API when the user sends attachments only (matches Slack bot). */
 const ATTACHMENT_ONLY_STREAM_QUERY = 'See below attached file(s).';
@@ -268,6 +269,7 @@ export function buildStreamChatRequestForSlot(
     ...buildStreamRequestModeFields(currentState.settings, isAgent),
     timezone: getClientTimezone(),
     currentTime: getClientCurrentTime(),
+    responseLanguage: getResponseLanguage(),
     filters: resolvedFilters,
     ...(appliedFilters ? { appliedFilters } : {}),
     conversationId: currentSlot.convId || undefined,

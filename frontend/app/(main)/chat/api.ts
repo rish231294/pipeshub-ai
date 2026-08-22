@@ -27,6 +27,7 @@ import {
   AttachmentRef,
 } from './types';
 import { getClientTimezone, getClientCurrentTime } from './utils/client-time';
+import { getResponseLanguage } from './utils/response-language';
 import { createAGUIEventHandler, type AGUIStreamTracking } from './agui-event-handler';
 
 export interface FeedbackPayload {
@@ -305,6 +306,7 @@ export const ChatApi = {
         chatMode: agentChatMode,
         timezone: getClientTimezone(),
         currentTime: getClientCurrentTime(),
+        responseLanguage: getResponseLanguage(),
         ...(request.reasoningEffort ? { reasoningEffort: request.reasoningEffort } : {}),
         // `undefined` (runtime.ts omits the field entirely when every tool
         // is selected) must NOT become `[]` here — an empty array means
@@ -329,6 +331,7 @@ export const ChatApi = {
         modelFriendlyName: request.modelFriendlyName || request.modelName,
         timezone: getClientTimezone(),
         currentTime: getClientCurrentTime(),
+        responseLanguage: getResponseLanguage(),
         ...(agentStreamTools !== undefined ? { tools: agentStreamTools } : {}),
         ...buildFiltersPayload(reqFilters?.apps, reqFilters?.kb),
         ...(reqAttachments?.length ? { attachments: reqAttachments } : {}),
@@ -374,6 +377,7 @@ export const ChatApi = {
       ...buildFiltersPayload(request.filters?.apps, request.filters?.kb),
       timezone: getClientTimezone(),
       currentTime: getClientCurrentTime(),
+      responseLanguage: getResponseLanguage(),
     };
     if (request.agentStreamTools !== undefined) {
       body.tools = request.agentStreamTools;
@@ -418,6 +422,7 @@ export const ChatApi = {
       chatMode: model.chatMode,
       timezone: getClientTimezone(),
       currentTime: getClientCurrentTime(),
+      responseLanguage: getResponseLanguage(),
       ...buildAgentFiltersPayload(model.filters.apps, model.filters.kb),
     };
     if (model.tools !== undefined) {

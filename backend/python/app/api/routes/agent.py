@@ -120,6 +120,7 @@ class ChatQuery(BaseModel):
     reasoningEffort: str | None = None
     timezone: str | None = None
     currentTime: str | None = None
+    responseLanguage: str | None = None
     conversationId: str | None = None
     # End-user display name when JWT userId is synthetic (e.g. Slack) — see
     # _merge_end_user_into_service_account_user_info.
@@ -3815,6 +3816,7 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
             "custom_instructions": custom_instructions,
             "timezone": chat_query.timezone,
             "currentTime": chat_query.currentTime,
+            "responseLanguage": chat_query.responseLanguage,
             "toolsets": agent_toolsets,
             "mcpServers": agent_mcp_servers,
             "mcpServerConfigs": mcp_server_configs,

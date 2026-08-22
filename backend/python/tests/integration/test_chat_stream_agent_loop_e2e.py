@@ -271,6 +271,73 @@ class TestChatStreamAgentLoopEndToEnd:
             "Q3 Board Deck" in str(c) for c in captured_goal["goal"].constraints
         )
 
+    async def test_response_language_reaches_agent_context_and_prompt(self):
+        """Workspace Language setting → `responseLanguage` on the HTTP body →
+        `chat_state` → `AgentContext.response_language` → the real
+        `PipesHubPromptBuilder` renders a "## Response Language" section.
+        Only the model call itself is faked."""
+        captured: dict = {}
+
+        async def _fake_create_capturing_context(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
+            captured["context"] = context
+            agent = MagicMock()
+            agent.last_stream_result = MagicMock(success=True, error=None, output="Die Antwort.")
+
+            async def _fake_stream(goal, **kwargs):
+                return
+                yield  # pragma: no cover - marks this an async generator
+
+            agent.stream = _fake_stream
+            return agent, MagicMock(), MagicMock(constraints=[]), []
+
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None):
+            await event_sink.write({"event": "complete", "data": {"answer": agent_output}})
+            return {"answer": agent_output}
+
+        request = _mock_request({
+            "query": "What is our refund policy?",
+            "chatMode": "internal_search",
+            "responseLanguage": "de-DE",
+        })
+
+        with (
+            patch("app.agents.chat_modes.bridge.PipesHubAgentFactory.create", new=_fake_create_capturing_context),
+            patch("app.agents.chat_modes.bridge.AnswerFinalizer.run", new=_fake_finalizer_run),
+        ):
+            response = await askAIStream(
+                request=request,
+                retrieval_service=_mock_retrieval_service(),
+                graph_provider=MagicMock(),
+                config_service=_mock_config_service(),
+            )
+            chunks = await _drain(response)
+
+        events = _events_by_name(chunks)
+        assert "complete" in events
+        assert "error" not in events
+
+        context = captured["context"]
+        assert context.response_language == "de-DE"
+        assert context.tool_state["response_language"] == "de-DE"
+
+        from app.agent_loop_lib.agent.spec import AgentSpec, ModelSpec
+        from app.agent_loop_lib.core.types import Goal
+        from app.agent_loop_lib.runtime.runtime import AgentRuntime
+        from app.agent_loop_lib.tools.registry import ToolRegistry
+        from app.agents.agent_loop.prompt_builder import PipesHubPromptBuilder
+
+        spec = AgentSpec(
+            name="pipeshub-agent",
+            system_prompt="BASE",
+            tool_names=[],
+            model=ModelSpec(provider="scripted", model="scripted-model"),
+        )
+        prompt = PipesHubPromptBuilder(context).build(
+            spec, AgentRuntime(tool_registry=ToolRegistry()), Goal(description="hello"), [], {},
+        )
+        assert "## Response Language" in prompt
+        assert "final answer in German" in prompt
+
     async def test_llm_initialization_failure_surfaces_as_sse_error_not_500(self):
         request = _mock_request({"query": "hello", "chatMode": "internal_search"})
 

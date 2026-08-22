@@ -9,6 +9,7 @@ from typing_extensions import TypedDict
 
 from app.utils.execute_query import agent_knowledge_has_sql_connector
 from app.utils.fetch_slack_thread import agent_knowledge_has_slack_connector
+from app.utils.response_language import normalize_response_language
 from app.config.configuration_service import ConfigurationService
 from app.modules.reranker.reranker import RerankerService
 from app.modules.retrieval.retrieval_service import RetrievalService
@@ -93,6 +94,7 @@ class ChatState(TypedDict):
     custom_instructions: str | None  # Org-level Chat Assistant / Universal Agent Mode instructions
     timezone: str | None  # User's timezone (e.g., "America/New_York")
     current_time: str | None  # Current time in user's timezone (ISO 8601)
+    response_language: str | None  # BCP-47 tag the final answer must be written in
     apps: list[str] | None  # List of app IDs to search in (extracted from knowledge array)
     kb: list[str] | None  # List of KB app IDs to search in (extracted from knowledge array)
     agent_knowledge: list[dict[str, Any]] | None
@@ -466,6 +468,7 @@ def build_initial_state(chat_query: dict[str, Any], user_info: dict[str, Any], l
     custom_instructions = chat_query.get("custom_instructions")
     timezone = chat_query.get("timezone")
     current_time = chat_query.get("currentTime")
+    response_language = normalize_response_language(chat_query.get("responseLanguage"))
     output_file_path = chat_query.get("outputFilePath")
 
     # Get toolsets and knowledge from the new graph-based format
@@ -554,6 +557,7 @@ def build_initial_state(chat_query: dict[str, Any], user_info: dict[str, Any], l
         "custom_instructions": custom_instructions,
         "timezone": timezone,
         "current_time": current_time,
+        "response_language": response_language,
         "apps": apps,  # Extracted from knowledge connector IDs
         "kb": kb,
         "agent_knowledge": agent_knowledge,

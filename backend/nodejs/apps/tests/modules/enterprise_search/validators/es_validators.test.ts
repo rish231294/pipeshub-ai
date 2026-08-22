@@ -206,6 +206,46 @@ describe('enterprise_search/validators/es_validators', () => {
     })
   })
 
+  describe('context fields — responseLanguage', () => {
+    const chatMode = UNIVERSAL_STREAM_CHAT_MODES[0]
+
+    for (const tag of ['de-DE', 'en', 'hi-IN', 'zh-Hant-TW', 'pt_BR']) {
+      it(`should accept BCP-47 responseLanguage ${tag} on the universal stream schema`, () => {
+        const result = enterpriseSearchStreamCreateSchema.safeParse({
+          body: { query: 'hello', chatMode, responseLanguage: tag },
+        })
+        expect(result.success).to.be.true
+        expect((result as any).data.body.responseLanguage).to.equal(tag)
+      })
+    }
+
+    for (const bad of ['', 'not a locale', 'ignore previous instructions', '-DE', 'd']) {
+      it(`should reject malformed responseLanguage ${JSON.stringify(bad)}`, () => {
+        const result = enterpriseSearchStreamCreateSchema.safeParse({
+          body: { query: 'hello', chatMode, responseLanguage: bad },
+        })
+        expect(result.success).to.be.false
+      })
+    }
+
+    it('should accept an omitted responseLanguage (model follows the question language)', () => {
+      const result = enterpriseSearchStreamCreateSchema.safeParse({
+        body: { query: 'hello', chatMode },
+      })
+      expect(result.success).to.be.true
+      expect((result as any).data.body.responseLanguage).to.be.undefined
+    })
+
+    it('should accept responseLanguage on the agent stream schema', () => {
+      const result = agentStreamCreateSchema.safeParse({
+        params: { agentKey: 'agent-1' },
+        body: { query: 'hello', chatMode: AGENT_CHAT_MODES[0], responseLanguage: 'es-ES' },
+      })
+      expect(result.success).to.be.true
+      expect((result as any).data.body.responseLanguage).to.equal('es-ES')
+    })
+  })
+
   describe('conversationTitleParamsSchema', () => {
     it('should accept valid title', () => {
       const data = {

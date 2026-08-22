@@ -112,6 +112,14 @@ const contextFieldsSchema = {
       message: 'currentTime must be an ISO 8601 datetime string',
     })
     .optional(),
+  // BCP-47 tag from the workspace Language setting; Python renders a
+  // "Response Language" prompt section from it.
+  responseLanguage: z
+    .string()
+    .regex(/^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$/, {
+      message: 'responseLanguage must be a BCP-47 language tag (e.g. de-DE)',
+    })
+    .optional(),
   tools: z.array(z.string().min(1)).optional(),
   // AG-UI is the only supported wire protocol (see
   // utils/agui.ts::resolveProtocol, which always resolves to `agui`

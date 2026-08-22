@@ -111,6 +111,7 @@ class AgentContext(BaseModel):
     custom_instructions: str | None = None
     timezone: str | None = None
     current_time: str | None = None
+    response_language: str | None = None
 
     # Mutable per-request state
     conversation_id: str | None = None
@@ -364,6 +365,7 @@ class AgentContext(BaseModel):
             custom_instructions=state.get("custom_instructions"),
             timezone=state.get("timezone"),
             current_time=state.get("current_time"),
+            response_language=state.get("response_language"),
             conversation_id=state.get("conversation_id"),
             has_ui_client=bool(state.get("has_ui_client", False)),
             previous_conversations=state.get("previous_conversations") or [],
@@ -439,6 +441,7 @@ class AgentContext(BaseModel):
             "custom_instructions": self.custom_instructions,
             "timezone": self.timezone,
             "current_time": self.current_time,
+            "response_language": self.response_language,
             "previous_conversations": self.previous_conversations,
             "final_results": [],
             "virtual_record_id_to_result": {},

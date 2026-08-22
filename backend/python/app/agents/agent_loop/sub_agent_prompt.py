@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from app.utils.response_language import build_llm_response_language_context
 from app.utils.time_conversion import build_llm_time_context
 
 if TYPE_CHECKING:
@@ -101,6 +102,9 @@ def build_sub_agent_prompt(
         )
         if time_block:
             parts.append(time_block)
+        language_block = build_llm_response_language_context(context.response_language)
+        if language_block:
+            parts.append(language_block)
 
     return "\n\n".join(parts)
 

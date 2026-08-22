@@ -61,6 +61,7 @@ PIPESHUB_SECTION_ORDER: tuple[tuple[str, Volatility], ...] = (
     ("knowledge_sources",          Volatility.CONV),
     ("capability_summary",         Volatility.CONV),
     ("user_context",               Volatility.CONV),
+    ("response_language",          Volatility.CONV),
     ("skills_overview",            Volatility.CONV),
     ("answer_confidence",          Volatility.CONV),
     # Worked examples — injected for SMALL and MID tiers only; omitted for

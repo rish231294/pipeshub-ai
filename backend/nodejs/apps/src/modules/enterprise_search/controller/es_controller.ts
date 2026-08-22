@@ -890,6 +890,7 @@ export const streamChat =
         conversationId: newConversationId || null,
         timezone: req.body.timezone || null,
         currentTime: req.body.currentTime || null,
+        responseLanguage: req.body.responseLanguage || null,
         // Explicit protocol propagation — Node hand-builds this request body,
         // so a header alone would never reach Python (see agui.ts docstring).
         ...(isAGUI(protocol) ? { protocol: AGUI_PROTOCOL } : {}),
@@ -2157,6 +2158,7 @@ export const addMessageStream =
         conversationId: conversationId || null,
         timezone: req.body.timezone || null,
         currentTime: req.body.currentTime || null,
+        responseLanguage: req.body.responseLanguage || null,
         // Explicit protocol propagation — Node hand-builds this request body,
         // so a header alone would never reach Python (see agui.ts docstring).
         ...(isAGUI(protocol) ? { protocol: AGUI_PROTOCOL } : {}),
@@ -3630,6 +3632,7 @@ async function regenerateAnswersInternal(
       conversationId: conversationId || null,
       timezone: req.body.timezone || null,
       currentTime: req.body.currentTime || null,
+      responseLanguage: req.body.responseLanguage || null,
       ...(isAGUI(protocol) ? { protocol: AGUI_PROTOCOL } : {}),
     };
     if (agentKey || regenIsAgentMode) {
@@ -5844,6 +5847,7 @@ export const deleteAgent =
         reasoningEffort: req.body.reasoningEffort || null,
         timezone: req.body.timezone || null,
         currentTime: req.body.currentTime || null,
+        responseLanguage: req.body.responseLanguage || null,
         conversationId: newAgentConversationId || null,
         // Explicit protocol propagation — Node hand-builds this request body,
         // so a header alone would never reach Python (see agui.ts docstring).
@@ -6362,6 +6366,7 @@ export const createAgentConversation =
         chatMode: req.body.chatMode || 'auto',
         timezone: req.body.timezone || null,
         currentTime: req.body.currentTime || null,
+        responseLanguage: req.body.responseLanguage || null,
         attachments: req.body.attachments || [],
       };
       assignCallerContextToAiPayload(aiPayload, req.body as Record<string, unknown>);
@@ -7026,6 +7031,7 @@ export const addMessageStreamToAgentConversation =
         chatMode: req.body.chatMode || 'auto',
         timezone: req.body.timezone || null,
         currentTime: req.body.currentTime || null,
+        responseLanguage: req.body.responseLanguage || null,
         conversationId: conversationId || null,
         // Explicit protocol propagation — Node hand-builds this request body,
         // so a header alone would never reach Python (see agui.ts docstring).

@@ -433,6 +433,26 @@ class TestCodeExecutionSteering:
 
 
 class TestIdentityAndOperatingRules:
+    def test_response_language_section_present_when_set(self) -> None:
+        context = make_context(response_language="de-DE")
+        result = _build(context)
+        assert "## Response Language" in result
+        assert "German" in result
+
+    def test_response_language_section_absent_when_unset(self) -> None:
+        result = _build(make_context())
+        assert "## Response Language" not in result
+
+    def test_response_language_survives_custom_system_prompt(self) -> None:
+        """Agent Builder agents replace the identity block, not the user's
+        language preference — the section must still render."""
+        context = make_context(
+            system_prompt="You are Aria, a witty legal assistant.", response_language="es-ES",
+        )
+        result = _build(context)
+        assert "## Response Language" in result
+        assert "Spanish" in result
+
     def test_identity_block_present_when_no_custom_prompt(self) -> None:
         context = make_context()
         result = _build(context)
