@@ -3,6 +3,7 @@ import express from 'express'
 import type { Server } from 'http'
 import { expect } from 'chai'
 import sinon from 'sinon'
+import { Users } from '../../../../src/modules/user_management/schema/users.schema'
 import { createOAuthClientsRouter } from '../../../../src/modules/oauth_provider/routes/oauth.clients.routes'
 
 describe('OAuth Clients Routes', () => {
@@ -65,6 +66,11 @@ describe('OAuth Clients Routes', () => {
 
     beforeEach(() => {
       principal = undefined
+      // refuseServiceAccountCaller looks the caller up in Mongo; answer as a
+      // person so the session-positive cases reach the controller.
+      sinon.stub(Users, 'findOne').returns({
+        select: () => ({ lean: () => ({ exec: async () => ({ kind: 'individual' }) }) }),
+      } as any)
       controller = {
         listScopes: sinon.stub().callsFake((_req: any, res: any) => res.status(200).json({ scopes: [] })),
         createApp: sinon.stub().callsFake((_req: any, res: any) => res.status(201).json({ app: {} })),

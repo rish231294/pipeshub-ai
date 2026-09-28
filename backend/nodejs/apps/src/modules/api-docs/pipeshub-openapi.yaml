@@ -116,6 +116,13 @@ tags:
       - **Any authenticated org member** — unlike OAuth apps, this is
         deliberately not admin-gated.
 
+      **Session only**
+      - Every `/personal-access-tokens/*` route requires the user's interactive
+        session JWT. OAuth access tokens and personal access tokens (`phpat_...`)
+        are rejected with `403`. `scopes` is capped at the instance's `MCP_SCOPES`,
+        not at the caller's own token, so a narrowly scoped token could otherwise
+        mint itself a full-scope, non-expiring PAT.
+
       **How it's issued**
       - Minted through the same OAuth access-token machinery as `/oauth2/token`,
         against one lazily-created, per-org synthetic OAuth app
@@ -17115,6 +17122,11 @@ paths:
         env var, not the full role-aware OAuth-app scope catalog — a
         non-admin can request any scope in that set.
 
+        **Session only.** The bearer token must be the user's interactive
+        session JWT. OAuth access tokens and personal access tokens
+        (`phpat_...`) are rejected with `403`, so a token that is already
+        issued cannot mint another with wider scopes or a longer life.
+
         The response's `accessToken` is shown **once**; only its SHA-256
         hash is stored. It's prefixed `phpat_` (see the `bearerAuth`
         security scheme).
@@ -17144,6 +17156,12 @@ paths:
                 $ref: '#/components/schemas/ApplicationJsonErrorResponse'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '403':
+          description: Bearer token is an OAuth access token or personal access token rather than a user session
           content:
             application/json:
               schema:

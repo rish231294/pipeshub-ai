@@ -172,11 +172,14 @@ export function createOAuthProviderRouter(container: Container): Router {
 
   /**
    * POST /device/verify — authenticated user_code lookup for the consent page.
+   * Session only, like /device/consent below: the page must not be drivable
+   * by a bearer token at all.
    */
   router.post(
     '/device/verify',
     oauthTokenRateLimiter,
     authMiddleware.authenticate.bind(authMiddleware),
+    requireSessionAuth,
     refuseServiceAccountCaller,
     ValidationMiddleware.validate(deviceUserCodeSchema),
     (req: Request, res: Response, next: NextFunction) =>
@@ -189,11 +192,15 @@ export function createOAuthProviderRouter(container: Container): Router {
 
   /**
    * POST /device/consent — user approves or denies a device grant.
+   * Session only, for the same reason as POST /authorize: approving issues a
+   * token to the polling device as the approver, so a client holding an
+   * access token or PAT for the user must not be able to self-consent.
    */
   router.post(
     '/device/consent',
     oauthTokenRateLimiter,
     authMiddleware.authenticate.bind(authMiddleware),
+    requireSessionAuth,
     refuseServiceAccountCaller,
     ValidationMiddleware.validate(deviceConsentSchema),
     (req: Request, res: Response, next: NextFunction) =>
