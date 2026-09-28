@@ -8,6 +8,29 @@ import {
   tokenSchema,
 } from '../../../../src/modules/oauth_provider/validators/oauth.validators'
 import { OAuthGrantType } from '../../../../src/modules/oauth_provider/schema/oauth.app.schema'
+import sinon from 'sinon'
+import {
+  authorizeQuerySchema,
+  authorizeConsentSchema,
+} from '../../../../src/modules/oauth_provider/validators/oauth.validators'
+
+const validChallenge = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
+
+const baseQuery = {
+  response_type: 'code',
+  client_id: 'cid',
+  redirect_uri: 'https://example.com/cb',
+  scope: 'org:read',
+  state: 'st',
+}
+
+const baseConsent = {
+  client_id: 'cid',
+  redirect_uri: 'https://example.com/cb',
+  scope: 'org:read',
+  state: 'st',
+  consent: 'granted',
+}
 
 describe('oauth_provider/validators/oauth.validators', () => {
   it('should accept a device authorization body', () => {
@@ -53,5 +76,53 @@ describe('oauth_provider/validators/oauth.validators', () => {
       },
     })
     expect(parsed.body.device_code).to.equal('abc')
+  it('should be importable without errors', async () => {
+    const validators = await import('../../../../src/modules/oauth_provider/validators/oauth.validators')
+    expect(validators).to.be.an('object')
+  })
+
+  // GHSA-cxgc-52jq-fcx9: only S256 is accepted on both the GET and the POST.
+  describe('code_challenge_method (PKCE)', () => {
+    it('authorizeQuerySchema accepts S256', () => {
+      const result = authorizeQuerySchema.safeParse({
+        query: { ...baseQuery, code_challenge: validChallenge, code_challenge_method: 'S256' },
+      })
+      expect(result.success).to.be.true
+    })
+
+    it('authorizeQuerySchema rejects plain', () => {
+      const result = authorizeQuerySchema.safeParse({
+        query: { ...baseQuery, code_challenge: validChallenge, code_challenge_method: 'plain' },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('authorizeQuerySchema still accepts an omitted method', () => {
+      const result = authorizeQuerySchema.safeParse({
+        query: { ...baseQuery, code_challenge: validChallenge },
+      })
+      expect(result.success).to.be.true
+    })
+
+    it('authorizeConsentSchema accepts S256', () => {
+      const result = authorizeConsentSchema.safeParse({
+        body: { ...baseConsent, code_challenge: validChallenge, code_challenge_method: 'S256' },
+      })
+      expect(result.success).to.be.true
+    })
+
+    it('authorizeConsentSchema rejects plain', () => {
+      const result = authorizeConsentSchema.safeParse({
+        body: { ...baseConsent, code_challenge: validChallenge, code_challenge_method: 'plain' },
+      })
+      expect(result.success).to.be.false
+    })
+
+    it('authorizeConsentSchema rejects a malformed code_challenge', () => {
+      const result = authorizeConsentSchema.safeParse({
+        body: { ...baseConsent, code_challenge: 'too-short', code_challenge_method: 'S256' },
+      })
+      expect(result.success).to.be.false
+    })
   })
 })

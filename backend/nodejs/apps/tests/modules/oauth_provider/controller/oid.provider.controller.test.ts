@@ -109,6 +109,8 @@ describe('OIDCProviderController', () => {
         const config = mockRes.json.firstCall.args[0]
         expect(config.registration_endpoint, value).to.equal(undefined)
       }
+      // GHSA-cxgc-52jq-fcx9: `plain` is no longer advertised or accepted.
+      expect(config.code_challenge_methods_supported).to.deep.equal(['S256'])
     })
   })
 
