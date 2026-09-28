@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlencode, urlparse
+from uuid import uuid4
 
 from dependency_injector.wiring import Provide, inject
 from fastapi import (
@@ -133,6 +134,7 @@ from app.utils.user_messages import (
     not_found,
     provider_failure,
 )
+from app.utils.filename_utils import upload_extension
 from app.utils.jwt import generate_jwt
 from app.utils.logger import create_logger
 from app.utils.oauth_config import extract_oauth_error_message, fetch_oauth_config_by_id, get_oauth_config
@@ -1459,6 +1461,25 @@ async def stream_record(
         raise to_stream_error(e) from e
 
 
+CONVERTIBLE_UPLOAD_EXTENSIONS = frozenset(
+    {
+        # Writer (word processing)
+        "doc", "docx", "docm", "dot", "dotx", "odt", "ott", "fodt",
+        "rtf", "txt", "wps", "wpd", "sxw",
+        # Calc (spreadsheets)
+        "xls", "xlsx", "xlsm", "xlt", "xl[str]tx", "ods", "ots", "fods",
+        "csv", "tsv", "dif", "dbf", "sxc",
+        # Impress (presentations)
+        "ppt", "pptx", "pptm", "pps", "ppsx", "pot", "potx",
+        "odp", "otp", "fodp", "sxi",
+        # Draw (vector / diagrams)
+        "odg", "otg", "fodg", "svg", "vsd", "vsdx", "pub", "cdr", "wmf", "emf",
+    }
+)
+# Matches the Node storage document upload limit (storage.routes.ts).
+MAX_CONVERT_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
 @router.post("/api/v1/record/buffer/convert", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
 async def get_record_stream(request: Request, file: UploadFile = File(...)) -> StreamingResponse:
     request.query_params.get("from")
@@ -1466,11 +1487,30 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
 
     if to_format == MimeTypes.PDF.value:
         try:
+            extension = upload_extension(file.filename, CONVERTIBLE_UPLOAD_EXTENSIONS)
+            if extension is None:
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_REQUEST.value,
+                    detail="Invalid filename or unsupported file type; expected one of: "
+                    + ", ".join(sorted(CONVERTIBLE_UPLOAD_EXTENSIONS)),
+                )
+            content = await file.read(MAX_CONVERT_UPLOAD_BYTES + 1)
+            if len(content) > MAX_CONVERT_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=HttpStatusCode.PAYLOAD_TOO_LARGE.value,
+                    detail=f"File exceeds the {MAX_CONVERT_UPLOAD_BYTES // (1024 * 1024)} MB conversion limit",
+                )
             with tempfile.TemporaryDirectory() as tmpdir:
                 try:
-                    ppt_path = os.path.join(tmpdir, file.filename)
+                    # The client name never touches the filesystem; only its validated
+                    # extension survives so LibreOffice picks the right import filter.
+                    stem = uuid4().hex
+                    ppt_path = os.path.join(tmpdir, f"{stem}.{extension}")
+                    pdf_path = os.path.join(tmpdir, f"{stem}.pdf")
+                    if os.path.dirname(os.path.realpath(ppt_path)) != os.path.realpath(tmpdir):
+                        raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid filename")
                     with open(ppt_path, "wb") as f:
-                        f.write(await file.read())
+                        f.write(content)
 
                     conversion_cmd = [
                         "libreoffice",
@@ -1504,8 +1544,7 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out"
                         ) from te
 
-                    pdf_filename = file.filename.rsplit(".", 1)[0] + ".pdf"
-                    pdf_path = os.path.join(tmpdir, pdf_filename)
+                    pdf_filename = f"{file.filename.rpartition('.')[0]}.pdf"
 
                     if process.returncode != 0:
                         error_msg = f"LibreOffice conversion failed: {conversion_error.decode('utf-8', errors='replace')}"
@@ -1519,16 +1558,13 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                             "PDF conversion failed - output file not found"
                         )
 
+                    # Read before leaving the TemporaryDirectory block; the response body
+                    # is streamed after this function returns, when tmpdir is already gone.
+                    with open(pdf_path, "rb") as pdf_file:
+                        pdf_bytes = await asyncio.to_thread(pdf_file.read)
+
                     async def file_iterator() -> AsyncGenerator[bytes, None]:
-                        try:
-                            with open(pdf_path, "rb") as pdf_file:
-                                yield await asyncio.to_thread(pdf_file.read)
-                        except Exception as e:
-                            logger.error(f"Error reading PDF file: {str(e)}")
-                            raise HTTPException(
-                                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
-                                detail="Error reading converted PDF file",
-                            ) from e
+                        yield pdf_bytes
 
                     return create_stream_record_response(
                         file_iterator(),
