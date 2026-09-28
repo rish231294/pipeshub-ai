@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import tempfile
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -1467,7 +1468,7 @@ CONVERTIBLE_UPLOAD_EXTENSIONS = frozenset(
         "doc", "docx", "docm", "dot", "dotx", "odt", "ott", "fodt",
         "rtf", "txt", "wps", "wpd", "sxw",
         # Calc (spreadsheets)
-        "xls", "xlsx", "xlsm", "xlt", "xl[str]tx", "ods", "ots", "fods",
+        "xls", "xlsx", "xlsm", "xlt", "xltx", "ods", "ots", "fods",
         "csv", "tsv", "dif", "dbf", "sxc",
         # Impress (presentations)
         "ppt", "pptx", "pptm", "pps", "ppsx", "pot", "potx",
@@ -1476,8 +1477,18 @@ CONVERTIBLE_UPLOAD_EXTENSIONS = frozenset(
         "odg", "otg", "fodg", "svg", "vsd", "vsdx", "pub", "cdr", "wmf", "emf",
     }
 )
-# Matches the Node storage document upload limit (storage.routes.ts).
-MAX_CONVERT_UPLOAD_BYTES = 100 * 1024 * 1024
+
+# Upload and converted PDF are moved through the filesystem in chunks of this size
+# so neither is ever held in memory in full. 16 MiB keeps the per-chunk footprint
+# small while avoiding a thread hop per megabyte on large files.
+_CONVERT_CHUNK_BYTES = 16 * 1024 * 1024
+
+# Seconds to allow a single LibreOffice conversion before giving up. Env-configurable
+# because large or complex documents can legitimately take longer than the default.
+try:
+    CONVERT_PDF_TIMEOUT_SECONDS = float(os.getenv("CONVERT_PDF_TIMEOUT_SECONDS", "60"))
+except ValueError:
+    CONVERT_PDF_TIMEOUT_SECONDS = 60.0
 
 
 @router.post("/api/v1/record/buffer/convert", dependencies=[Depends(require_scopes(OAuthScopes.CONNECTOR_READ))])
@@ -1494,93 +1505,98 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                     detail="Invalid filename or unsupported file type; expected one of: "
                     + ", ".join(sorted(CONVERTIBLE_UPLOAD_EXTENSIONS)),
                 )
-            content = await file.read(MAX_CONVERT_UPLOAD_BYTES + 1)
-            if len(content) > MAX_CONVERT_UPLOAD_BYTES:
-                raise HTTPException(
-                    status_code=HttpStatusCode.PAYLOAD_TOO_LARGE.value,
-                    detail=f"File exceeds the {MAX_CONVERT_UPLOAD_BYTES // (1024 * 1024)} MB conversion limit",
+            # mkdtemp, not TemporaryDirectory: the PDF is streamed after this handler
+            # returns, so the directory must outlive the function. It is removed by
+            # file_iterator's finally on success, or by the except blocks on failure.
+            tmpdir = tempfile.mkdtemp()
+            try:
+                # The client name never touches the filesystem; only its validated
+                # extension survives so LibreOffice picks the right import filter.
+                stem = uuid4().hex
+                ppt_path = os.path.join(tmpdir, f"{stem}.{extension}")
+                pdf_path = os.path.join(tmpdir, f"{stem}.pdf")
+                if os.path.dirname(os.path.realpath(ppt_path)) != os.path.realpath(tmpdir):
+                    raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid filename")
+                # Stream the upload to disk in bounded chunks so a large upload is
+                # never held in memory in full.
+                with open(ppt_path, "wb") as f:
+                    while chunk := await file.read(_CONVERT_CHUNK_BYTES):
+                        await asyncio.to_thread(f.write, chunk)
+
+                conversion_cmd = [
+                    "libreoffice",
+                    "--headless",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    tmpdir,
+                    ppt_path,
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *conversion_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-            with tempfile.TemporaryDirectory() as tmpdir:
+
                 try:
-                    # The client name never touches the filesystem; only its validated
-                    # extension survives so LibreOffice picks the right import filter.
-                    stem = uuid4().hex
-                    ppt_path = os.path.join(tmpdir, f"{stem}.{extension}")
-                    pdf_path = os.path.join(tmpdir, f"{stem}.pdf")
-                    if os.path.dirname(os.path.realpath(ppt_path)) != os.path.realpath(tmpdir):
-                        raise HTTPException(status_code=HttpStatusCode.BAD_REQUEST.value, detail="Invalid filename")
-                    with open(ppt_path, "wb") as f:
-                        f.write(content)
-
-                    conversion_cmd = [
-                        "libreoffice",
-                        "--headless",
-                        "--convert-to",
-                        "pdf",
-                        "--outdir",
-                        tmpdir,
-                        ppt_path,
-                    ]
-                    process = await asyncio.create_subprocess_exec(
-                        *conversion_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
+                    conversion_output, conversion_error = await asyncio.wait_for(
+                        process.communicate(), timeout=CONVERT_PDF_TIMEOUT_SECONDS
                     )
-
+                except asyncio.TimeoutError as te:
+                    process.terminate()
                     try:
-                        conversion_output, conversion_error = await asyncio.wait_for(
-                            process.communicate(), timeout=30.0
-                        )
-                    except asyncio.TimeoutError as te:
-                        process.terminate()
-                        try:
-                            await asyncio.wait_for(process.wait(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            process.kill()
-                        logger.error(
-                            "LibreOffice conversion timed out after 30 seconds"
-                        )
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out"
-                        ) from te
+                        await asyncio.wait_for(process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                    logger.error(
+                        f"LibreOffice conversion timed out after {CONVERT_PDF_TIMEOUT_SECONDS} seconds"
+                    )
+                    raise HTTPException(
+                        status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="PDF conversion timed out"
+                    ) from te
 
-                    pdf_filename = f"{file.filename.rpartition('.')[0]}.pdf"
+                pdf_filename = f"{file.filename.rpartition('.')[0]}.pdf"
 
-                    if process.returncode != 0:
-                        error_msg = f"LibreOffice conversion failed: {conversion_error.decode('utf-8', errors='replace')}"
-                        logger.error(error_msg)
-                        raise HTTPException(
-                            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Failed to convert file to PDF"
-                        )
-
-                    if not os.path.exists(pdf_path):
-                        raise FileNotFoundError(
-                            "PDF conversion failed - output file not found"
-                        )
-
-                    # Read before leaving the TemporaryDirectory block; the response body
-                    # is streamed after this function returns, when tmpdir is already gone.
-                    with open(pdf_path, "rb") as pdf_file:
-                        pdf_bytes = await asyncio.to_thread(pdf_file.read)
-
-                    async def file_iterator() -> AsyncGenerator[bytes, None]:
-                        yield pdf_bytes
-
-                    return create_stream_record_response(
-                        file_iterator(),
-                        filename=pdf_filename,
-                        mime_type="application/pdf",
-                        fallback_filename="converted_file.pdf"
+                if process.returncode != 0:
+                    error_msg = f"LibreOffice conversion failed: {conversion_error.decode('utf-8', errors='replace')}"
+                    logger.error(error_msg)
+                    raise HTTPException(
+                        status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail="Failed to convert file to PDF"
                     )
 
-                except FileNotFoundError as e:
-                    logger.error(str(e))
-                    raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=action_failed("open this file")) from e
-                except Exception as e:
-                    logger.error(f"Conversion error: {str(e)}")
-                    raise HTTPException(
-                        status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=action_failed("open this file")
-                    ) from e
+                if not os.path.exists(pdf_path):
+                    raise FileNotFoundError(
+                        "PDF conversion failed - output file not found"
+                    )
+
+                # Stream the converted PDF from disk in bounded chunks so the whole
+                # file is never held in memory, and drop tmpdir once the last chunk
+                # is sent. Ownership of tmpdir passes to the iterator here.
+                async def file_iterator() -> AsyncGenerator[bytes, None]:
+                    try:
+                        with open(pdf_path, "rb") as pdf_file:
+                            while chunk := await asyncio.to_thread(pdf_file.read, _CONVERT_CHUNK_BYTES):
+                                yield chunk
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+
+                return create_stream_record_response(
+                    file_iterator(),
+                    filename=pdf_filename,
+                    mime_type="application/pdf",
+                    fallback_filename="converted_file.pdf"
+                )
+
+            except FileNotFoundError as e:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                logger.error(str(e))
+                raise HTTPException(status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=action_failed("open this file")) from e
+            except Exception as e:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                logger.error(f"Conversion error: {str(e)}")
+                raise HTTPException(
+                    status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value, detail=action_failed("open this file")
+                ) from e
         finally:
             await file.close()
 
@@ -1625,7 +1641,7 @@ async def convert_to_pdf(file_path: str, temp_dir: str) -> str:
 
         try:
             conversion_output, conversion_error = await asyncio.wait_for(
-                process.communicate(), timeout=30.0
+                process.communicate(), timeout=CONVERT_PDF_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError as te:
             process.terminate()

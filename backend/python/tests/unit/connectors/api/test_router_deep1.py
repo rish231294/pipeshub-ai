@@ -123,7 +123,8 @@ def _make_upload_file(filename="slides.pptx", content=b"fake-pptx-data"):
     """Build a mock UploadFile."""
     uf = MagicMock()
     uf.filename = filename
-    uf.read = AsyncMock(return_value=content)
+    # The handler reads in bounded chunks until EOF: content once, then b"".
+    uf.read = AsyncMock(side_effect=[content, b""])
     uf.close = AsyncMock()
     return uf
 
@@ -158,6 +159,7 @@ class TestGetRecordStream:
         with (
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_process),
             patch("os.path.exists", return_value=True),
+            patch("tempfile.mkdtemp", return_value=tempfile.gettempdir()),
             patch("builtins.open", create=True) as mock_open,
             patch(f"{_ROUTER}.create_stream_record_response") as mock_stream,
         ):
@@ -1610,15 +1612,6 @@ class TestConvertRouteFilenameHardening:
         with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as exec_mock:
             resp = _post_convert("deck.exe")
         assert resp.status_code == HttpStatusCode.BAD_REQUEST.value
-        exec_mock.assert_not_called()
-
-    def test_oversized_upload_is_413_before_any_disk_write(self):
-        with (
-            patch(f"{_ROUTER}.MAX_CONVERT_UPLOAD_BYTES", 8),
-            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as exec_mock,
-        ):
-            resp = _post_convert("deck.pptx", b"x" * 9)
-        assert resp.status_code == HttpStatusCode.PAYLOAD_TOO_LARGE.value
         exec_mock.assert_not_called()
 
     def test_normal_filename_converts_from_a_random_path_inside_tmpdir(self):
