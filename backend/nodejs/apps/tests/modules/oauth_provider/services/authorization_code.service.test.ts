@@ -4,7 +4,10 @@ import sinon from 'sinon'
 import crypto from 'crypto'
 import { Types } from 'mongoose'
 import { AuthorizationCodeService } from '../../../../src/modules/oauth_provider/services/authorization_code.service'
-import { AuthorizationCode } from '../../../../src/modules/oauth_provider/schema/authorization_code.schema'
+import {
+  AuthorizationCode,
+  IAuthorizationCode,
+} from '../../../../src/modules/oauth_provider/schema/authorization_code.schema'
 import { OAuthAccessToken } from '../../../../src/modules/oauth_provider/schema/oauth.access_token.schema'
 import { OAuthRefreshToken } from '../../../../src/modules/oauth_provider/schema/oauth.refresh_token.schema'
 import { InvalidGrantError } from '../../../../src/libs/errors/oauth.errors'
@@ -245,7 +248,21 @@ describe('AuthorizationCodeService', () => {
 
     // PKCE fail-closed for public clients (GHSA-cxgc-52jq-fcx9)
     describe('public clients without a stored challenge', () => {
-      function codeWithoutChallenge() {
+      type AuthCodeFixture = Pick<
+        IAuthorizationCode,
+        | 'code' | 'clientId' | 'userId' | 'orgId' | 'redirectUri' | 'scopes'
+        | 'expiresAt' | 'isUsed' | 'codeChallenge' | 'codeChallengeMethod'
+      > & { _id: Types.ObjectId; save: sinon.SinonStub }
+      type AuthCodeQuery = ReturnType<typeof AuthorizationCode.findOne>
+
+      // exchangeCode awaits findOne and touches only the fixture's fields and save().
+      function stubFindOne(fixture: AuthCodeFixture): void {
+        sinon
+          .stub(AuthorizationCode, 'findOne')
+          .returns(Promise.resolve(fixture) as unknown as AuthCodeQuery)
+      }
+
+      function codeWithoutChallenge(): AuthCodeFixture {
         return {
           _id: new Types.ObjectId(),
           code: 'no-pkce-code',
@@ -264,7 +281,7 @@ describe('AuthorizationCodeService', () => {
 
       it('rejects a public client redeeming a code that has no challenge, even with a verifier', async () => {
         const mockCode = codeWithoutChallenge()
-        sinon.stub(AuthorizationCode, 'findOne').resolves(mockCode as any)
+        stubFindOne(mockCode)
 
         try {
           await service.exchangeCode(
@@ -280,7 +297,7 @@ describe('AuthorizationCodeService', () => {
       })
 
       it('fails closed when the caller omits the client type', async () => {
-        sinon.stub(AuthorizationCode, 'findOne').resolves(codeWithoutChallenge() as any)
+        stubFindOne(codeWithoutChallenge())
 
         try {
           await service.exchangeCode('no-pkce-code', 'client-1', 'https://example.com/cb')
@@ -292,7 +309,7 @@ describe('AuthorizationCodeService', () => {
 
       it('lets a confidential client redeem a code that has no challenge', async () => {
         const mockCode = codeWithoutChallenge()
-        sinon.stub(AuthorizationCode, 'findOne').resolves(mockCode as any)
+        stubFindOne(mockCode)
 
         const result = await service.exchangeCode(
           'no-pkce-code', 'client-1', 'https://example.com/cb', undefined, true,
@@ -310,8 +327,8 @@ describe('AuthorizationCodeService', () => {
           .replace(/\+/g, '-')
           .replace(/\//g, '_')
           .replace(/=/g, '')
-        const mockCode = { ...codeWithoutChallenge(), codeChallenge: challenge, codeChallengeMethod: 'S256' }
-        sinon.stub(AuthorizationCode, 'findOne').resolves(mockCode as any)
+        const mockCode: AuthCodeFixture = { ...codeWithoutChallenge(), codeChallenge: challenge, codeChallengeMethod: 'S256' }
+        stubFindOne(mockCode)
 
         const result = await service.exchangeCode(
           'no-pkce-code', 'client-1', 'https://example.com/cb', verifier, false,
@@ -328,8 +345,8 @@ describe('AuthorizationCodeService', () => {
           .replace(/\+/g, '-')
           .replace(/\//g, '_')
           .replace(/=/g, '')
-        const mockCode = { ...codeWithoutChallenge(), codeChallenge: challenge, codeChallengeMethod: 'S256' }
-        sinon.stub(AuthorizationCode, 'findOne').resolves(mockCode as any)
+        const mockCode: AuthCodeFixture = { ...codeWithoutChallenge(), codeChallenge: challenge, codeChallengeMethod: 'S256' }
+        stubFindOne(mockCode)
 
         try {
           await service.exchangeCode(

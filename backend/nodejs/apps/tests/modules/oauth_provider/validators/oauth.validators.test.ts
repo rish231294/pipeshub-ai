@@ -2,17 +2,14 @@ import 'reflect-metadata'
 import { expect } from 'chai'
 import { ZodError } from 'zod'
 import {
+  authorizeConsentSchema,
+  authorizeQuerySchema,
   deviceAuthorizationSchema,
   deviceConsentSchema,
   deviceUserCodeSchema,
   tokenSchema,
 } from '../../../../src/modules/oauth_provider/validators/oauth.validators'
 import { OAuthGrantType } from '../../../../src/modules/oauth_provider/schema/oauth.app.schema'
-import sinon from 'sinon'
-import {
-  authorizeQuerySchema,
-  authorizeConsentSchema,
-} from '../../../../src/modules/oauth_provider/validators/oauth.validators'
 
 const validChallenge = 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM'
 
@@ -76,9 +73,6 @@ describe('oauth_provider/validators/oauth.validators', () => {
       },
     })
     expect(parsed.body.device_code).to.equal('abc')
-  it('should be importable without errors', async () => {
-    const validators = await import('../../../../src/modules/oauth_provider/validators/oauth.validators')
-    expect(validators).to.be.an('object')
   })
 
   // GHSA-cxgc-52jq-fcx9: only S256 is accepted on both the GET and the POST.

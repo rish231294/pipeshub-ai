@@ -12,6 +12,26 @@ import {
 import { Users } from '../../../../src/modules/user_management/schema/users.schema'
 import { Org } from '../../../../src/modules/user_management/schema/org.schema'
 import { ScopeValidatorService } from '../../../../src/modules/oauth_provider/services/scope.validator.service'
+import type { z } from 'zod'
+import type { authorizeConsentSchema } from '../../../../src/modules/oauth_provider/validators/oauth.validators'
+import type { TokenRequest } from '../../../../src/modules/oauth_provider/types/oauth.types'
+
+type ConsentRequest = Parameters<OAuthProviderController['authorizeConsent']>[0]
+type TokenHttpRequest = Parameters<OAuthProviderController['token']>[0]
+
+// Express types `body` as any, so the body is typed separately to keep the fixture checked.
+function consentRequest(body: z.infer<typeof authorizeConsentSchema>['body']): ConsentRequest {
+  const req: Pick<ConsentRequest, 'body' | 'user'> = {
+    body,
+    user: { userId: 'u1', orgId: 'o1', email: 'u1@example.com' },
+  }
+  return req as ConsentRequest
+}
+
+function tokenRequest(body: TokenRequest): TokenHttpRequest {
+  const req: Pick<TokenHttpRequest, 'body' | 'headers'> = { body, headers: {} }
+  return req as TokenHttpRequest
+}
 
 describe('OAuthProviderController', () => {
   let controller: OAuthProviderController
@@ -176,13 +196,10 @@ describe('OAuthProviderController', () => {
           isConfidential: false,
           createdBy: { toString: () => 'u1' },
         })
-        const req = {
-          body: {
-            client_id: 'cid', redirect_uri: 'https://example.com/cb',
-            scope: 'org:read', state: 'state1', consent: 'granted',
-          },
-          user: { userId: 'u1', orgId: 'o1' },
-        } as any
+        const req = consentRequest({
+          client_id: 'cid', redirect_uri: 'https://example.com/cb',
+          scope: 'org:read', state: 'state1', consent: 'granted',
+        })
 
         await controller.authorizeConsent(req, mockRes, mockNext)
 
@@ -202,14 +219,11 @@ describe('OAuthProviderController', () => {
           createdBy: { toString: () => 'u1' },
         })
         mockAuthCodeService.generateCode.resolves('pkce-code')
-        const req = {
-          body: {
-            client_id: 'cid', redirect_uri: 'https://example.com/cb',
-            scope: 'org:read', state: 'state1', consent: 'granted',
-            code_challenge: validChallenge, code_challenge_method: 'S256',
-          },
-          user: { userId: 'u1', orgId: 'o1' },
-        } as any
+        const req = consentRequest({
+          client_id: 'cid', redirect_uri: 'https://example.com/cb',
+          scope: 'org:read', state: 'state1', consent: 'granted',
+          code_challenge: validChallenge, code_challenge_method: 'S256',
+        })
 
         await controller.authorizeConsent(req, mockRes, mockNext)
 
@@ -226,13 +240,10 @@ describe('OAuthProviderController', () => {
           createdBy: { toString: () => 'u1' },
         })
         mockAuthCodeService.generateCode.resolves('conf-code')
-        const req = {
-          body: {
-            client_id: 'cid', redirect_uri: 'https://example.com/cb',
-            scope: 'org:read', state: 'state1', consent: 'granted',
-          },
-          user: { userId: 'u1', orgId: 'o1' },
-        } as any
+        const req = consentRequest({
+          client_id: 'cid', redirect_uri: 'https://example.com/cb',
+          scope: 'org:read', state: 'state1', consent: 'granted',
+        })
 
         await controller.authorizeConsent(req, mockRes, mockNext)
 
@@ -851,13 +862,10 @@ describe('OAuthProviderController', () => {
     // GHSA-cxgc-52jq-fcx9: the client type must reach exchangeCode so it can
     // fail closed for public clients whose code carries no challenge.
     it('passes the client type (isConfidential) to exchangeCode', async () => {
-      const req = {
-        body: {
-          grant_type: 'authorization_code', client_id: 'cid', code: 'code',
-          redirect_uri: 'https://ex.com/cb', code_verifier: 'v'.repeat(43),
-        },
-        headers: {},
-      } as any
+      const req = tokenRequest({
+        grant_type: 'authorization_code', client_id: 'cid', code: 'code',
+        redirect_uri: 'https://ex.com/cb', code_verifier: 'v'.repeat(43),
+      })
 
       mockOAuthAppService.getAppByClientId.resolves({ clientId: 'cid', isConfidential: false })
       mockOAuthAppService.isGrantTypeAllowed.returns(true)
@@ -865,9 +873,10 @@ describe('OAuthProviderController', () => {
       mockOAuthTokenService.generateTokens.resolves({
         accessToken: 'at', tokenType: 'Bearer', expiresIn: 3600, scope: 'org:read',
       })
+      // Only the select/lean/exec chain is exercised, not the full mongoose Query.
       const chainable = { select: sinon.stub().returnsThis(), lean: sinon.stub().returnsThis(), exec: sinon.stub().resolves(null) }
-      sinon.stub(Users, 'findOne').returns(chainable as any)
-      sinon.stub(Org, 'findOne').returns(chainable as any)
+      sinon.stub(Users, 'findOne').returns(chainable as Partial<ReturnType<typeof Users.findOne>> as ReturnType<typeof Users.findOne>)
+      sinon.stub(Org, 'findOne').returns(chainable as Partial<ReturnType<typeof Org.findOne>> as ReturnType<typeof Org.findOne>)
 
       await controller.token(req, mockRes, mockNext)
 
