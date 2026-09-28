@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1647,3 +1648,7 @@ class TestConvertRouteFilenameHardening:
         assert os.path.realpath(outdir).startswith(os.path.realpath(tempfile.gettempdir()))
         assert re.fullmatch(r"[0-9a-f]{32}\.pptx", os.path.basename(input_path))
         assert "deck" not in os.path.basename(input_path)
+        profile_args = [a for a in cmd if a.startswith("-env:UserInstallation=")]
+        assert profile_args == [
+            "-env:UserInstallation=" + Path(os.path.join(outdir, ".libreoffice-profile")).as_uri()
+        ]

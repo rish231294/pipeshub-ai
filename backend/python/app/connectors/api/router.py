@@ -1523,8 +1523,15 @@ async def get_record_stream(request: Request, file: UploadFile = File(...)) -> S
                     while chunk := await file.read(_CONVERT_CHUNK_BYTES):
                         await asyncio.to_thread(f.write, chunk)
 
+                # A per-request profile stops concurrent conversions from colliding on
+                # the shared default profile (the second process would hand off or exit
+                # with no output). It lives in tmpdir, so it is removed with it.
+                libreoffice_profile_uri = Path(
+                    os.path.join(tmpdir, ".libreoffice-profile")
+                ).as_uri()
                 conversion_cmd = [
                     "libreoffice",
+                    f"-env:UserInstallation={libreoffice_profile_uri}",
                     "--headless",
                     "--convert-to",
                     "pdf",
