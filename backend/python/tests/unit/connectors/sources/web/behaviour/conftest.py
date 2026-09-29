@@ -1,5 +1,6 @@
 """Fixtures for the Web connector behaviour tests (fakes live in web_behaviour_fakes)."""
 
+import asyncio
 import logging
 import shutil
 import socket
@@ -29,19 +30,31 @@ from web_behaviour_fakes import (
 )
 
 from app.connectors.sources.web import connector as connector_module
-from app.connectors.sources.web import crawl4ai_fetcher, fetch_strategy
+from app.connectors.sources.web import crawl4ai_fetcher, egress_proxy, fetch_strategy
 from app.connectors.sources.web.connector import WebConnector
 
 
 @pytest.fixture(autouse=True)
 def no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only Unix sockets (the fake websites) may be connected to."""
+    """Only Unix sockets (the fake websites) and the browser's own egress proxy may be connected to."""
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
+    proxy_ports: set[int] = set()
+    real_proxy_start = egress_proxy.EgressProxy.start
+
+    async def proxy_start(self: egress_proxy.EgressProxy) -> str:
+        url = await real_proxy_start(self)
+        proxy_ports.add(int(url.rsplit(":", 1)[1]))
+        return url
+
+    monkeypatch.setattr(egress_proxy.EgressProxy, "start", proxy_start)
 
     def _guard(sock: socket.socket, address: object) -> None:
-        if sock.family != socket.AF_UNIX:
-            raise AssertionError(f"test tried to reach the network: {address!r}")
+        if sock.family == socket.AF_UNIX:
+            return
+        if isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] in proxy_ports:
+            return
+        raise AssertionError(f"test tried to reach the network: {address!r}")
 
     def connect(sock: socket.socket, address: object) -> None:
         _guard(sock, address)
@@ -93,6 +106,14 @@ async def site(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FakeWeb]:
         return real_session(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(aiohttp, "ClientSession", session_on_fake_web)
+
+    async def upstream_on_fake_web(*_: object, **__: object) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        return await asyncio.open_unix_connection(sock_path)
+
+    # The egress proxy connects to the checked address; on the fake web every address is the site.
+    fake_asyncio = SimpleNamespace(**{name: getattr(asyncio, name) for name in dir(asyncio) if not name.startswith("_")})
+    fake_asyncio.open_connection = upstream_on_fake_web
+    monkeypatch.setattr(egress_proxy, "asyncio", fake_asyncio)
     try:
         yield fake
     finally:

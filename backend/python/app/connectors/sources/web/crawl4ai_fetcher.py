@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Coroutine, Optional, TypeVar, Union
 
 from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.sources.web.egress_proxy import EgressProxy
 from app.connectors.sources.web.fetch_strategy import (
     BLOCKED_URL_MESSAGE,
     BlockedUrlError,
@@ -18,7 +19,7 @@ T = TypeVar("T")
 
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})")
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, ProxyConfig
 from crawl4ai.async_dispatcher import SemaphoreDispatcher
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_adapter import UndetectedAdapter
@@ -304,6 +305,8 @@ for (const p of __panels) {
             viewport_width=viewport[0],
             viewport_height=viewport[1],
             java_script_enabled=True,
+            # WebRTC could otherwise send UDP past the egress proxy.
+            extra_args=["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"],
             **({"init_scripts": init_scripts} if init_scripts else {}),
         )
         before_wait = [self._CSR_MONITOR_JS]
@@ -336,6 +339,7 @@ for (const p of __panels) {
         self._crawler: Optional[AsyncWebCrawler] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._egress = EgressProxy()
 
     async def start(self):
         loop = asyncio.new_event_loop()
@@ -354,8 +358,16 @@ for (const p of __panels) {
         self._thread.start()
         started.wait()
 
-        self._crawler = await self._run_in_browser_thread(self._create_and_start_crawler())
-        self._semaphore = await self._run_in_browser_thread(self._create_semaphore())
+        # Every connection the browser makes goes through the SSRF-checking proxy, which runs on
+        # the browser's own loop so it lives exactly as long as the browser does.
+        try:
+            proxy_url = await self._run_in_browser_thread(self._egress.start())
+            self._browser_config.proxy_config = ProxyConfig(server=proxy_url)
+            self._crawler = await self._run_in_browser_thread(self._create_and_start_crawler())
+            self._semaphore = await self._run_in_browser_thread(self._create_semaphore())
+        except BaseException:
+            await self.close()  # a browser that failed to start leaves no thread or proxy socket behind
+            raise
 
     async def _create_semaphore(self) -> asyncio.Semaphore:
         return asyncio.Semaphore(self._concurrency)
@@ -379,6 +391,7 @@ for (const p of __panels) {
             await self._run_in_browser_thread(self._crawler.close())
             self._crawler = None
         if self._loop:
+            await self._run_in_browser_thread(self._egress.close())
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._loop = None
         if self._thread:

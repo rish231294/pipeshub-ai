@@ -229,3 +229,17 @@ async def test_a_render_that_lands_on_an_internal_address_is_discarded(many: boo
     assert result.error == BLOCKED_URL_MESSAGE
     assert result.html is None
     assert result.url == "http://site.test/go"
+
+
+async def test_the_browser_is_launched_behind_the_egress_proxy(browser: FakeWeb) -> None:
+    browser.add("http://site.test/", Page(body=html_page("Home"), subresources=(METADATA, "/logo.png")))
+    browser.add("http://site.test/logo.png", Page(body=b"PNG", content_type="image/png"))
+
+    async with Crawl4AIFetcher() as fetcher:
+        result = await fetcher.fetch("http://site.test/")
+        proxy = fetcher._browser_config.proxy_config.server  # noqa: SLF001
+
+    assert result.success is True
+    assert proxy.startswith("http://127.0.0.1:")
+    assert dict(browser.browser_subresources) == {METADATA: 403, "http://site.test/logo.png": 200}
+    assert METADATA not in [url for _, url in browser.requests]

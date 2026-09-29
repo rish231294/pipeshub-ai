@@ -114,3 +114,27 @@ async def test_the_connection_test_reports_a_redirect_to_an_internal_address_as_
 
     assert await connector.test_connection_and_access() is False
     assert not _requested(site, METADATA)
+
+
+async def test_in_robust_mode_a_page_s_own_requests_to_internal_addresses_never_leave_the_browser(
+    site: FakeWeb, db: FakeRecordsDb, make_connector: MakeConnector,
+) -> None:
+    """Images, iframes and fetch() calls the page makes itself go through the egress proxy."""
+    _internal_pages(site)
+    site.add("http://site.test/logo.png", Page(body=b"PNG", content_type="image/png"))
+    site.add(START_URL, Page(
+        body=b"<html><body><h1>Home</h1><p>Welcome to the site.</p></body></html>",
+        subresources=("/logo.png", METADATA, INTRANET, "http://127.0.0.1:9911/"),
+    ))
+
+    await (await make_connector(crawl_type="single", use_headless_browser=True)).run_sync()
+
+    assert START_URL in db.pages()
+    assert dict(site.browser_subresources) == {
+        "http://site.test/logo.png": 200,
+        METADATA: 403,
+        INTRANET: 403,
+        "http://127.0.0.1:9911/": 403,
+    }
+    assert not _requested(site, METADATA)
+    assert not _requested(site, INTRANET)

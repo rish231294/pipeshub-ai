@@ -1160,6 +1160,7 @@ class TestWebConnectorFetchAndProcessDeep:
     @pytest.mark.asyncio
     async def test_queues_retry_on_none_result(self):
         connector = _make_connector()
+        connector._ensure_crawl4ai_fetcher = AsyncMock(return_value=None)  # no real browser
         connector.url = "https://example.com"
         connector.base_domain = "https://example.com"
         connector.session = MagicMock()
@@ -1176,6 +1177,7 @@ class TestWebConnectorFetchAndProcessDeep:
     @pytest.mark.asyncio
     async def test_queues_retry_on_retryable_status(self):
         connector = _make_connector()
+        connector._ensure_crawl4ai_fetcher = AsyncMock(return_value=None)  # no real browser
         connector.url = "https://example.com"
         connector.base_domain = "https://example.com"
         connector.session = MagicMock()

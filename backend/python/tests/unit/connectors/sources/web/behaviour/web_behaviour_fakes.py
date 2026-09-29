@@ -83,6 +83,8 @@ class Page:
     cloudflare_challenge: bool = False
     # Where the solved challenge sends the scraper; the page itself by default.
     cloudflare_challenge_redirect: str | None = None
+    # What the rendered page loads by itself (images, iframes, fetch()), through the browser's proxy.
+    subresources: tuple[str, ...] = ()
 
 
     # Validators: sent with the page, and a matching If-None-Match / If-Modified-Since gets a 304.
@@ -114,6 +116,7 @@ class FakeWeb:
         self.not_modified: list[str] = []
         self.browser_visits: list[str] = []
         self.browser_loaded: list[str] = []  # every address the browser requested, redirect hops included
+        self.browser_subresources: list[tuple[str, int]] = []  # (url, status the page's own request got)
         self.browser_starts = 0
         self.browser_broken = False
         self.storage_docs: dict[str, bytes] = {}
@@ -264,8 +267,26 @@ def browser_crawler_class(site: FakeWeb) -> type:
     """A stand-in for ``crawl4ai.AsyncWebCrawler`` that renders from ``site``."""
 
     class FakeBrowserCrawler:
-        def __init__(self, *_, **__) -> None:
+        def __init__(self, *_, crawler_strategy: object = None, **__) -> None:
             self.started = False
+            proxy_config = getattr(getattr(crawler_strategy, "browser_config", None), "proxy_config", None)
+            self.proxy = getattr(proxy_config, "server", None)
+
+        async def _load_subresource(self, url: str) -> None:
+            """Like Chromium: through the proxy it was launched with, or straight to the site without one."""
+            if self.proxy is None:
+                answered = site.answer("GET", url, {}, via="browser")
+                site.browser_subresources.append((url, answered[0] if answered else 0))
+                return
+            proxy = urlparse(self.proxy)
+            reader, writer = await asyncio.open_connection(proxy.hostname, proxy.port)
+            try:
+                writer.write(f"GET {url} HTTP/1.1\r\nHost: {urlparse(url).netloc}\r\n\r\n".encode())
+                await writer.drain()
+                status_line = await reader.readline()
+                site.browser_subresources.append((url, int(status_line.split()[1]) if status_line else 0))
+            finally:
+                writer.close()
 
         async def start(self) -> None:
             site.browser_starts += 1
@@ -285,6 +306,8 @@ def browser_crawler_class(site: FakeWeb) -> type:
                 return SimpleNamespace(url=url, redirected_url=url, html="", success=False, status_code=None,
                                        error_message="net::ERR_EMPTY_RESPONSE", crawl_stats=None,
                                        js_execution_result=None)
+            for subresource in page.subresources:
+                await self._load_subresource(urljoin(final_url, subresource))
             browser_headers = {"content-type": page.content_type} if page.content_type else {}
             status = page.rendered_status if page.rendered_status is not None else page.status
             if page.rendered is not None:
