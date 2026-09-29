@@ -778,6 +778,26 @@ class TestValidatePublicHttpUrlEdgeCases:
             with pytest.raises(FetchError, match="Blocked unsafe URL"):
                 validate_public_http_url("http://sneaky-nat64-metadata.example/")
 
+    @pytest.mark.parametrize("address", ["2002:7f00:1::", "2002:a9fe:a9fe::", "2002:a00:1::1"])
+    def test_resolved_6to4_embedding_internal_ipv4_raises(self, address: str) -> None:
+        """6to4 (2002::/16) carries an IPv4 address; Python calls all of it global."""
+        from app.utils.url_fetcher import validate_public_http_url
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, 0, 0, 0))]
+        with patch("socket.getaddrinfo", return_value=infos):
+            with pytest.raises(FetchError, match="Blocked unsafe URL"):
+                validate_public_http_url("http://sneaky-6to4.example/")
+
+    def test_resolved_6to4_embedding_public_ipv4_allowed(self) -> None:
+        from app.utils.url_fetcher import validate_public_http_url
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2002:808:808::", 0, 0, 0))]
+        with patch("socket.getaddrinfo", return_value=infos):
+            validate_public_http_url("http://public-6to4.example/")
+
+    def test_ietf_protocol_assignments_range_raises(self) -> None:
+        from app.utils.url_fetcher import validate_public_http_url
+        with pytest.raises(FetchError, match="Blocked unsafe URL address"):
+            validate_public_http_url("http://192.0.0.8/")
+
 
 # ---------------------------------------------------------------------------
 # _get_supported_profiles — lines 167-180 (body when curl_cffi is importable)

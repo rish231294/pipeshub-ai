@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes
+from app.connectors.core.base.connector.connector_service import ConnectorInitError
 from app.connectors.sources.rss.connector import RSSApp, RSSConnector
+from app.connectors.sources.web.fetch_strategy import FetchResponse
 from app.models.entities import (
     AppUser,
     RecordGroupType,
@@ -26,6 +28,18 @@ from app.models.entities import FileRecord, RecordType
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _patch_fetch(status: int):
+    """The connection test fetches through fetch_url_with_fallback; answer it with ``status``."""
+    return patch(
+        "app.connectors.sources.rss.connector.fetch_url_with_fallback",
+        new=AsyncMock(return_value=FetchResponse(status, b"", {}, "https://feed.com/rss", "aiohttp")),
+    )
+
+
+def _patch_fetch_raises(exc: Exception):
+    return patch("app.connectors.sources.rss.connector.fetch_url_with_fallback", new=AsyncMock(side_effect=exc))
 
 def _make_connector():
     """Build an RSSConnector with all dependencies mocked."""
@@ -134,6 +148,17 @@ class TestRSSConnectorInit:
         assert connector.max_articles_per_feed == 50
         assert connector.fetch_full_content is True
         assert connector.session is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("feed_url", ["http://169.254.169.254/latest/meta-data/", "http://127.0.0.1:8088/feed"])
+    async def test_init_rejects_an_internal_feed_url(self, feed_url):
+        connector = _make_connector()
+        config = _rss_config()
+        config["sync"]["feed_urls"] = feed_url
+        connector.config_service.get_config = AsyncMock(return_value=config)
+        with pytest.raises(ConnectorInitError, match="private, internal or reserved"):
+            await connector.init()
+        assert connector.session is None
 
     @pytest.mark.asyncio
     async def test_init_no_config(self):
@@ -1214,29 +1239,38 @@ class TestTestConnectionAndAccess:
     async def test_success(self):
         conn = _make_connector_cov()
         conn.feed_urls = ["https://feed.com/rss"]
-        resp = _make_mock_response(status=200)
-        conn.session = _make_session(resp)
-        result = await conn.test_connection_and_access()
+        conn.session = MagicMock()
+        with _patch_fetch(status=200):
+            result = await conn.test_connection_and_access()
         assert result is True
 
     @pytest.mark.asyncio
     async def test_bad_status(self):
         conn = _make_connector_cov()
         conn.feed_urls = ["https://feed.com/rss"]
-        resp = _make_mock_response(status=404)
-        conn.session = _make_session(resp)
-        result = await conn.test_connection_and_access()
+        conn.session = MagicMock()
+        with _patch_fetch(status=404):
+            result = await conn.test_connection_and_access()
         assert result is False
 
     @pytest.mark.asyncio
     async def test_exception(self):
         conn = _make_connector_cov()
         conn.feed_urls = ["https://feed.com/rss"]
-        session = MagicMock()
-        session.get = MagicMock(side_effect=Exception("network error"))
-        conn.session = session
+        conn.session = MagicMock()
+        with _patch_fetch_raises(Exception("network error")):
+            result = await conn.test_connection_and_access()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_internal_feed_url_is_never_requested(self):
+        conn = _make_connector_cov()
+        conn.feed_urls = ["http://169.254.169.254/latest/meta-data/"]
+        conn.session = MagicMock()
         result = await conn.test_connection_and_access()
         assert result is False
+        conn.session.get.assert_not_called()
+        conn.session.head.assert_not_called()
 
 
 # ===================================================================

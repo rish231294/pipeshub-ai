@@ -27,6 +27,18 @@ from app.models.entities import FileRecord, RecordType, User
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _patch_fetch(status: int):
+    """The connection test fetches through fetch_url_with_fallback; answer it with ``status``."""
+    return patch(
+        "app.connectors.sources.rss.connector.fetch_url_with_fallback",
+        new=AsyncMock(return_value=FetchResponse(status, b"", {}, "https://feed.com/rss", "aiohttp")),
+    )
+
+
+def _patch_fetch_raises(exc: Exception):
+    return patch("app.connectors.sources.rss.connector.fetch_url_with_fallback", new=AsyncMock(side_effect=exc))
+
 def _make_connector():
     """Build an RSSConnector with all dependencies mocked."""
     logger = MagicMock()
@@ -669,28 +681,27 @@ class TestTestConnectionAndAccess:
     async def test_success(self):
         conn = _make_connector()
         conn.feed_urls = ["https://feed.com/rss"]
-        resp = _make_mock_response(status=200)
-        conn.session = _make_session(resp)
-        result = await conn.test_connection_and_access()
+        conn.session = MagicMock()
+        with _patch_fetch(status=200):
+            result = await conn.test_connection_and_access()
         assert result is True
 
     @pytest.mark.asyncio
     async def test_bad_status(self):
         conn = _make_connector()
         conn.feed_urls = ["https://feed.com/rss"]
-        resp = _make_mock_response(status=404)
-        conn.session = _make_session(resp)
-        result = await conn.test_connection_and_access()
+        conn.session = MagicMock()
+        with _patch_fetch(status=404):
+            result = await conn.test_connection_and_access()
         assert result is False
 
     @pytest.mark.asyncio
     async def test_exception(self):
         conn = _make_connector()
         conn.feed_urls = ["https://feed.com/rss"]
-        session = MagicMock()
-        session.get = MagicMock(side_effect=Exception("network error"))
-        conn.session = session
-        result = await conn.test_connection_and_access()
+        conn.session = MagicMock()
+        with _patch_fetch_raises(Exception("network error")):
+            result = await conn.test_connection_and_access()
         assert result is False
 
 

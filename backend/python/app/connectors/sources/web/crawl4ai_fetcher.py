@@ -7,6 +7,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Coroutine, Optional, TypeVar, Union
 
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.sources.web.fetch_strategy import (
+    BLOCKED_URL_MESSAGE,
+    BlockedUrlError,
+    resolve_public_target,
+)
+
 T = TypeVar("T")
 
 _HTTP_STATUS_RE = re.compile(r"HTTP\s+(\d{3})")
@@ -15,6 +22,7 @@ from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from crawl4ai.async_dispatcher import SemaphoreDispatcher
 from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
 from crawl4ai.browser_adapter import UndetectedAdapter
+
 
 
 class _SharedSemaphoreDispatcher(SemaphoreDispatcher):
@@ -58,6 +66,31 @@ class FetchResult:
     error: Optional[str] = None
     js_execution_result: Optional[dict[str, Any]] = None
     content_type: str | None = None  # of the response the browser loaded, when it reports one
+
+
+async def _refusal(url: str) -> Optional["FetchResult"]:
+    """The answer to use instead of loading ``url``, when the SSRF policy refuses it.
+
+    Chromium resolves names and follows redirects by itself, so only the URL it is given and the
+    one it lands on can be checked here, not every connection it makes.
+    """
+    try:
+        await resolve_public_target(url)
+    except BlockedUrlError:
+        return FetchResult(
+            url=url, success=False, status_code=HttpStatusCode.BAD_REQUEST.value, error=BLOCKED_URL_MESSAGE,
+        )
+    except OSError as e:
+        return FetchResult(url=url, success=False, error=str(e))
+    return None
+
+
+async def _landed_refused(requested: str, landed: Optional[str]) -> Optional["FetchResult"]:
+    """A render that redirected onto a refused address is discarded, filed under the URL asked for."""
+    if not landed or landed == requested:
+        return None
+    refused = await _refusal(landed)
+    return FetchResult(url=requested, success=False, status_code=refused.status_code, error=refused.error) if refused else None
 
 
 def _content_type(response_headers: object) -> str | None:
@@ -392,12 +425,16 @@ for (const p of __panels) {
         page_timeout_s = (config.page_timeout or 15000) / 1000
         timeout = page_timeout_s * 2 + 10
 
+        if (refused := await _refusal(url)) is not None:
+            return refused
         try:
             async with self._semaphore:
                 result = await asyncio.wait_for(
                     self._crawler.arun(url, config=config),
                     timeout=timeout,
                 )
+            if (refused := await _landed_refused(url, result.redirected_url)) is not None:
+                return refused
             js_result = None
             raw = result.js_execution_result
             if isinstance(raw, dict) and raw.get("success"):
@@ -454,15 +491,22 @@ for (const p of __panels) {
             semaphore_count=self._concurrency,
         )
 
+        refusals = await asyncio.gather(*(_refusal(u) for u in urls))
+        to_load = [u for u, refused in zip(urls, refusals) if refused is None]
         try:
-            results = await asyncio.wait_for(
-                self._crawler.arun_many(urls, config=config, dispatcher=dispatcher),
+            results = iter(await asyncio.wait_for(
+                self._crawler.arun_many(to_load, config=config, dispatcher=dispatcher),
                 timeout=batch_timeout,
-            )
+            ) if to_load else ())
             out: list[FetchResult] = []
-            for r, u in zip(results, urls):
-                if isinstance(r, BaseException):
+            for u, refused in zip(urls, refusals):
+                r = next(results) if refused is None else None
+                if refused is not None:
+                    out.append(refused)
+                elif isinstance(r, BaseException):
                     out.append(FetchResult(url=u, error=str(r), success=False))
+                elif (landed := await _landed_refused(u, r.redirected_url)) is not None:
+                    out.append(landed)
                 else:
                     out.append(FetchResult(
                         # crawl4ai's ``url`` is the one asked for; the connector needs where it landed.

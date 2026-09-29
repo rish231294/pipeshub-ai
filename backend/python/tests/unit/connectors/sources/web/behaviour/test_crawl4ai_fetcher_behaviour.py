@@ -15,6 +15,7 @@ from app.connectors.sources.web.crawl4ai_fetcher import (
     get_shared_fetcher,
     release_shared_fetcher,
 )
+from app.connectors.sources.web.fetch_strategy import BLOCKED_URL_MESSAGE
 
 
 def _with_crawler(monkeypatch: pytest.MonkeyPatch, arun: Callable[[str], Awaitable[object]], site: FakeWeb) -> None:
@@ -198,3 +199,33 @@ async def test_a_redirect_in_the_browser_reports_where_the_page_ended_up(many: b
             result = await fetcher.fetch("http://site.test/old")
 
     assert result.url == "http://site.test/new"
+
+
+METADATA = "http://169.254.169.254/latest/meta-data/"
+
+
+async def test_the_browser_is_never_given_an_internal_address(browser: FakeWeb) -> None:
+    browser.html(METADATA, "AKIA-SECRET")
+
+    async with Crawl4AIFetcher() as fetcher:
+        single = await fetcher.fetch(METADATA)
+        batch = await fetcher.fetch_many(["http://site.test/", METADATA])
+
+    assert single.success is False and single.error == BLOCKED_URL_MESSAGE and single.html is None
+    assert batch[1].error == BLOCKED_URL_MESSAGE and batch[1].html is None
+    assert batch[0].url == "http://site.test/"
+    assert METADATA not in browser.browser_loaded
+
+
+@pytest.mark.parametrize("many", [False, True])
+async def test_a_render_that_lands_on_an_internal_address_is_discarded(many: bool, browser: FakeWeb) -> None:
+    browser.add("http://site.test/go", Page(status=302, location=METADATA, content_type=None))
+    browser.html(METADATA, "AKIA-SECRET")
+
+    async with Crawl4AIFetcher() as fetcher:
+        result = (await fetcher.fetch_many(["http://site.test/go"]))[0] if many else await fetcher.fetch("http://site.test/go")
+
+    assert result.success is False
+    assert result.error == BLOCKED_URL_MESSAGE
+    assert result.html is None
+    assert result.url == "http://site.test/go"

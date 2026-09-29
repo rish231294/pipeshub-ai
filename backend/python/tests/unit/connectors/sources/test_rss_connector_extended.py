@@ -8,9 +8,22 @@ import pytest
 
 from app.config.constants.arangodb import Connectors, MimeTypes
 from app.connectors.sources.rss.connector import RSSApp, RSSConnector
+from app.connectors.sources.web.fetch_strategy import FetchResponse
 from app.models.entities import AppUser, RecordGroupType, RecordType, User
 from app.models.permission import EntityType, PermissionType
 
+
+
+def _patch_fetch(status: int):
+    """The connection test fetches through fetch_url_with_fallback; answer it with ``status``."""
+    return patch(
+        "app.connectors.sources.rss.connector.fetch_url_with_fallback",
+        new=AsyncMock(return_value=FetchResponse(status, b"", {}, "https://feed.com/rss", "aiohttp")),
+    )
+
+
+def _patch_fetch_raises(exc: Exception):
+    return patch("app.connectors.sources.rss.connector.fetch_url_with_fallback", new=AsyncMock(side_effect=exc))
 
 def _make_connector():
     from app.models.entities import AppMetadata, User
@@ -175,36 +188,23 @@ class TestTestConnection:
     async def test_success(self):
         conn = _make_connector()
         conn.feed_urls = ["https://example.com/rss"]
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_session = MagicMock()
-        mock_session.get = MagicMock(return_value=AsyncMock(
-            __aenter__=AsyncMock(return_value=mock_response),
-            __aexit__=AsyncMock(return_value=None),
-        ))
-        conn.session = mock_session
-        assert await conn.test_connection_and_access() is True
+        conn.session = MagicMock()
+        with _patch_fetch(status=200):
+            assert await conn.test_connection_and_access() is True
 
     async def test_bad_status(self):
         conn = _make_connector()
         conn.feed_urls = ["https://example.com/rss"]
-        mock_response = MagicMock()
-        mock_response.status = 404
-        mock_session = MagicMock()
-        mock_session.get = MagicMock(return_value=AsyncMock(
-            __aenter__=AsyncMock(return_value=mock_response),
-            __aexit__=AsyncMock(return_value=None),
-        ))
-        conn.session = mock_session
-        assert await conn.test_connection_and_access() is False
+        conn.session = MagicMock()
+        with _patch_fetch(status=404):
+            assert await conn.test_connection_and_access() is False
 
     async def test_exception(self):
         conn = _make_connector()
         conn.feed_urls = ["https://example.com/rss"]
-        mock_session = MagicMock()
-        mock_session.get = MagicMock(side_effect=Exception("error"))
-        conn.session = mock_session
-        assert await conn.test_connection_and_access() is False
+        conn.session = MagicMock()
+        with _patch_fetch_raises(Exception("error")):
+            assert await conn.test_connection_and_access() is False
 
 
 # ===========================================================================

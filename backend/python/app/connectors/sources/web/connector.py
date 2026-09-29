@@ -34,7 +34,7 @@ from app.config.constants.arangodb import (
 from app.config.constants.http_status_code import HttpStatusCode
 from app.config.constants.service import DefaultEndpoints, config_node_constants
 from app.connectors.core.constants import IconPaths
-from app.connectors.core.base.connector.connector_service import BaseConnector
+from app.connectors.core.base.connector.connector_service import BaseConnector, ConnectorInitError
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
     DataSourceEntitiesProcessor,
 )
@@ -73,10 +73,16 @@ from app.models.entities import (
     User,
 )
 from app.connectors.sources.web.fetch_strategy import (
+    BLOCKED_URL_MESSAGE,
     MAX_RATE_LIMIT_BACKOFF,
+    BlockedUrlError,
     FetchResponse,
+    blocked_url_response,
     build_stealth_headers,
     fetch_url_with_fallback,
+    is_blocked_url_response,
+    public_client_session,
+    resolve_public_target,
     too_many_redirects_response,
 )
 from app.connectors.sources.web.crawl4ai_fetcher import Crawl4AIFetcher, FetchResult, get_shared_fetcher, release_shared_fetcher, resolve_fetch_status_code
@@ -166,6 +172,7 @@ MAX_RETRIES = 2
 # Finding where a redirect the browser aborted was heading, without following it off the crawl.
 MAX_PROBE_REDIRECTS = 10
 PROBE_UNENDING = -1  # _probe_landing's status for a chain still redirecting after MAX_PROBE_REDIRECTS
+PROBE_BLOCKED = -2  # _probe_landing's status for a hop the SSRF policy refused, unrequested
 REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 HEAD_NOT_SUPPORTED = frozenset({HTTPStatus.METHOD_NOT_ALLOWED.value, HTTPStatus.NOT_IMPLEMENTED.value})
 PROBE_TIMEOUT_SECONDS = 10
@@ -484,7 +491,7 @@ class WebConnector(BaseConnector):
 
             # Initialize aiohttp session with realistic browser headers
             timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
+            self.session = public_client_session(
                 timeout=timeout,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -511,6 +518,8 @@ class WebConnector(BaseConnector):
                 await self._check_script_rendering(self.url)
 
             return True
+        except ConnectorInitError:
+            raise
         except Exception as e:
             self.logger.error(f"❌ Failed to initialize web connector: {e}", exc_info=True)
             return False
@@ -554,6 +563,14 @@ class WebConnector(BaseConnector):
             if not url:
                 self.logger.error("❌ WebPage url not found")
                 raise ValueError("WebPage url not found")
+            try:
+                await resolve_public_target(url)
+            except BlockedUrlError as e:
+                self.logger.error("❌ WebPage url refused by the SSRF policy: %s", e)
+                raise ConnectorInitError(BLOCKED_URL_MESSAGE) from e
+            except OSError as e:
+                # Every fetch checks again, so a host that doesn't resolve yet fails there, not here.
+                self.logger.warning("⚠️ WebPage url host did not resolve: %s", e)
 
             crawl_type = sync_config.get("type", "single")
             max_depth = int(sync_config.get("depth") or 3)
@@ -664,7 +681,10 @@ class WebConnector(BaseConnector):
                     type=NotificationType.CONNECTOR_NOT_ACCESSIBLE,
                     severity=NotificationSeverity.ERROR,
                     title=f"Website not accessible",
-                    message=f"Website {self.url} returned status {result.status_code}",
+                    message=(
+                        BLOCKED_URL_MESSAGE if is_blocked_url_response(result)
+                        else f"Website {self.url} returned status {result.status_code}"
+                    ),
                 )
                 return False
 
@@ -1408,6 +1428,8 @@ class WebConnector(BaseConnector):
             return False
         if result.headers.get("X-Fetch-Skip-Reason") == "too_many_redirects":
             return False  # the browser would follow the same chain, without checking each hop
+        if is_blocked_url_response(result):
+            return False  # refused by the SSRF policy; a browser must not try the address
         return True  # Bot-block, rate-limit, or server error — try headless
 
     async def _ensure_crawl4ai_fetcher(self) -> Optional[Crawl4AIFetcher]:
@@ -1576,6 +1598,9 @@ class WebConnector(BaseConnector):
         rendered.  Both snapshots respect CSS visibility, avoiding false
         results from CSS-hidden elements.
         """
+        if await self._browser_refused(url):
+            self.logger.warning("⚠️ Not opening %s in a browser: refused by the SSRF policy", url)
+            return False
         try:
             probe = Crawl4AIFetcher(
                 concurrency=1,
@@ -1632,6 +1657,8 @@ class WebConnector(BaseConnector):
             return True
 
     def _crawl4ai_result_to_response(self, fetch_result: FetchResult, url: str) -> Optional[FetchResponse]:
+        if fetch_result.error == BLOCKED_URL_MESSAGE:
+            return blocked_url_response(fetch_result.url or url)
         # The site's own status is kept for the reason shown; 0 means the browser got no answer.
         status_code = resolve_fetch_status_code(
             fetch_result.status_code,
@@ -1669,6 +1696,8 @@ class WebConnector(BaseConnector):
         if probed is None:
             return None  # the site answered neither HEAD nor GET; recorded as unreachable
         landing, status, _content_type = probed
+        if status == PROBE_BLOCKED:
+            return blocked_url_response(landing)
         if status == PROBE_UNENDING:
             return too_many_redirects_response(url)
         if self._outside_crawl(landing):
@@ -1732,6 +1761,8 @@ class WebConnector(BaseConnector):
             return await self._fetch_linked_document(url)
         if walk_first and (refused := await self._landing_refused_before_browser(url)) is not None:
             return refused
+        if not walk_first and await self._browser_refused(url):
+            return blocked_url_response(url)
         result = await self.crawl4ai_fetcher.fetch(url)
         return await self._fetch_document_behind_render(
             self._crawl4ai_result_to_response(result, url), url, no_answer=self._browser_got_no_answer(result),
@@ -1766,10 +1797,19 @@ class WebConnector(BaseConnector):
         probed = await self._probe_landing(url)
         if probed is None or probed[1] > 0:
             return None
+        if probed[1] == PROBE_BLOCKED:
+            return blocked_url_response(probed[0])
         if probed[1] == PROBE_UNENDING:
             return too_many_redirects_response(url)
         landing = probed[0]
         return self._out_of_scope_response(landing) if self._outside_crawl(landing) else self._robots_skip_response(landing)
+
+    async def _browser_refused(self, url: str) -> bool:
+        """Chromium resolves and redirects on its own, past the crawl session's SSRF guard, so the
+        URL and its redirects are walked with that session first. A chain that changes between this
+        walk and the browser's load is not covered."""
+        probed = await self._probe_landing(url)
+        return probed is not None and probed[1] == PROBE_BLOCKED
 
     @staticmethod
     def _browser_got_no_answer(fetch_result: FetchResult) -> bool:
@@ -1798,6 +1838,8 @@ class WebConnector(BaseConnector):
             if probed is None:
                 return response  # the site didn't answer the probe either; the browser retry stands
             landing, status, content_type = probed
+            if status == PROBE_BLOCKED:
+                return blocked_url_response(landing)
             if status == PROBE_UNENDING:
                 return too_many_redirects_response(requested_url)
             if self._outside_crawl(landing):
@@ -1906,25 +1948,43 @@ class WebConnector(BaseConnector):
 
         Each hop is asked with HEAD, or with GET (body left unread) when HEAD is refused or fails.
         Returns the landing URL, its status and Content-Type, or the first out-of-scope or
-        disallowed hop, unrequested, with status 0, or the last hop checked with ``PROBE_UNENDING``
+        disallowed hop, unrequested, with status 0, or the first hop the SSRF policy refuses,
+        unrequested, with ``PROBE_BLOCKED``, or the last hop checked with ``PROBE_UNENDING``
         when the chain is still redirecting after MAX_PROBE_REDIRECTS redirects, the same limit as
         a normal crawl's walk. Returns None if the site doesn't answer.
         """
         if self.session is None:
             return None
+        # Each hop is checked here as well as by the crawl session: this walk clears a URL for the browser.
+        try:
+            await resolve_public_target(url)
+        except BlockedUrlError:
+            return url, PROBE_BLOCKED, None
+        except OSError:
+            return None
         for _ in range(MAX_PROBE_REDIRECTS + 1):
             try:
                 status, location, content_type = await self._probe_hop("HEAD", url)
+            except BlockedUrlError:
+                return url, PROBE_BLOCKED, None
             except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
                 status, location, content_type = None, None, None  # some servers mishandle HEAD; GET may still answer
             if status is None or status in HEAD_NOT_SUPPORTED:
                 try:
                     status, location, content_type = await self._probe_hop("GET", url)
+                except BlockedUrlError:
+                    return url, PROBE_BLOCKED, None
                 except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
                     return None
             if not (status in REDIRECT_STATUS_CODES and location):
                 return url, status, content_type
             url = urljoin(url, location)
+            try:
+                await resolve_public_target(url)
+            except BlockedUrlError:
+                return url, PROBE_BLOCKED, None
+            except OSError:
+                return None
             if self._outside_crawl(url) or not await self._robots_allows(url):
                 return url, 0, None  # not requested at all: outside the crawl, or robots.txt disallows it
         return url, PROBE_UNENDING, None
@@ -2004,10 +2064,13 @@ class WebConnector(BaseConnector):
                 reason = (
                     self._too_large_reason() if skip == "max_size_exceeded"
                     else TOO_MANY_REDIRECTS_REASON if skip == "too_many_redirects"
+                    else BLOCKED_URL_MESSAGE if is_blocked_url_response(result)
                     else None
                 )
+                # A refused address is filed under the page that led there, never as a record of its own.
+                failed_url = url if is_blocked_url_response(result) else result.final_url or url
                 self._record_final_failure(
-                    result.final_url or url, depth, referer, result.status_code, reason, queued_url=url,
+                    failed_url, depth, referer, result.status_code, reason, queued_url=url,
                 )
             return None
         elif not result.success:
@@ -3111,9 +3174,8 @@ class WebConnector(BaseConnector):
                 token = await self._get_storage_token()
                 download_endpoint = f"{storage_url}/api/v1/document/internal/{record.storage_document_id}/download"
 
-                owned_session = self.session is None
-                session = self.session or aiohttp.ClientSession()
-                try:
+                # Not the crawl session: that one refuses internal addresses, and storage is one.
+                async with aiohttp.ClientSession() as session:
                     async with session.get(
                         download_endpoint,
                         headers={"Authorization": f"Bearer {token}"},
@@ -3125,9 +3187,6 @@ class WebConnector(BaseConnector):
                                 signed_url = data.get("signedUrl")
                                 if signed_url:
                                     return signed_url
-                finally:
-                    if owned_session:
-                        await session.close()
             except Exception as e:
                 self.logger.warning("Failed to get storage signed URL for record %s: %s", record.id, e)
 

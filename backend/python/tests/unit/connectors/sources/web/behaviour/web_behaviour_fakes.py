@@ -42,6 +42,7 @@ STORAGE_HOST = "storage.test"
 HEAD_HANGS_UP = -1  # a ``head_status`` meaning the site drops HEAD requests without answering
 CONNECTOR_ID = "web-1"
 START_URL = "http://site.test/"
+FAKE_PUBLIC_ADDRESS = "93.184.216.34"  # what every fake .test host resolves to
 _real_sleep = asyncio.sleep
 
 
@@ -495,6 +496,7 @@ class FakeResponse:
         self.headers = headers
         self.content = body
         self.url = url
+        self.primary_ip = FAKE_PUBLIC_ADDRESS  # curl reports the address it connected to
 
     def iter_content(self, chunk_size: int = 65536) -> Iterator[bytes]:
         for start in range(0, len(self.content), chunk_size):
@@ -512,6 +514,10 @@ class FakeRequestsClient:
         self.site = site
         self.label = label
         self.cookies: dict[str, str] = {}
+        # The fetcher pins every request: curl_cffi through curl options, cloudscraper through its adapters.
+        self.curl_options: dict = {}
+        self.adapters: dict = {}
+        self.trust_env = True
 
     def __enter__(self) -> "FakeRequestsClient":
         return self

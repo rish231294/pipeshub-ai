@@ -14,6 +14,7 @@ import pytest
 from aiohttp import web
 from web_behaviour_fakes import (
     CONNECTOR_ID,
+    FAKE_PUBLIC_ADDRESS,
     START_URL,
     FakeCheckpointStore,
     FakeConfigService,
@@ -52,6 +53,15 @@ def no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket.socket, "connect", connect)
     monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    # The fake websites' .test hosts resolve to a public address, so the SSRF policy runs for real.
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host: object, *args: object, **kwargs: object) -> list:
+        if isinstance(host, str) and host.endswith(".test"):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (FAKE_PUBLIC_ADDRESS, 0))]
+        return real_getaddrinfo(host, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     # As if curl_cffi and cloudscraper were not installed: the aiohttp strategy serves every fetch.
     monkeypatch.setattr(fetch_strategy, "_CURL_PROFILES", [])
     monkeypatch.setitem(sys.modules, "cloudscraper", None)

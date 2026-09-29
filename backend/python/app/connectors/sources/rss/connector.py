@@ -26,11 +26,15 @@ from app.config.constants.arangodb import (
 )
 from app.connectors.core.constants import IconPaths
 from app.connectors.sources.web.fetch_strategy import (
+    BLOCKED_URL_MESSAGE,
+    BlockedUrlError,
     FetchResponse,
     fetch_url_with_fallback,
+    public_client_session,
+    resolve_public_target,
 )
 from app.config.constants.http_status_code import HttpStatusCode
-from app.connectors.core.base.connector.connector_service import BaseConnector
+from app.connectors.core.base.connector.connector_service import BaseConnector, ConnectorInitError
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
     DataSourceEntitiesProcessor,
 )
@@ -195,6 +199,15 @@ class RSSConnector(BaseConnector):
             if not self.feed_urls:
                 self.logger.error("❌ No valid feed URLs found after parsing")
                 raise ValueError("No valid feed URLs found")
+            for feed_url in self.feed_urls:
+                try:
+                    await resolve_public_target(feed_url)
+                except BlockedUrlError as e:
+                    self.logger.error("❌ Feed URL refused by the SSRF policy: %s", e)
+                    raise ConnectorInitError(f"{feed_url}: {BLOCKED_URL_MESSAGE}") from e
+                except OSError as e:
+                    # Every fetch checks again, so a host that doesn't resolve yet fails there, not here.
+                    self.logger.warning("⚠️ Feed URL host did not resolve: %s", e)
 
             self.max_articles_per_feed = int(
                 sync_config.get("max_articles_per_feed", 50)
@@ -209,7 +222,7 @@ class RSSConnector(BaseConnector):
 
             # Initialize aiohttp session with realistic browser headers
             timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
+            self.session = public_client_session(
                 timeout=timeout,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -227,6 +240,8 @@ class RSSConnector(BaseConnector):
             )
             return True
 
+        except ConnectorInitError:
+            raise
         except Exception as e:
             self.logger.error(
                 f"❌ Failed to initialize RSS connector: {e}", exc_info=True
@@ -297,20 +312,18 @@ class RSSConnector(BaseConnector):
             return False
 
         try:
-            # Test the first feed URL
-            async with self.session.get(
-                self.feed_urls[0], allow_redirects=True
-            ) as response:
-                if response.status < HttpStatusCode.BAD_REQUEST.value:
-                    self.logger.info(
-                        f"✅ Feed accessible: {self.feed_urls[0]} (status: {response.status})"
-                    )
-                    return True
-                else:
-                    self.logger.warning(
-                        f"⚠️ Feed returned status {response.status}: {self.feed_urls[0]}"
-                    )
-                    return False
+            result = await fetch_url_with_fallback(
+                url=self.feed_urls[0],
+                session=self.session,
+                logger=self.logger,
+                max_retries_per_strategy=1,  # keep it fast for a connection test
+            )
+            if result is not None and result.status_code < HttpStatusCode.BAD_REQUEST.value:
+                self.logger.info(f"✅ Feed accessible: {self.feed_urls[0]} (status: {result.status_code})")
+                return True
+            status = result.status_code if result else "no response"
+            self.logger.warning(f"⚠️ Feed returned status {status}: {self.feed_urls[0]}")
+            return False
         except Exception as e:
             self.logger.error(f"❌ Failed to access feed: {e}")
             return False

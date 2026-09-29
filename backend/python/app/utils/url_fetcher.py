@@ -118,6 +118,10 @@ _CLOUD_METADATA_ADDRESSES = frozenset(
 )
 
 
+# Ranges some Python releases don't flag: before 3.12.4 only parts of 192.0.0.0/24 were private.
+_ALWAYS_BLOCKED_NETWORKS = (ipaddress.IPv4Network("192.0.0.0/24"),)
+
+
 def _ip_is_blocked(ip: IPAddress, *, block_non_global: bool = True) -> bool:
     """True if the address must not be contacted by the generic HTTP fetcher.
 
@@ -133,7 +137,14 @@ def _ip_is_blocked(ip: IPAddress, *, block_non_global: bool = True) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_WELL_KNOWN_PREFIX:
         embedded_ipv4 = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
         return _ip_is_blocked(embedded_ipv4, block_non_global=block_non_global)
-    if ip in _CLOUD_METADATA_ADDRESSES:
+    # Python counts all of 6to4 as global, so 2002:7f00:1:: would pass as a public address.
+    if (
+        isinstance(ip, ipaddress.IPv6Address)
+        and ip.sixtofour is not None
+        and _ip_is_blocked(ip.sixtofour, block_non_global=block_non_global)
+    ):
+        return True
+    if ip in _CLOUD_METADATA_ADDRESSES or any(ip in network for network in _ALWAYS_BLOCKED_NETWORKS):
         return True
     return bool(
         ip.is_private
@@ -295,6 +306,23 @@ def _require_pinned_peer(peer_ip: str, pin: PublicTarget) -> None:
         raise FetchError(f"Connected to {peer_ip!r}, not the validated address for {pin.host!r}")
 
 
+def _pin_pool_key(
+    key: "tuple[_HostParams, _PoolKwargs]", pin: PublicTarget
+) -> "tuple[_HostParams, _PoolKwargs]":
+    """Point a requests adapter's connection pool at ``pin``'s address, keeping the URL's host
+    for SNI and certificate verification."""
+    host_params, pool_kwargs = key
+    if host_params["scheme"] == "https":
+        pool_kwargs["server_hostname"] = host_params["host"].rstrip(".")  # pyright: ignore[reportGeneralTypeIssues]
+    host_params["host"] = str(pin.pinned_address)
+    return host_params, pool_kwargs
+
+
+def _set_pinned_host_header(request: "PreparedRequest") -> None:
+    """urllib3 would otherwise send the pinned address as the Host header."""
+    request.headers["Host"] = urlsplit(request.url or "").netloc.rpartition("@")[2]
+
+
 def _pinned_requests_adapter(pin: PublicTarget) -> "HTTPAdapter":
     """A requests adapter that connects to ``pin``'s address, keeping the URL's host for the
     Host header, SNI and certificate verification."""
@@ -308,15 +336,11 @@ def _pinned_requests_adapter(pin: PublicTarget) -> "HTTPAdapter":
             verify: bool | str,
             cert: tuple[str, str] | str | None = None,
         ) -> "tuple[_HostParams, _PoolKwargs]":
-            host_params, pool_kwargs = super().build_connection_pool_key_attributes(request, verify, cert)
-            if host_params["scheme"] == "https":
-                pool_kwargs["server_hostname"] = host_params["host"].rstrip(".")  # pyright: ignore[reportGeneralTypeIssues]
-            host_params["host"] = str(pin.pinned_address)
-            return host_params, pool_kwargs
+            return _pin_pool_key(super().build_connection_pool_key_attributes(request, verify, cert), pin)
 
         @override
         def add_headers(self, request: "PreparedRequest", **kwargs: object) -> None:
-            request.headers["Host"] = urlsplit(request.url or "").netloc.rpartition("@")[2]
+            _set_pinned_host_header(request)
 
     return PinnedAddressAdapter()
 
