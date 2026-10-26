@@ -34,7 +34,10 @@ function principalMatchesType(
   label: string,
   read: (value: unknown) => { id: unknown; type: unknown },
   path: (string | number)[],
-) {
+): readonly [
+  (value: unknown, ctx: z.RefinementCtx) => void,
+  { when: () => boolean },
+] {
   return [
     (value: unknown, ctx: z.RefinementCtx) => {
       const { id, type } = read(value);
@@ -210,7 +213,10 @@ export const upsertProjectMembersSchema = z.object({
             ...principalMatchesType(
               'principal ID',
               (member) => {
-                const m = member as { principalId?: unknown; principalType?: unknown };
+                const m = member as {
+                  principalId?: unknown;
+                  principalType?: unknown;
+                };
                 return { id: m.principalId, type: m.principalType };
               },
               ['principalId'],

@@ -692,6 +692,11 @@ export class ProjectService {
    * Owner removes anyone; a member may remove only their own user row, which
    * is how they leave. `removed` is false when no row matched, so a client can
    * tell a repeated or mistaken removal from a real one.
+   *
+   * `beforeSave` runs once a row matched and before the removal is saved: the
+   * caller revokes the member's access to the files collection there, so a
+   * failed revoke leaves the membership in place to retry instead of a former
+   * member who can still read the project's files.
    */
   static async removeMember(
     orgId: string,
@@ -700,6 +705,7 @@ export class ProjectService {
     memberPrincipalId: string,
     principalType: 'user' | 'team' = 'user',
     callerTeamIds: string[] = [],
+    beforeSave?: (project: IProjectDocument) => Promise<void>,
   ): Promise<{ project: IProjectDocument; removed: boolean }> {
     const { role, project } = await this.assertAccess(
       orgId,
@@ -724,6 +730,7 @@ export class ProjectService {
     if (!removed) {
       return { project, removed };
     }
+    await beforeSave?.(project);
     return { project: await project.save(), removed };
   }
 

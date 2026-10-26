@@ -124,19 +124,29 @@ export function formatEpochArgument(name: string, value: unknown): string | null
   return new Date(ms).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
+// A list item that reads the same in a comma list: a person approving a write must see where each
+// item ends, so `['admins, owners']` and `['admins', 'owners']` cannot look alike.
+function plainListItem(item: unknown): boolean {
+  if (typeof item === 'number' || typeof item === 'boolean') return true;
+  return typeof item === 'string' && item !== '' && !item.includes(',') && item.trim() === item;
+}
+
 function argumentText(name: string, value: unknown): string {
   if (typeof value === 'string') return formatEpochArgument(name, value) ?? value;
   if (typeof value === 'number') return formatEpochArgument(name, value) ?? String(value);
-  if (Array.isArray(value) && value.every((item) => item === null || ['string', 'number', 'boolean'].includes(typeof item))) {
+  if (Array.isArray(value) && value.every(plainListItem)) {
     return value.map((item) => String(item)).join(', ');
+  }
+  if (Array.isArray(value) && value.every((item) => item === null || typeof item !== 'object')) {
+    return JSON.stringify(value);
   }
   if (value !== null && typeof value === 'object') return JSON.stringify(value, null, 2);
   return JSON.stringify(value) ?? String(value);
 }
 
 /** One line per argument, for a person to read before approving; long values are cut unless `full`.
- * Unix times under time-like names read as dates, lists of plain values as a comma list, and
- * nested values as indented JSON. */
+ * Unix times under time-like names read as dates, lists of plain values as a comma list (as JSON when
+ * an item holds a comma or would otherwise blur into its neighbour), and nested values as indented JSON. */
 export function approvalArgumentLines(
   args: Record<string, unknown>,
   { full = false }: { full?: boolean } = {}

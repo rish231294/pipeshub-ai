@@ -973,9 +973,18 @@ describe('project.controller', () => {
   })
 
   describe('removeProjectMember', () => {
+    /** Stubs the service, running the controller's pre-save hook the way the service does when a row matched. */
+    function stubRemoveMember(project: any, removed: boolean): sinon.SinonStub {
+      return sinon.stub(ProjectService, 'removeMember').callsFake(async (...args: any[]) => {
+        const beforeSave = args[6] as ((p: any) => Promise<void>) | undefined
+        if (removed) await beforeSave?.(project)
+        return { project, removed }
+      })
+    }
+
     it('removes a user member by default and returns the updated member list', async () => {
       const updated = makeProjectDoc({ members: [] })
-      const removeMemberStub = sinon.stub(ProjectService, 'removeMember').resolves({ project: updated, removed: true })
+      const removeMemberStub = stubRemoveMember(updated, true)
 
       stubNoTeamMemberships()
       const req = createMockRequest({ params: { projectId: PROJECT_ID, memberUserId: VALID_OID2 } })
@@ -991,9 +1000,7 @@ describe('project.controller', () => {
 
     it('skips the KB revoke and reports removed=false when nobody matched', async () => {
       stubNoTeamMemberships()
-      sinon
-        .stub(ProjectService, 'removeMember')
-        .resolves({ project: makeProjectDoc({ linkedKnowledgeBaseId: 'kb-1' }), removed: false })
+      stubRemoveMember(makeProjectDoc({ linkedKnowledgeBaseId: 'kb-1' }), false)
       const revokeStub = sinon.stub(ProjectKnowledgeBaseService, 'revokePrincipalPermission').resolves()
       const req = createMockRequest({ params: { projectId: PROJECT_ID, memberUserId: VALID_OID2 } })
       const res = createMockResponse()
@@ -1006,7 +1013,7 @@ describe('project.controller', () => {
 
     it('removes a team member when principalType=team is passed as a query param', async () => {
       const updated = makeProjectDoc({ members: [] })
-      const removeMemberStub = sinon.stub(ProjectService, 'removeMember').resolves({ project: updated, removed: true })
+      const removeMemberStub = stubRemoveMember(updated, true)
 
       stubNoTeamMemberships()
       const req = createMockRequest({
@@ -1023,7 +1030,7 @@ describe('project.controller', () => {
 
     it('revokes the KB permission when the project has a linked KB', async () => {
       const updated = makeProjectDoc({ members: [], linkedKnowledgeBaseId: 'kb-1' })
-      sinon.stub(ProjectService, 'removeMember').resolves({ project: updated, removed: true })
+      stubRemoveMember(updated, true)
       const revokeStub = sinon.stub(ProjectKnowledgeBaseService, 'revokePrincipalPermission').resolves()
 
       stubNoTeamMemberships()
@@ -1042,19 +1049,18 @@ describe('project.controller', () => {
       expect(res.status.calledWith(200)).to.be.true
     })
 
-    it('skips the KB revoke call when the project has no linked KB', async () => {
-      const updated = makeProjectDoc({ members: [] })
-      sinon.stub(ProjectService, 'removeMember').resolves({ project: updated, removed: true })
-      const revokeStub = sinon.stub(ProjectKnowledgeBaseService, 'revokePrincipalPermission').resolves()
+    it('answers 200 without a KB call when the project has no linked KB', async () => {
+      stubRemoveMember(makeProjectDoc({ members: [] }), true)
 
-      stubNoTeamMemberships()
+      const aiStub = stubNoTeamMemberships()
       const req = createMockRequest({ params: { projectId: PROJECT_ID, memberUserId: VALID_OID2 } })
       const res = createMockResponse()
-      const next = createMockNext()
 
-      await removeProjectMember(createMockAppConfig())(req, res, next)
+      await removeProjectMember(createMockAppConfig())(req, res, createMockNext())
 
-      expect(revokeStub.called).to.be.false
+      expect(res.status.calledWith(200)).to.be.true
+      // Only the team lookup reached the connector service.
+      expect(aiStub.callCount).to.equal(1)
     })
 
     it('forwards ForbiddenError (non-owner) to next', async () => {
@@ -1071,8 +1077,8 @@ describe('project.controller', () => {
       expect(next.calledWith(error)).to.be.true
     })
 
-    it('reports a failed KB revoke instead of answering 200 while the member still holds KB access', async () => {
-      sinon.stub(ProjectService, 'removeMember').resolves({ project: makeProjectDoc({ linkedKnowledgeBaseId: 'kb-1' }), removed: true })
+    it('revokes before the removal is saved, so a failed revoke leaves the member in place', async () => {
+      stubRemoveMember(makeProjectDoc({ linkedKnowledgeBaseId: 'kb-1' }), true)
       const error = new Error('KB service unavailable')
       sinon.stub(ProjectKnowledgeBaseService, 'revokePrincipalPermission').rejects(error)
 

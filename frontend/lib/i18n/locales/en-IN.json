@@ -1322,7 +1322,8 @@
         "description": "You'll lose access to this project and its files. Your chats stay yours. The owner can add you back.",
         "leaving": "Leaving…",
         "left": "You left the project",
-        "failed": "Couldn't leave the project"
+        "failed": "Couldn't leave the project",
+        "inherited": "You can't leave this project: your access comes from your organisation or a team. Ask the owner to change who it's shared with."
       },
       "archiveSuccess": "Project archived",
       "archivedNoNewChats": "This project is archived, so new chats can't be started in it.",

@@ -376,10 +376,19 @@ export function ProjectList() {
   };
 
   const confirmLeave = async () => {
-    if (!pendingLeave || !myUserId) return;
+    if (!pendingLeave) return;
+    if (!myUserId) {
+      toast.error(t('chat.projects.leaveDialog.failed'));
+      return;
+    }
     setBusyId(pendingLeave._id);
     try {
-      await ProjectApi.removeMember(pendingLeave._id, myUserId);
+      const { removed } = await ProjectApi.removeMember(pendingLeave._id, myUserId);
+      if (!removed) {
+        setPendingLeave(null);
+        toast.error(t('chat.projects.leaveDialog.inherited'));
+        return;
+      }
       dropFromView(pendingLeave._id);
       removeProjectFromList(pendingLeave._id);
       setPendingLeave(null);

@@ -1280,7 +1280,8 @@
         "description": "Sie verlieren den Zugriff auf dieses Projekt und seine Dateien. Ihre Chats bleiben Ihnen erhalten. Der Eigentümer kann Sie wieder hinzufügen.",
         "leaving": "Wird verlassen…",
         "left": "Sie haben das Projekt verlassen",
-        "failed": "Projekt konnte nicht verlassen werden"
+        "failed": "Projekt konnte nicht verlassen werden",
+        "inherited": "Sie können dieses Projekt nicht verlassen: Ihr Zugriff kommt über Ihre Organisation oder ein Team. Bitten Sie den Eigentümer, die Freigabe zu ändern."
       },
       "archiveSuccess": "Projekt archiviert",
       "archivedNoNewChats": "Dieses Projekt ist archiviert, daher können darin keine neuen Chats gestartet werden.",

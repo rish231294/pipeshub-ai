@@ -478,16 +478,15 @@ export const removeProjectMember =
         memberUserId,
         effectivePrincipalType,
         callerTeamIds,
+        (matched) =>
+          ProjectKnowledgeBaseService.revokePrincipalPermission(
+            appConfig,
+            req.headers as Record<string, string>,
+            matched,
+            memberUserId,
+            effectivePrincipalType,
+          ),
       );
-      if (removed && project.linkedKnowledgeBaseId) {
-        await ProjectKnowledgeBaseService.revokePrincipalPermission(
-          appConfig,
-          req.headers as Record<string, string>,
-          project,
-          memberUserId,
-          effectivePrincipalType,
-        );
-      }
 
       res.status(200).json({
         members: await ProjectService.withMemberNames(orgId, project.members),

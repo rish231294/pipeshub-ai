@@ -1301,7 +1301,8 @@
         "description": "Perderás el acceso a este proyecto y sus archivos. Tus chats siguen siendo tuyos. El propietario puede volver a añadirte.",
         "leaving": "Saliendo…",
         "left": "Saliste del proyecto",
-        "failed": "No se pudo salir del proyecto"
+        "failed": "No se pudo salir del proyecto",
+        "inherited": "No puedes salir de este proyecto: tu acceso procede de tu organización o de un equipo. Pide al propietario que cambie con quién lo comparte."
       },
       "archiveSuccess": "Proyecto archivado",
       "archivedNoNewChats": "Este proyecto está archivado, así que no se pueden iniciar chats nuevos en él.",

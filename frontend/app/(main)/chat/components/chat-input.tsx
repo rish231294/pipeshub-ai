@@ -222,7 +222,7 @@ function SpeechInputButton({
   return (
     <Tooltip content={tooltip} side="top">
       <IconButton
-        className="touch-hit"
+        className="touch-size"
         variant={isListening ? 'soft' : 'ghost'}
         color={isListening ? 'red' : 'gray'}
         size="2"
@@ -2416,7 +2416,7 @@ export function ChatInput({
               side="top"
             >
               <IconButton
-                className="touch-hit"
+                className="touch-size"
                 variant={isSearchMode ? 'soft' : 'ghost'}
                 color="gray"
                 size="2"
@@ -2459,7 +2459,7 @@ export function ChatInput({
                 size="2"
                 disabled={isRegenerateMode}
                 onClick={() => setIsMobilePlusMenuOpen(true)}
-                className="touch-hit"
+                className="touch-size"
                 aria-label={
                   showPlusMenuFilterBadge
                     ? t('chat.plusMenu.ariaLabelFiltersApplied', {
@@ -2701,7 +2701,7 @@ export function ChatInput({
                   side="top"
                 >
                     <IconButton
-                      className="touch-hit"
+                      className="touch-size"
                       variant="ghost"
                       color="gray"
                       size="2"
@@ -2754,7 +2754,7 @@ export function ChatInput({
                     side="top"
                   >
                     <IconButton
-                      className="touch-hit"
+                      className="touch-size"
                       variant="ghost"
                       color="gray"
                       size="2"
@@ -2808,7 +2808,7 @@ export function ChatInput({
                   >
                   <button
                     type="button"
-                    className="touch-hit"
+                    className="touch-size"
                     aria-label={t('chat.aiModelsTooltip')}
                     data-testid="chat-model-selector"
                     onClick={() => {
@@ -2888,7 +2888,7 @@ export function ChatInput({
           {/* Send / Stop button */}
           {isStreaming ? (
             <IconButton
-              className="touch-hit"
+              className="touch-size"
               variant="solid"
               size="2"
               onClick={handleStopStream}
@@ -2908,7 +2908,7 @@ export function ChatInput({
             </IconButton>
           ) : (
             <IconButton
-              className="touch-hit"
+              className="touch-size"
               variant="solid"
               size="2"
               onClick={(event) => {

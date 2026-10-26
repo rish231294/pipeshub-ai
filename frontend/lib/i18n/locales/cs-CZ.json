@@ -1466,7 +1466,8 @@
         "description": "Ztratíte přístup k tomuto projektu a jeho souborům. Vaše chaty vám zůstanou. Vlastník vás může přidat zpět.",
         "leaving": "Opouštění…",
         "left": "Opustili jste projekt",
-        "failed": "Projekt se nepodařilo opustit"
+        "failed": "Projekt se nepodařilo opustit",
+        "inherited": "Tento projekt nemůžete opustit: přístup máte přes svou organizaci nebo tým. Požádejte vlastníka, aby změnil, s kým je sdílený."
       },
       "archiveSuccess": "Projekt archivován",
       "archivedNoNewChats": "Tento projekt je archivovaný, nelze v něm zahájit nové chaty.",

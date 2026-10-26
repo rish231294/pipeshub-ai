@@ -35,6 +35,7 @@ import { ChatDefaultsCard } from './chat-defaults-card';
 import { AboutCard } from './about-card';
 import { ProjectSharingSettings } from './project-sharing-settings';
 import { createSerialSaver } from '../utils/serial-saver';
+import { hasDirectMembership } from '../utils/membership';
 
 interface ProjectWorkspaceRedesignedProps {
   projectId: string;
@@ -165,7 +166,9 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
 
   const canEdit = project?.role === 'owner' || project?.role === 'editor';
   const isOwner = project?.role === 'owner';
-  const isMember = project?.role === 'editor' || project?.role === 'viewer';
+  const isMember =
+    (project?.role === 'editor' || project?.role === 'viewer') &&
+    hasDirectMembership(project?.members, profile?.userId);
   const isArchived = Boolean(project?.isArchived);
 
   /** A PATCH response, minus a tool list that newer local toggles have already moved past. */
@@ -284,10 +287,18 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
 
   const handleConfirmLeave = useCallback(async () => {
     const myUserId = profile?.userId;
-    if (!myUserId) return;
+    if (!myUserId) {
+      toast.error(t('chat.projects.leaveDialog.failed'));
+      return;
+    }
     setIsLeaving(true);
     try {
-      await ProjectApi.removeMember(projectId, myUserId);
+      const { removed } = await ProjectApi.removeMember(projectId, myUserId);
+      if (!removed) {
+        setLeaveOpen(false);
+        toast.error(t('chat.projects.leaveDialog.inherited'));
+        return;
+      }
       removeProjectFromList(projectId);
       setLeaveOpen(false);
       toast.success(t('chat.projects.leaveDialog.left'));

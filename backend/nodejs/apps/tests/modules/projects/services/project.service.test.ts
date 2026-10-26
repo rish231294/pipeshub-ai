@@ -1065,6 +1065,43 @@ describe('ProjectService', () => {
       expect(updated.members).to.have.lengthOf(0);
     });
 
+    it('runs beforeSave before saving, and saves nothing when it fails', async () => {
+      const project = makeProjectDoc({
+        members: [
+          { principalType: 'user', principalId: new mongoose.Types.ObjectId(MEMBER_ID), role: 'viewer' },
+        ],
+      });
+      sinon.stub(Project, 'findOne').resolves(project);
+      const beforeSave = sinon.stub().rejects(new Error('KB service unavailable'));
+
+      try {
+        await ProjectService.removeMember(
+          ORG_ID,
+          OWNER_ID,
+          project._id.toString(),
+          MEMBER_ID,
+          'user',
+          [],
+          beforeSave,
+        );
+        expect.fail('Expected rejection');
+      } catch (error: any) {
+        expect(error.message).to.equal('KB service unavailable');
+      }
+      expect(beforeSave.calledOnce).to.equal(true);
+      expect(project.save.called).to.equal(false);
+    });
+
+    it('skips beforeSave when nobody matched', async () => {
+      const project = makeProjectDoc();
+      sinon.stub(Project, 'findOne').resolves(project);
+      const beforeSave = sinon.stub().resolves();
+
+      await ProjectService.removeMember(ORG_ID, OWNER_ID, project._id.toString(), MEMBER_ID, 'user', [], beforeSave);
+
+      expect(beforeSave.called).to.equal(false);
+    });
+
     it('reports removed=false without saving when nobody matched', async () => {
       const project = makeProjectDoc();
       sinon.stub(Project, 'findOne').resolves(project);

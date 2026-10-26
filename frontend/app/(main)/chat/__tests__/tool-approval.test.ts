@@ -114,6 +114,13 @@ describe('approvalArgumentLines', () => {
     ]);
   });
 
+  it('keeps list items apart when one holds a comma or is blank', () => {
+    expect(approvalArgumentLines({ to: ['admins, owners'] })[0]!.value).toBe('["admins, owners"]');
+    expect(approvalArgumentLines({ to: ['admins', 'owners'] })[0]!.value).toBe('admins, owners');
+    expect(approvalArgumentLines({ to: ['a', ''] })[0]!.value).toBe('["a",""]');
+    expect(approvalArgumentLines({ to: ['a', null] })[0]!.value).toBe('["a",null]');
+  });
+
   it('indents nested values as JSON', () => {
     const [line] = approvalArgumentLines({ columns: [{ name: 'Status', type: 'select' }] });
     expect(line!.value).toBe(JSON.stringify([{ name: 'Status', type: 'select' }], null, 2));

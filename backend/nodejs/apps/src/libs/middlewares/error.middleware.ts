@@ -5,6 +5,7 @@ import {
   BadRequestError,
   HttpError,
   LargePayloadError,
+  UnsupportedMediaTypeError,
 } from '../errors/http.errors';
 import { isClientSafeError, isReaderWritten } from '../errors/reader-friendly';
 import {
@@ -47,9 +48,12 @@ function bodyParserError(error: Error): HttpError | null {
     case 'entity.too.large':
       return new LargePayloadError('The request body is too large.');
     case 'encoding.unsupported':
+      return new UnsupportedMediaTypeError(
+        'The request body uses an unsupported content encoding.',
+      );
     case 'charset.unsupported':
-      return new BadRequestError(
-        'The request body uses an unsupported encoding.',
+      return new UnsupportedMediaTypeError(
+        'The request body uses an unsupported character set.',
       );
     default:
       return null;

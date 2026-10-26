@@ -178,6 +178,20 @@ describe('ErrorMiddleware', () => {
       expect(res.status.calledWith(413)).to.be.true
     })
 
+    for (const [type, message] of [
+      ['encoding.unsupported', 'The request body uses an unsupported content encoding.'],
+      ['charset.unsupported', 'The request body uses an unsupported character set.'],
+    ]) {
+      it(`answers ${type} with 415 and a fixed message`, () => {
+        const res = createMockResponse()
+
+        handler(parserError(type, 415), createMockRequest(), res, createMockNext())
+
+        expect(res.status.calledWith(415)).to.be.true
+        expect(res.json.firstCall.args[0].error.message).to.equal(message)
+      })
+    }
+
     it('keeps an unexposed error with a parser-like type on the 500 path', () => {
       const error = Object.assign(new Error('boom'), { type: 'entity.parse.failed' })
       const res = createMockResponse()

@@ -1353,15 +1353,14 @@ export const addMessageStream =
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
     }
-    if (
-      !(await ownsConversationBeforeStream({
-        _id: conversationId,
-        orgId,
-        userId,
-        isDeleted: false,
-        ...EXCLUDE_AGENT,
-      }, next))
-    ) {
+    const ownedConversation = {
+      _id: conversationId,
+      orgId,
+      userId,
+      isDeleted: false,
+      ...EXCLUDE_AGENT,
+    };
+    if (!(await ownsConversationBeforeStream(ownedConversation, next))) {
       return;
     }
 
@@ -7481,16 +7480,15 @@ export const addMessageStreamToAgentConversation =
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
     }
-    if (
-      !(await ownsConversationBeforeStream({
-        _id: conversationId,
-        agentKey,
-        orgId,
-        userId,
-        isDeleted: false,
-        ...ONLY_AGENT,
-      }, next))
-    ) {
+    const ownedConversation = {
+      _id: conversationId,
+      agentKey,
+      orgId,
+      userId,
+      isDeleted: false,
+      ...ONLY_AGENT,
+    };
+    if (!(await ownsConversationBeforeStream(ownedConversation, next))) {
       return;
     }
 

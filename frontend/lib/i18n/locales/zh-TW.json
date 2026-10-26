@@ -1368,10 +1368,11 @@
       "leaveProject": "退出專案",
       "leaveDialog": {
         "title": "退出 {{name}}？",
-        "description": "您將失去此專案及其檔案的存取權。您的對話仍歸您所有。擁有者可以重新加入您。",
+        "description": "您將失去此專案及其檔案的存取權。您的對話仍歸您所有。擁有者可以重新將您加入。",
         "leaving": "正在退出…",
         "left": "您已退出專案",
-        "failed": "無法退出專案"
+        "failed": "無法退出專案",
+        "inherited": "您無法退出此專案：您的存取權來自您的組織或某個團隊。請擁有者變更共用對象。"
       },
       "archiveSuccess": "專案已封存",
       "archivedNoNewChats": "此專案已封存，無法在其中開始新對話。",

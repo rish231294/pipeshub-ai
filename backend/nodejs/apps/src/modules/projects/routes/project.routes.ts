@@ -92,10 +92,11 @@ export function createProjectsRouter(container: Container): Router {
     unarchiveProject(appConfig),
   );
 
+  // A pin changes only the caller's own list, so read access is enough.
   router.post(
     '/:projectId/pin',
     authMiddleware.authenticate,
-    requireScopes(OAuthScopeNames.PROJECT_WRITE),
+    requireScopes(OAuthScopeNames.PROJECT_READ, OAuthScopeNames.PROJECT_WRITE),
     ValidationMiddleware.validate(projectIdParamsSchema),
     pinProject(appConfig),
   );
@@ -103,7 +104,7 @@ export function createProjectsRouter(container: Container): Router {
   router.post(
     '/:projectId/unpin',
     authMiddleware.authenticate,
-    requireScopes(OAuthScopeNames.PROJECT_WRITE),
+    requireScopes(OAuthScopeNames.PROJECT_READ, OAuthScopeNames.PROJECT_WRITE),
     ValidationMiddleware.validate(projectIdParamsSchema),
     unpinProject(appConfig),
   );
