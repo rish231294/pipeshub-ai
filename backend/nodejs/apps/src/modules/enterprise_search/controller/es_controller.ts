@@ -1353,7 +1353,7 @@ export const addMessageStream =
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
     }
-    const ownedConversation = {
+    const ownedConversation: Record<string, unknown> = {
       _id: conversationId,
       orgId,
       userId,
@@ -7480,7 +7480,7 @@ export const addMessageStreamToAgentConversation =
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
     }
-    const ownedConversation = {
+    const ownedConversation: Record<string, unknown> = {
       _id: conversationId,
       agentKey,
       orgId,
