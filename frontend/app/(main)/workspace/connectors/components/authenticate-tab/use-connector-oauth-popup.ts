@@ -288,6 +288,20 @@ export function useConnectorOAuthPopup(options?: ConnectorOAuthPopupOptions) {
     oauthVerifyAbortRef.current = false;
     oauthPopupRef.current = null;
 
+    const resetAuthStateFromConfig = () => {
+      const cfg = useConnectorsStore.getState().connectorConfig;
+      setAuthState(isConnectorConfigAuthenticated(cfg) ? 'success' : 'empty');
+    };
+
+    // Opened before anything is awaited: iOS Safari and other strict browsers block a window
+    // opened after an async gap, so it starts blank and navigates once the address arrives.
+    const popup = isElectron() ? null : openCenteredOAuthWindow('about:blank', `connector-oauth-${id}`);
+    if (!isElectron() && (!popup || popup.closed)) {
+      resetAuthStateFromConfig();
+      addToast({ variant: 'error', title: t('agentBuilder.oauthPopupBlocked') });
+      return;
+    }
+
     setAuthState('authenticating');
     setIsAuthenticating(true);
 
@@ -323,16 +337,15 @@ export function useConnectorOAuthPopup(options?: ConnectorOAuthPopupOptions) {
         return;
       }
 
-      const popup = openCenteredOAuthWindow(authorizationUrl, `connector-oauth-${id}`);
-      if (!popup || popup.closed) {
+      if (popup.closed) {
+        // Closed while the address was on its way: the person changed their mind.
         setIsAuthenticating(false);
-        const cfg = useConnectorsStore.getState().connectorConfig;
-        setAuthState(isConnectorConfigAuthenticated(cfg) ? 'success' : 'empty');
-        addToast({ variant: 'error', title: t('agentBuilder.oauthPopupBlocked') });
+        resetAuthStateFromConfig();
         return;
       }
 
       oauthPopupRef.current = popup;
+      popup.location.href = authorizationUrl;
       popup.focus();
 
       // Poll for popup closure — same guard as toolset (`statusChecked` / `oauthCompletionHandledRef`)
@@ -354,6 +367,7 @@ export function useConnectorOAuthPopup(options?: ConnectorOAuthPopupOptions) {
     } catch {
       clearOAuthPoll();
       oauthPopupRef.current = null;
+      if (popup && !popup.closed) popup.close();
       setIsAuthenticating(false);
       setAuthState('failed');
     }
