@@ -147,7 +147,10 @@ import { TokenScopes } from '../../../libs/enums/token-scopes.enum';
 import {
   applyProjectScope,
   loadProjectForSession,
+  accessibleProjectIdsFor,
+  projectCallerFromRequest,
   resolveProjectLink,
+  ResolvedProjectLink,
 } from '../utils/project-context';
 import {
   buildAiRequestLogMetadata,
@@ -166,6 +169,7 @@ import {
 } from '../utils/fork-conversation';
 import { ArtifactCopier, ArtifactCopyOutcome } from '../utils/fork-artifacts';
 import { executeConnectorCommand } from '../../tokens_manager/utils/connector.utils';
+import { resolveCallerTeamIds } from '../../projects/utils/team-membership';
 import { ProjectService } from '../../projects/services/project.service';
 import {
   assignAgentCapabilitiesToPayload,
@@ -598,7 +602,11 @@ export const uploadChatAttachmentsInternal =
 
 export const streamChat =
   (appConfig: AppConfig) =>
-  async (req: AuthenticatedUserRequest, res: Response) => {
+  async (
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next?: NextFunction,
+  ): Promise<void> => {
     const requestId = req.context?.requestId;
     const startTime = Date.now();
     const timer = new StageTimer();
@@ -618,6 +626,22 @@ export const streamChat =
       throw new BadRequestError('Query is required');
     }
 
+    let projectLink: ResolvedProjectLink;
+    try {
+      // Before the stream opens, so a project the caller cannot use is refused
+      // with its own status rather than a 200 stream that ends in RUN_ERROR.
+      projectLink = await resolveProjectLink(
+        String(orgId),
+        String(userId),
+        req.body as Record<string, unknown>,
+        projectCallerFromRequest(req, appConfig),
+      );
+    } catch (error) {
+      if (!next) throw error;
+      next(error);
+      return;
+    }
+
     try {
       // Set SSE headers
       res.writeHead(200, {
@@ -635,12 +659,6 @@ export const streamChat =
         req.body.appliedFilters,
         req.body.chatMode,
         req.body.attachments,
-      );
-
-      const projectLink = await resolveProjectLink(
-        orgId as unknown as string,
-        userId as unknown as string,
-        req.body as Record<string, unknown>,
       );
 
       const userConversationData: Partial<IChatSession> = {
@@ -1283,6 +1301,32 @@ const refuseBeforeStream = (
   next(error);
 };
 
+/**
+ * Whether the caller owns the conversation they are posting to, checked
+ * before the stream opens: a project member posting into someone else's
+ * project-shared chat used to get a `connected` event carrying that chat's
+ * id, then a RUN_ERROR. A refusal or a failed lookup goes to `next` (or is
+ * thrown, for the internal wrappers that pass none) and this returns false.
+ */
+const ownsConversationBeforeStream = async (
+  filter: Record<string, unknown>,
+  next: NextFunction | undefined,
+): Promise<boolean> => {
+  let error: unknown;
+  try {
+    const found = mongoose.Types.ObjectId.isValid(String(filter._id))
+      ? await ChatSession.findOne(filter, { _id: 1 })
+      : null;
+    if (found !== null) return true;
+    error = new NotFoundError('Conversation not found');
+  } catch (lookupError) {
+    error = lookupError;
+  }
+  if (!next) throw error;
+  next(error);
+  return false;
+};
+
 export const addMessageStream =
   (appConfig: AppConfig) =>
   async (
@@ -1308,6 +1352,17 @@ export const addMessageStream =
 
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
+    }
+    if (
+      !(await ownsConversationBeforeStream({
+        _id: conversationId,
+        orgId,
+        userId,
+        isDeleted: false,
+        ...EXCLUDE_AGENT,
+      }, next))
+    ) {
+      return;
     }
 
     // Helper function that contains the common conversation operations
@@ -1452,6 +1507,10 @@ export const addMessageStream =
         confirmedConversation.orgId.toString(),
         confirmedConversation.userId.toString(),
         confirmedConversation.projectId,
+        {
+          caller: projectCallerFromRequest(req, appConfig),
+          conversationId: confirmedConversation._id,
+        },
       );
       const aiRequest = buildAiChatRequest({ kind: 'assistant' }, req.body, {
         conversationId,
@@ -2092,6 +2151,8 @@ export const getAllConversations = async (
   req: AuthenticatedUserRequest,
   res: Response,
   next: NextFunction,
+  // Passed by the router so project-shared chats reach team members; absent in direct calls.
+  appConfig?: AppConfig,
 ) => {
   const requestId = req.context?.requestId;
   const startTime = Date.now();
@@ -2131,7 +2192,11 @@ export const getAllConversations = async (
       );
     }
     const accessibleProjectIds = !isOwned
-      ? await ProjectService.getAccessibleProjectIds(orgId, userId)
+      ? await accessibleProjectIdsFor(
+          String(orgId),
+          String(userId),
+          appConfig ? projectCallerFromRequest(req, appConfig) : undefined,
+        )
       : undefined;
     const filter = {
       ...buildFilter(
@@ -2358,9 +2423,10 @@ export const getConversationById =
           escapedSearch,
         );
       }
-      const accessibleProjectIds = await ProjectService.getAccessibleProjectIds(
-        orgId,
-        userId,
+      const accessibleProjectIds = await accessibleProjectIdsFor(
+        String(orgId),
+        String(userId),
+        projectCallerFromRequest(req, appConfig),
       );
       const baseFilter = buildFilter(
         req,
@@ -3182,6 +3248,8 @@ export const setConversationProject = async (
   req: AuthenticatedUserRequest,
   res: Response,
   next: NextFunction,
+  // Passed by the router so a team member can move a chat into the project.
+  appConfig?: AppConfig,
 ) => {
   const requestId = req.context?.requestId;
   try {
@@ -3215,7 +3283,9 @@ export const setConversationProject = async (
         userId,
         projectId,
         'viewer',
+        appConfig ? await resolveCallerTeamIds(req, appConfig) : [],
       );
+      ProjectService.assertNotArchived(project);
       const projectVisibility =
         conversation.projectVisibility === 'project'
           ? 'project'
@@ -3913,6 +3983,10 @@ async function regenerateAnswersInternal(
       existingConversation.orgId.toString(),
       existingConversation.userId.toString(),
       existingConversation.projectId,
+      {
+        caller: projectCallerFromRequest(req, appConfig),
+        conversationId: existingConversation._id,
+      },
     );
     applyProjectScope(aiPayload, regenProject);
     if (existingConversation.projectId) {
@@ -6660,7 +6734,11 @@ export const deleteAgent =
 
   export const streamAgentConversation =
   (appConfig: AppConfig) =>
-  async (req: AuthenticatedUserRequest | AuthenticatedServiceRequest, res: Response) => {
+  async (
+    req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+    res: Response,
+    next?: NextFunction,
+  ): Promise<void> => {
     const requestId = req.context?.requestId;
     const startTime = Date.now();
     let userId: Types.ObjectId | undefined;
@@ -6696,6 +6774,21 @@ export const deleteAgent =
       throw new BadRequestError('Query is required');
     }
 
+    let projectLink: ResolvedProjectLink;
+    try {
+      // Before the stream opens; see streamChat.
+      projectLink = await resolveProjectLink(
+        orgId as unknown as string,
+        userId as unknown as string,
+        req.body as Record<string, unknown>,
+        projectCallerFromRequest(req, appConfig),
+      );
+    } catch (error) {
+      if (!next) throw error;
+      next(error);
+      return;
+    }
+
     try {
       // Set SSE headers
       res.writeHead(200, {
@@ -6713,12 +6806,6 @@ export const deleteAgent =
         req.body.appliedFilters,
         req.body.chatMode,
         req.body.attachments,
-      );
-
-      const projectLink = await resolveProjectLink(
-        orgId as unknown as string,
-        userId as unknown as string,
-        req.body as Record<string, unknown>,
       );
 
       const userConversationData: Partial<IChatSession> = {
@@ -7394,6 +7481,18 @@ export const addMessageStreamToAgentConversation =
     if (!req.body.query) {
       return refuseBeforeStream(next, 'Query is required');
     }
+    if (
+      !(await ownsConversationBeforeStream({
+        _id: conversationId,
+        agentKey,
+        orgId,
+        userId,
+        isDeleted: false,
+        ...ONLY_AGENT,
+      }, next))
+    ) {
+      return;
+    }
 
     // Helper function that contains the common conversation operations
     async function performAddMessageStream(
@@ -7540,6 +7639,10 @@ export const addMessageStreamToAgentConversation =
         confirmedConversation.orgId.toString(),
         confirmedConversation.userId.toString(),
         confirmedConversation.projectId,
+        {
+          caller: projectCallerFromRequest(req, appConfig),
+          conversationId: confirmedConversation._id,
+        },
       );
       const aiRequest = buildAiChatRequest(
         { kind: 'agent', agentKey: agentKey as string },
@@ -8267,6 +8370,8 @@ export const getAllAgentConversations = async (
   req: AuthenticatedUserRequest,
   res: Response,
   next: NextFunction,
+  // Passed by the router so project-shared chats reach team members; absent in direct calls.
+  appConfig?: AppConfig,
 ) => {
   const requestId = req.context?.requestId;
   const startTime = Date.now();
@@ -8297,9 +8402,10 @@ export const getAllAgentConversations = async (
         escapedSearch,
       );
     }
-    const accessibleProjectIds = await ProjectService.getAccessibleProjectIds(
-      orgId,
-      userId,
+    const accessibleProjectIds = await accessibleProjectIdsFor(
+      String(orgId),
+      String(userId),
+      appConfig ? projectCallerFromRequest(req, appConfig) : undefined,
     );
     const filter = {
       ...buildAgentConversationFilter(
@@ -8436,9 +8542,10 @@ const getAgentConversationByIdOf = async (
         escapedSearch,
       );
     }
-    const accessibleProjectIds = await ProjectService.getAccessibleProjectIds(
-      orgId,
-      userId,
+    const accessibleProjectIds = await accessibleProjectIdsFor(
+      String(orgId),
+      String(userId),
+      projectCallerFromRequest(req, appConfig),
     );
     const baseFilter = buildAgentConversationFilter(
       req,

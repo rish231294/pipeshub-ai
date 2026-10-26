@@ -149,6 +149,45 @@ describe('ErrorMiddleware', () => {
   // -----------------------------------------------------------------------
   // BaseError handling
   // -----------------------------------------------------------------------
+  describe('body-parser rejections', () => {
+    function parserError(type: string, status: number): Error {
+      return Object.assign(new SyntaxError('Unexpected token } in JSON at position 12'), {
+        type,
+        status,
+        statusCode: status,
+        expose: true,
+      })
+    }
+
+    it('answers a malformed JSON body with 400 and does not echo the body', () => {
+      const res = createMockResponse()
+
+      handler(parserError('entity.parse.failed', 400), createMockRequest(), res, createMockNext())
+
+      expect(res.status.calledWith(400)).to.be.true
+      const response = res.json.firstCall.args[0]
+      expect(response.error.code).to.equal('HTTP_BAD_REQUEST')
+      expect(response.error.message).to.equal('The request body is not valid JSON.')
+    })
+
+    it('answers an oversized body with 413', () => {
+      const res = createMockResponse()
+
+      handler(parserError('entity.too.large', 413), createMockRequest(), res, createMockNext())
+
+      expect(res.status.calledWith(413)).to.be.true
+    })
+
+    it('keeps an unexposed error with a parser-like type on the 500 path', () => {
+      const error = Object.assign(new Error('boom'), { type: 'entity.parse.failed' })
+      const res = createMockResponse()
+
+      handler(error, createMockRequest(), res, createMockNext())
+
+      expect(res.status.calledWith(500)).to.be.true
+    })
+  })
+
   describe('BaseError handling', () => {
     it('should respond with correct status code for BadRequestError', () => {
       const error = new BadRequestError('Invalid input')

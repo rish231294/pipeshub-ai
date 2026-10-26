@@ -140,10 +140,13 @@ export function createProjectsRouter(container: Container): Router {
     removeProjectMember(appConfig),
   );
 
+  // The files collection is a Collection like any other, so an OAuth token
+  // needs kb:write as well; asked for here so the refusal names both scopes.
   router.post(
     '/:projectId/knowledge-base',
     authMiddleware.authenticate,
     requireScopes(OAuthScopeNames.PROJECT_WRITE),
+    requireScopes(OAuthScopeNames.KB_WRITE),
     ValidationMiddleware.validate(projectIdParamsSchema),
     ensureProjectKnowledgeBase(appConfig),
   );
