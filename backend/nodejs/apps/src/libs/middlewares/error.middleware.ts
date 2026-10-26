@@ -45,8 +45,14 @@ function bodyParserError(error: Error): HttpError | null {
   switch (type) {
     case 'entity.parse.failed':
       return new BadRequestError('The request body is not valid JSON.');
+    case 'request.size.invalid':
+      return new BadRequestError(
+        'The request body does not match its Content-Length.',
+      );
     case 'entity.too.large':
       return new LargePayloadError('The request body is too large.');
+    case 'parameters.too.many':
+      return new LargePayloadError('The form body has too many fields.');
     case 'encoding.unsupported':
       return new UnsupportedMediaTypeError(
         'The request body uses an unsupported content encoding.',

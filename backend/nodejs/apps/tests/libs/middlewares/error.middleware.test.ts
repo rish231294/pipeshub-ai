@@ -170,6 +170,25 @@ describe('ErrorMiddleware', () => {
       expect(response.error.message).to.equal('The request body is not valid JSON.')
     })
 
+    it('answers a body that does not match its Content-Length with 400', () => {
+      const res = createMockResponse()
+
+      handler(parserError('request.size.invalid', 400), createMockRequest(), res, createMockNext())
+
+      expect(res.status.calledWith(400)).to.be.true
+      const response = res.json.firstCall.args[0]
+      expect(response.error.code).to.equal('HTTP_BAD_REQUEST')
+      expect(response.error.message).to.equal('The request body does not match its Content-Length.')
+    })
+
+    it('answers a form body with too many fields with 413', () => {
+      const res = createMockResponse()
+
+      handler(parserError('parameters.too.many', 413), createMockRequest(), res, createMockNext())
+
+      expect(res.status.calledWith(413)).to.be.true
+    })
+
     it('answers an oversized body with 413', () => {
       const res = createMockResponse()
 

@@ -504,7 +504,7 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
                   </Text>
                 </Flex>
               </DropdownMenu.Item>
-              {canEdit && (
+              {canEdit && !isArchived && (
                 <DropdownMenu.Item onClick={() => setEditOpen(true)}>
                   <Flex align="center" gap="2">
                     <MaterialIcon name="edit" size={16} />
@@ -636,7 +636,7 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
                   {project.description.trim()}
                 </Text>
               ) : (
-                canEdit && (
+                canEdit && !isArchived && (
                   <Button
                     size="1"
                     variant="ghost"
