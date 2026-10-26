@@ -1764,7 +1764,14 @@ export function ChatInput({
         }}
       >
         {/* Single row: plus button + input + send */}
-        <Flex align="center" justify="between" gap="1" style={{ height: isMobile ? TOUCH_TARGET_PX : 26 }}>
+        {/* On phones the row is 44px but the field is 20px; a tap above or below it should still open the composer. */}
+        <Flex
+          align="center"
+          justify="between"
+          gap="1"
+          onClick={isMobile ? (event) => { if (event.target === event.currentTarget) handleExpand(); } : undefined}
+          style={{ height: isMobile ? TOUCH_TARGET_PX : 26 }}
+        >
           {!isAgentChat && (
             <IconButton
               variant="ghost"

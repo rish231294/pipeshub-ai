@@ -202,9 +202,10 @@ export default function PromptsPage() {
     customPromptWebSearch !== savedPromptWebSearch ||
     customPromptAgent !== savedPromptAgent;
 
-  // The sidebar hides this page from members, but the URL still opens it.
+  // The sidebar hides this page from members, but the URL still opens it. A profile that failed
+  // to load leaves isAdmin null; General is open to everyone, so that goes there too.
   useEffect(() => {
-    if (isProfileInitialized && isAdmin === false) {
+    if (isProfileInitialized && isAdmin !== true) {
       router.replace('/workspace/general');
     }
   }, [isProfileInitialized, isAdmin, router]);
@@ -284,7 +285,7 @@ export default function PromptsPage() {
     });
   }, [savedPrompt, savedPromptWebSearch, savedPromptAgent, addToast, t]);
 
-  if (!isProfileInitialized || isAdmin === false) {
+  if (!isProfileInitialized || isAdmin !== true) {
     return null;
   }
 

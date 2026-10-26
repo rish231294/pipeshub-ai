@@ -149,6 +149,28 @@ describe('Authorize tab: starting OAuth', () => {
     await waitFor(() => expect(popup.location.href).toBe(AUTH_URL));
   });
 
+  it('closes the blank popup and leaves it alone when the panel unmounts before the link arrives', async () => {
+    let resolveUrl: (value: { authorizationUrl: string }) => void = () => {};
+    getOAuthAuthorizationUrl.mockReturnValue(
+      new Promise((resolve) => {
+        resolveUrl = resolve;
+      })
+    );
+    const popup = fakePopup();
+    openSpy.mockReturnValue(popup as unknown as Window);
+    openInstance(false);
+    const { unmount } = renderInTheme(<OAuthStep />);
+
+    fireEvent.click(signInButton());
+    unmount();
+
+    expect(popup.close).toHaveBeenCalled();
+    await act(async () => {
+      resolveUrl({ authorizationUrl: AUTH_URL });
+    });
+    expect(popup.location.href).toBe('about:blank');
+  });
+
   it('shows that sign-in is in progress while the popup is open', async () => {
     openSpy.mockReturnValue(fakePopup() as unknown as Window);
     openInstance(false);

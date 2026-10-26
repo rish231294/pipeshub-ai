@@ -62,6 +62,14 @@ describe('Prompts page access', () => {
     expect(container.textContent).toBe('');
   });
 
+  it('sends the user to General when the profile loaded without a role', async () => {
+    useUserStore.setState({ isInitialized: true, profile: null });
+    render(<PromptsPage />);
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/workspace/general'));
+    expect(getSystemPrompts).not.toHaveBeenCalled();
+  });
+
   it('loads the prompts for an admin', async () => {
     signInAs(true);
     render(<PromptsPage />);
