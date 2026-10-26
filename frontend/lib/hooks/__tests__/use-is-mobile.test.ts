@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useIsMobile, useIsBelowDesktop, MOBILE_MEDIA_QUERY } from '../use-is-mobile';
+import { useIsMobile, useIsBelowDesktop } from '../use-is-mobile';
 
 /** Values returned by every render, so the first one is observable. */
 function renders(hook: () => boolean) {
@@ -26,13 +26,9 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('useIsMobile', () => {
   it('is true on the very first render when the query matches', () => {
-    stubMatchMedia((q) => q === MOBILE_MEDIA_QUERY);
+    stubMatchMedia((q) => q === '(max-width: 768px)');
     const seen = renders(useIsMobile);
     expect(seen[0]).toBe(true);
-  });
-
-  it('covers phones held sideways as well as narrow screens', () => {
-    expect(MOBILE_MEDIA_QUERY).toBe('(max-width: 768px), (pointer: coarse) and (max-height: 500px)');
   });
 
   it('is false when the query does not match', () => {

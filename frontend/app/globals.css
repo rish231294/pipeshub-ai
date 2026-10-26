@@ -1152,7 +1152,7 @@ li > blockquote {
 }
 
 /* Same breakpoint as `useIsMobile`. */
-@media (max-width: 768px), (pointer: coarse) and (max-height: 500px) {
+@media (max-width: 768px) {
   .agent-builder-draggable-row {
     min-height: 44px;
   }
@@ -1602,7 +1602,7 @@ th code {
 /* iOS Safari zooms into any focused field under 16px. !important beats the inline font sizes
    several fields set (the chat composer among them); the composer's backdrop and placeholder
    follow so the chips stay aligned with the text. */
-@media (max-width: 768px) and (pointer: coarse), (pointer: coarse) and (max-height: 500px) {
+@media (max-width: 768px) and (pointer: coarse) {
   .rt-TextFieldInput,
   .rt-TextAreaInput,
   textarea,
