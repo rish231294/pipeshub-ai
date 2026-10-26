@@ -69,6 +69,8 @@ export interface ScopedToolGroupRow {
   toolDescriptions?: Record<string, string>;
   /** Display name per `fullNames` entry, where the full name doesn't read as one (MCP). */
   toolLabels?: Record<string, string>;
+  /** What a tool does to data, per `fullNames` entry, where it is known. */
+  toolKinds?: Record<string, 'read' | 'write' | 'destructive'>;
   toolsetSlug: string;
   instanceId?: string;
   iconPath?: string;

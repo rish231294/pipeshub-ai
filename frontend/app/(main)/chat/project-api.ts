@@ -154,16 +154,21 @@ export const ProjectApi = {
     return data.members ?? [];
   },
 
+  /**
+   * Removes a member, or — with the caller's own user id — leaves the
+   * project. `removed` is false when the principal was no longer a member.
+   */
   async removeMember(
     projectId: string,
     memberPrincipalId: string,
     principalType: ProjectPrincipalType = 'user',
-  ): Promise<ProjectMember[]> {
-    const { data } = await apiClient.delete<{ members: ProjectMember[] }>(
+  ): Promise<{ members: ProjectMember[]; removed: boolean }> {
+    const { data } = await apiClient.delete<{ members?: ProjectMember[]; removed?: boolean }>(
       `${PROJECTS_BASE_URL}/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberPrincipalId)}`,
       { params: { principalType } },
     );
-    return data.members ?? [];
+    // Older servers omit `removed`; a 200 from them always meant a removal.
+    return { members: data.members ?? [], removed: data.removed !== false };
   },
 
   async setConversationProject(

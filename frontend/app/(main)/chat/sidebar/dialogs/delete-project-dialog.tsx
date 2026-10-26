@@ -12,9 +12,9 @@ interface DeleteProjectDialogProps {
 }
 
 /**
- * Confirmation dialog for deleting a project. Unlike `DeleteChatDialog`,
- * this doesn't require typing a keyword — deleting a project only unlinks
- * its chats (`ProjectService.softDelete`), it never deletes chat data.
+ * Confirmation dialog for deleting a project. Its chats are unlinked, not
+ * deleted, but its uploaded files (the hidden linked Collection) go with it
+ * and every member loses access — the copy says so.
  */
 export function DeleteProjectDialog({
   open,
@@ -34,9 +34,20 @@ export function DeleteProjectDialog({
           <Text size="4" weight="bold" style={{ color: 'var(--olive-12)' }}>
             {t('chat.projects.deleteDialog.title')}
           </Text>
-          <Text size="2" style={{ color: 'var(--slate-11)' }}>
+          <Text as="p" size="2" style={{ color: 'var(--slate-11)' }}>
             {t('chat.projects.deleteDialog.description')}
           </Text>
+          <ul style={{ margin: 0, paddingLeft: 'var(--space-5)', color: 'var(--slate-11)' }}>
+            <li>
+              <Text size="2">{t('chat.projects.deleteDialog.filesDeleted')}</Text>
+            </li>
+            <li>
+              <Text size="2">{t('chat.projects.deleteDialog.membersLoseAccess')}</Text>
+            </li>
+            <li>
+              <Text size="2">{t('chat.projects.deleteDialog.chatsKept')}</Text>
+            </li>
+          </ul>
           <Flex gap="2" justify="end">
             <LoadingButton
               type="button"

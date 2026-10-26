@@ -222,6 +222,7 @@ function SpeechInputButton({
   return (
     <Tooltip content={tooltip} side="top">
       <IconButton
+        className="touch-hit"
         variant={isListening ? 'soft' : 'ghost'}
         color={isListening ? 'red' : 'gray'}
         size="2"
@@ -2415,6 +2416,7 @@ export function ChatInput({
               side="top"
             >
               <IconButton
+                className="touch-hit"
                 variant={isSearchMode ? 'soft' : 'ghost'}
                 color="gray"
                 size="2"
@@ -2457,6 +2459,7 @@ export function ChatInput({
                 size="2"
                 disabled={isRegenerateMode}
                 onClick={() => setIsMobilePlusMenuOpen(true)}
+                className="touch-hit"
                 aria-label={
                   showPlusMenuFilterBadge
                     ? t('chat.plusMenu.ariaLabelFiltersApplied', {
@@ -2698,6 +2701,7 @@ export function ChatInput({
                   side="top"
                 >
                     <IconButton
+                      className="touch-hit"
                       variant="ghost"
                       color="gray"
                       size="2"
@@ -2750,6 +2754,7 @@ export function ChatInput({
                     side="top"
                   >
                     <IconButton
+                      className="touch-hit"
                       variant="ghost"
                       color="gray"
                       size="2"
@@ -2883,6 +2888,7 @@ export function ChatInput({
           {/* Send / Stop button */}
           {isStreaming ? (
             <IconButton
+              className="touch-hit"
               variant="solid"
               size="2"
               onClick={handleStopStream}
@@ -2902,6 +2908,7 @@ export function ChatInput({
             </IconButton>
           ) : (
             <IconButton
+              className="touch-hit"
               variant="solid"
               size="2"
               onClick={(event) => {

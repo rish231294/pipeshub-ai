@@ -162,6 +162,16 @@ describe('ProjectApi.ensureKnowledgeBase / listMembers / upsertMembers / removeM
       params: { principalType: 'team' },
     });
   });
+
+  it('removeMember() reports removed:false when the member was already gone', async () => {
+    mockedDelete.mockResolvedValueOnce({ data: { members: [], removed: false } });
+    await expect(ProjectApi.removeMember('p1', 'u1')).resolves.toEqual({ members: [], removed: false });
+  });
+
+  it('removeMember() treats a response without `removed` as a removal', async () => {
+    mockedDelete.mockResolvedValueOnce({ data: { members: [] } });
+    await expect(ProjectApi.removeMember('p1', 'u1')).resolves.toEqual({ members: [], removed: true });
+  });
 });
 
 describe('ProjectApi.setConversationProject', () => {

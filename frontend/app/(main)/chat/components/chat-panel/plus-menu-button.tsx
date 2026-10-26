@@ -224,6 +224,7 @@ export function PlusMenuButton({
           variant="ghost"
           color="gray"
           size="2"
+          className="touch-hit"
           disabled={disabled}
           aria-label={
             showFilterBadge
