@@ -93,9 +93,9 @@ export interface ProcessedFile {
  * message naming recordName alone is ambiguous.
  */
 export const displayFileName = (pf: ProcessedFile): string => {
-  const base = pf.filePath?.split(/[\\/]/).pop();
+  const base = pf.filePath.split(/[\\/]/).pop();
   if (base) return base;
-  const ext = pf.fileRecord?.extension;
+  const ext = pf.fileRecord.extension;
   return ext ? `${pf.record.recordName}.${ext}` : pf.record.recordName;
 };
 

@@ -1125,8 +1125,9 @@ export class UserController {
       // Role and login-state changes require org admin (userAdminOrSelfCheck
       // alone is not enough: it lets a member edit their own record).
       // After userExists, req.user is the target document but still carries JWT userId.
+      const sentBody = req.body as Record<string, unknown>;
       const adminOnlyFieldsSent = ADMIN_ONLY_FIELDS.filter(
-        (field) => field in req.body && req.body[field] !== undefined,
+        (field) => field in sentBody && sentBody[field] !== undefined,
       );
       if (adminOnlyFieldsSent.length > 0) {
         const actorUserId = req.user.userId;
