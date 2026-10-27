@@ -1656,7 +1656,7 @@ def _assert_bind_vars_match(query: str, bind_vars: dict) -> None:
 
 class TestTeamsForAnOrgAdministrator:
     @pytest.mark.asyncio
-    async def test_one_team_grants_every_flag_to_an_admin(self, connected_provider):
+    async def test_one_team_grants_every_flag_to_an_admin(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(return_value=[])
         await connected_provider.get_team_with_users("t1", "org1", "u1", is_org_admin=True)
         query = connected_provider.execute_query.call_args.args[0]
@@ -1667,13 +1667,13 @@ class TestTeamsForAnOrgAdministrator:
         _assert_bind_vars_match(query, bind_vars)
 
     @pytest.mark.asyncio
-    async def test_one_team_for_a_member_does_not(self, connected_provider):
+    async def test_one_team_for_a_member_does_not(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(return_value=[])
         await connected_provider.get_team_with_users("t1", "org1", "u1")
         assert connected_provider.execute_query.call_args.kwargs["bind_vars"]["isOrgAdmin"] is False
 
     @pytest.mark.asyncio
-    async def test_an_admin_lists_every_team_in_the_org(self, connected_provider):
+    async def test_an_admin_lists_every_team_in_the_org(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(side_effect=[[1], [{"id": "t1"}]])
         connected_provider._enrich_created_by_user = AsyncMock()
 
@@ -1693,7 +1693,7 @@ class TestTeamsForAnOrgAdministrator:
         assert '"canEdit": true' in list_call.args[0]
 
     @pytest.mark.asyncio
-    async def test_a_member_lists_their_own_teams(self, connected_provider):
+    async def test_a_member_lists_their_own_teams(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(side_effect=[[0], []])
         connected_provider._enrich_created_by_user = AsyncMock()
 
@@ -1708,7 +1708,7 @@ class TestTeamsForAnOrgAdministrator:
 
 class TestFindTeamByName:
     @pytest.mark.asyncio
-    async def test_matches_trimmed_and_ignoring_case(self, connected_provider):
+    async def test_matches_trimmed_and_ignoring_case(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(return_value=[{"id": "t2", "name": "QA Dup Team"}])
 
         found = await connected_provider.find_team_by_name("org1", "  qa DUP team ", exclude_team_id="t1")
@@ -1721,7 +1721,7 @@ class TestFindTeamByName:
         _assert_bind_vars_match(query, bind_vars)
 
     @pytest.mark.asyncio
-    async def test_no_match(self, connected_provider):
+    async def test_no_match(self, connected_provider) -> None:
         connected_provider.execute_query = AsyncMock(return_value=[])
         assert await connected_provider.find_team_by_name("org1", "x") is None
         assert connected_provider.execute_query.call_args.kwargs["bind_vars"]["excludeTeamId"] == ""
