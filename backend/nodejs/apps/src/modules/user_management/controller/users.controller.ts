@@ -1130,7 +1130,8 @@ export class UserController {
       // own token (userAccount.controller); that one transition stays open, so
       // only an admin can reset someone to "Pending".
       const isSelfMarkedLoggedIn =
-        req.params.id === String(req.user.userId) && sentBody.hasLoggedIn === true;
+        req.params.id === String(req.user.userId) &&
+        sentBody.hasLoggedIn === true;
       const adminOnlyFieldsSent = ADMIN_ONLY_FIELDS.filter(
         (field) =>
           field in sentBody &&
