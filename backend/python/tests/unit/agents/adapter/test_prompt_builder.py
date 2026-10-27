@@ -279,7 +279,7 @@ class TestCitationRules:
             context.tool_state["final_results"] = [{"id": "r1"}]
             result = _build(context)
         for text in (result, _answer_markdown_description()):
-            assert "Never attach one to anything the" in " ".join(text.split())
+            assert "actually came from, only for what it states" in " ".join(text.split())
 
     def test_citation_rules_included_when_attachments_present(self) -> None:
         with patch(self._FA_PATCH, return_value=False):

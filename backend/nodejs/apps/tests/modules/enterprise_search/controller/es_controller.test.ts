@@ -73,6 +73,7 @@ import { IAMServiceCommand } from '../../../../src/libs/commands/iam/iam.service
 import { Users } from '../../../../src/modules/user_management/schema/users.schema'
 import { Notifications } from '../../../../src/modules/notification/schema/notification.schema'
 import { ProjectService } from '../../../../src/modules/projects/services/project.service'
+import { ProjectsFeature } from '../../../../src/modules/projects/utils/projects-feature'
 import { Org } from '../../../../src/modules/user_management/schema/org.schema'
 import * as searchUtils from '../../../../src/modules/enterprise_search/utils/utils'
 import { CHAT_ERROR_MESSAGES } from '../../../../src/modules/enterprise_search/utils/chat-error-messages'
@@ -690,6 +691,8 @@ describe('Enterprise Search Controller', () => {
 
     it('refuses a project the caller cannot use before opening the stream', async () => {
       const handler = streamChat(createMockAppConfig())
+      // The flag is cached across the suite; this test is about project access, not the flag.
+      sinon.stub(ProjectsFeature, 'assertEnabled').resolves()
       sinon.stub(ProjectService, 'assertAccess').rejects(new NotFoundError('Project not found'))
       const saveStub = sinon.stub(ChatSession.prototype, 'save')
       const req = createMockRequest({

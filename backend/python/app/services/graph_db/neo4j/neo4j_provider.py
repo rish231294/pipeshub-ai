@@ -23781,9 +23781,8 @@ class Neo4jProvider(NamedEntityGraphMixin, IGraphDBProvider):
             """
 
             # Shared filter params
-            filter_params: dict = {}
-            if list_all_org_teams:
-                filter_params["org_id"] = org_id
+            # The org comes in as an argument; this only passes it to the query.
+            filter_params: dict = {"org_id": org_id} if list_all_org_teams else {}
             if search:
                 filter_params["search"] = search
             if created_by:

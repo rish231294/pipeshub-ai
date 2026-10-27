@@ -26,6 +26,7 @@ from app.api.routes.entity import (
     update_team,
     update_user_email,
 )
+from app.core.org_context import OrgContext, bind
 from app.utils.user_messages import DATABASE_UNREACHABLE, not_found
 
 
@@ -56,6 +57,13 @@ def _make_request(body_dict=None, query_params=None):
         req.query_params = {}
 
     return req
+
+
+@pytest.fixture(autouse=True)
+def _caller_org_is_bound() -> Iterator[None]:
+    """The auth middleware binds the caller's org; these tests call handlers directly."""
+    with bind(OrgContext("org-1", "user-1", "user", "jwt", "req-test")):
+        yield
 
 
 @pytest.fixture(autouse=True)

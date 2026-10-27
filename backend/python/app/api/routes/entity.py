@@ -12,6 +12,7 @@ from app.api.middlewares.caller_role import fetch_caller_role
 from app.config.constants.arangodb import CollectionNames
 from app.config.constants.service import OAuthScopes, TokenScopes
 from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
+from app.core.org_context import current_org_id
 from app.services.cache.invalidation_hooks import notify_connector_sync_completed
 from app.services.graph_db.user_email_identity import GraphUserEmailConflictError
 from app.utils.logger import create_logger
@@ -252,7 +253,7 @@ async def create_team(request: Request) -> JSONResponse:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     team_name = _clean_team_name(body_dict.get("name"))
-    await _refuse_taken_team_name(graph_provider, user_info.get("orgId"), team_name, logger)
+    await _refuse_taken_team_name(graph_provider, current_org_id(), team_name, logger)
     # Generate a unique key for the team
     team_key = str(uuid.uuid4())
 
@@ -442,7 +443,7 @@ async def update_team(request: Request, team_id: str) -> JSONResponse:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    org_id = user_info.get("orgId")
+    org_id = current_org_id()
     is_org_admin = await _caller_is_an_administrator(request)
     permission = await _authorize_team_change(
         graph_provider,
@@ -702,7 +703,7 @@ async def get_user_teams(
             created_after=created_after,
             created_before=created_before,
             include_service_accounts=is_org_admin,
-            org_id=user_info.get("orgId"),
+            org_id=current_org_id(),
             is_org_admin=is_org_admin,
         )
 
