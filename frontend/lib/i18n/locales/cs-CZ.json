@@ -1946,7 +1946,11 @@
         "viewTeam": "Zobrazit tým",
         "delete": "Smazat",
         "deleteSuccess": "Tým byl smazán",
-        "deleteError": "Tým se nepodařilo smazat"
+        "deleteError": "Tým se nepodařilo smazat",
+        "deleteConfirmTitle": "Smazat tým?",
+        "deleteConfirmMessage": "Tým \"{{name}}\" bude smazán a jeho členové ztratí přístup sdílený jeho prostřednictvím. Tuto akci nelze vrátit.",
+        "deleteConfirmButton": "Smazat tým",
+        "deleting": "Mazání…"
       },
       "create": {
         "title": "Vytvořit tým",

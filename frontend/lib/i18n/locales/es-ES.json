@@ -1801,7 +1801,11 @@
         "viewTeam": "Ver equipo",
         "delete": "Eliminar",
         "deleteError": "Error al eliminar el equipo",
-        "deleteSuccess": "Equipo eliminado"
+        "deleteSuccess": "Equipo eliminado",
+        "deleteConfirmTitle": "¿Eliminar el equipo?",
+        "deleteConfirmMessage": "Se eliminará \"{{name}}\" y sus miembros perderán el acceso compartido a través de él. Esta acción no se puede deshacer.",
+        "deleteConfirmButton": "Eliminar equipo",
+        "deleting": "Eliminando…"
       },
       "create": {
         "accessComingSoon": "Permisos de acceso próximamente",

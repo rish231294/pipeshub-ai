@@ -1840,7 +1840,11 @@
         "viewTeam": "檢視團隊",
         "delete": "刪除",
         "deleteSuccess": "團隊已刪除",
-        "deleteError": "無法刪除團隊"
+        "deleteError": "無法刪除團隊",
+        "deleteConfirmTitle": "刪除團隊？",
+        "deleteConfirmMessage": "「{{name}}」將被刪除，其成員將失去透過該團隊共用的存取權。此動作無法復原。",
+        "deleteConfirmButton": "刪除團隊",
+        "deleting": "正在刪除…"
       },
       "create": {
         "title": "建立團隊",

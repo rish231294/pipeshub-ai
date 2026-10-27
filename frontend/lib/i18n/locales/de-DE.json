@@ -1767,7 +1767,11 @@
         "viewTeam": "Team anzeigen",
         "delete": "Löschen",
         "deleteSuccess": "Team gelöscht",
-        "deleteError": "Team konnte nicht gelöscht werden"
+        "deleteError": "Team konnte nicht gelöscht werden",
+        "deleteConfirmTitle": "Team löschen?",
+        "deleteConfirmMessage": "\"{{name}}\" wird gelöscht, und seine Mitglieder verlieren den darüber geteilten Zugriff. Dies kann nicht rückgängig gemacht werden.",
+        "deleteConfirmButton": "Team löschen",
+        "deleting": "Wird gelöscht…"
       },
       "create": {
         "title": "Team erstellen",

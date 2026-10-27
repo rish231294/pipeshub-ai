@@ -14,7 +14,9 @@ import {
   SearchableCheckboxDropdown,
   AvatarCell,
   PaginatedMembersList,
+  ConfirmationDialog,
 } from '../../components';
+import { useWorkspaceDrawerNestedModalHost } from '../../components/workspace-right-panel';
 import type { CheckboxOption, PaginatedMembersListHandle } from '../../components';
 import { useTeamsStore } from '../store';
 import { TeamsApi } from '../api';
@@ -61,6 +63,8 @@ export function TeamDetailSidebar({
   } = useTeamsStore();
 
   const [isDeleting, setIsDeleting] = useState(false);
+  const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
+  const nestedModalHost = useWorkspaceDrawerNestedModalHost(isDetailPanelOpen);
   const [addMemberRole, setAddMemberRole] = useState<TeamMemberRole>('READER');
   // Pending per-member role updates (Mongo userId; applied on Save as updateUserRoles)
   const [pendingUpdateRoles, setPendingUpdateRoles] = useState<Map<string, TeamMemberRole>>(
@@ -368,6 +372,7 @@ export function TeamDetailSidebar({
         duration: 3000,
       });
 
+      setIsDeleteConfirmOpen(false);
       closeDetailPanel();
       onUpdateSuccess?.();
     } catch {
@@ -901,7 +906,7 @@ export function TeamDetailSidebar({
               variant="outline"
               color="red"
               size="1"
-              onClick={handleDeleteTeam}
+              onClick={() => setIsDeleteConfirmOpen(true)}
               loading={isDeleting}
               loadingLabel={t('workspace.teams.edit.deleting', 'Deleting...')}
               style={{ flexShrink: 0 }}
@@ -911,6 +916,26 @@ export function TeamDetailSidebar({
           </Flex>
         </Box>
       )}
+
+      <ConfirmationDialog
+        open={isDeleteConfirmOpen}
+        onOpenChange={(open) => {
+          if (!open && !isDeleting) setIsDeleteConfirmOpen(false);
+        }}
+        title={t('workspace.teams.actions.deleteConfirmTitle', 'Delete team?')}
+        message={t('workspace.teams.actions.deleteConfirmMessage', {
+          name: detailTeam?.name ?? '',
+          defaultValue:
+            '"{{name}}" will be deleted and its members will lose access shared through it. This can\'t be undone.',
+        })}
+        confirmLabel={t('workspace.teams.actions.deleteConfirmButton', 'Delete team')}
+        cancelLabel={t('common.cancel', 'Cancel')}
+        confirmVariant="danger"
+        isLoading={isDeleting}
+        confirmLoadingLabel={t('workspace.teams.actions.deleting', 'Deleting…')}
+        onConfirm={() => void handleDeleteTeam()}
+        container={nestedModalHost}
+      />
     </WorkspaceRightPanel>
   );
 }

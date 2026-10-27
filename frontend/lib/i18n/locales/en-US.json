@@ -1856,7 +1856,11 @@
         "viewTeam": "View team",
         "delete": "Delete",
         "deleteSuccess": "Team deleted",
-        "deleteError": "Failed to delete team"
+        "deleteError": "Failed to delete team",
+        "deleteConfirmTitle": "Delete team?",
+        "deleteConfirmMessage": "\"{{name}}\" will be deleted and its members will lose access shared through it. This can't be undone.",
+        "deleteConfirmButton": "Delete team",
+        "deleting": "Deleting…"
       },
       "create": {
         "title": "Create team",

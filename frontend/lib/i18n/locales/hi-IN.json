@@ -1767,7 +1767,11 @@
         "viewTeam": "टीम देखें",
         "delete": "हटाएँ",
         "deleteError": "टीम हटाने में विफल",
-        "deleteSuccess": "टीम हटाई गई"
+        "deleteSuccess": "टीम हटाई गई",
+        "deleteConfirmTitle": "टीम हटाएँ?",
+        "deleteConfirmMessage": "\"{{name}}\" हटा दी जाएगी और इसके सदस्य इसके ज़रिए साझा की गई पहुँच खो देंगे। इसे पूर्ववत नहीं किया जा सकता।",
+        "deleteConfirmButton": "टीम हटाएँ",
+        "deleting": "हटाया जा रहा है…"
       },
       "create": {
         "accessComingSoon": "पहुंच अनुमतियां जल्द आ रही हैं",

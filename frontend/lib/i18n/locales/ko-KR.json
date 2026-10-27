@@ -1840,7 +1840,11 @@
         "viewTeam": "팀 보기",
         "delete": "삭제",
         "deleteSuccess": "팀이 삭제되었습니다",
-        "deleteError": "팀을 삭제하지 못했습니다"
+        "deleteError": "팀을 삭제하지 못했습니다",
+        "deleteConfirmTitle": "팀을 삭제할까요?",
+        "deleteConfirmMessage": "\"{{name}}\" 팀이 삭제되고 구성원은 이 팀을 통해 공유된 액세스 권한을 잃게 됩니다. 이 작업은 되돌릴 수 없습니다.",
+        "deleteConfirmButton": "팀 삭제",
+        "deleting": "삭제 중…"
       },
       "create": {
         "title": "팀 만들기",

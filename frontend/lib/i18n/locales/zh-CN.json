@@ -1840,7 +1840,11 @@
         "viewTeam": "查看团队",
         "delete": "删除",
         "deleteSuccess": "团队已删除",
-        "deleteError": "删除团队失败"
+        "deleteError": "删除团队失败",
+        "deleteConfirmTitle": "删除团队？",
+        "deleteConfirmMessage": "“{{name}}”将被删除，其成员将失去通过该团队共享的访问权限。此操作无法撤销。",
+        "deleteConfirmButton": "删除团队",
+        "deleting": "正在删除…"
       },
       "create": {
         "title": "创建团队",

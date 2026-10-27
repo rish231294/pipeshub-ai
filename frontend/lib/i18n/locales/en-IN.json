@@ -1767,7 +1767,11 @@
         "viewTeam": "View team",
         "delete": "Delete",
         "deleteError": "Failed to delete team",
-        "deleteSuccess": "Team deleted"
+        "deleteSuccess": "Team deleted",
+        "deleteConfirmTitle": "Delete team?",
+        "deleteConfirmMessage": "\"{{name}}\" will be deleted and its members will lose access shared through it. This can't be undone.",
+        "deleteConfirmButton": "Delete team",
+        "deleting": "Deleting…"
       },
       "create": {
         "accessComingSoon": "Access permissions coming soon",
