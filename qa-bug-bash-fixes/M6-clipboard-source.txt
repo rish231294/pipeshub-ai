@@ -1,0 +1,4 @@
+flowchart TD
+    Cart --> Address --> Payment --> Decision{Payment OK?}
+    Decision -->|Yes| OrderConfirmed[Order Confirmed]
+    Decision -->|No| Payment
