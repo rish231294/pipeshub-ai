@@ -29728,16 +29728,16 @@ paths:
                   type: array
                   items:
                     type: string
-                    format: email
-                    maxLength: 254
                   minItems: 1
                   description: |
-                    Array of email addresses to invite. The validator only checks for strings; the
-                    handler then refuses the whole request with `400` `Invalid emails are found` if
-                    any address has whitespace, `@`, `"`, `(`, `)`, `,`, `:`, `;`, `<`, `>`, `[`,
-                    `]`, `\` or a backtick in its local part, or a domain that is not dot-separated
-                    labels of Unicode letters, digits and `-` ending in a label of two or more
-                    characters. Surrounding whitespace is trimmed before either check.
+                    Array of email addresses to invite. The validator only checks for strings, so
+                    the schema sets no `format` or length on the raw value. Surrounding whitespace
+                    is trimmed first; the handler then refuses the whole request with `400`
+                    `Invalid emails are found` if any trimmed address is longer than 254
+                    characters, has whitespace, `@`, `"`, `(`, `)`, `,`, `:`, `;`, `<`, `>`, `[`,
+                    `]`, `\` or a backtick in its local part, or has a domain that is not
+                    dot-separated labels of Unicode letters, digits and `-` ending in a label of
+                    two or more characters.
                   example: ["user1@company.com", "user2@company.com"]
                 groupIds:
                   type: array
