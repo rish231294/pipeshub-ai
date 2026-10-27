@@ -70,6 +70,29 @@ export function rowsToCsv(rows: string[][]): string {
 /** The byte order mark lets Excel read accented and non-Latin text as UTF-8. */
 const UTF8_BOM = '\uFEFF';
 
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * `<first header>-YYYYMMDD-HHmmss.csv` (local time), or `table-…` when the
+ * header has nothing usable, so repeated downloads do not all land as `table.csv`.
+ */
+export function tableCsvFileName(rows: string[][], now: Date = new Date()): string {
+  const slug = (rows[0]?.[0] ?? '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+    .replace(/-+$/, '');
+  const stamp =
+    `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}` +
+    `-${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`;
+  return `${slug || 'table'}-${stamp}.csv`;
+}
+
 export function downloadTableCsv(rows: string[][]): void {
-  saveTextFile('table.csv', `${UTF8_BOM}${rowsToCsv(rows)}\r\n`, 'text/csv');
+  saveTextFile(tableCsvFileName(rows), `${UTF8_BOM}${rowsToCsv(rows)}\r\n`, 'text/csv');
 }

@@ -58,6 +58,7 @@ import {
 import {
   buildCitationMapsFromStreaming,
 } from './components/message-area/response-tabs/citations';
+import type { CitationMaps } from './components/message-area/response-tabs/citations/types';
 import { pickModelInfoFromConversationBundle } from './utils/apply-conversation-model-info';
 import { CONVERSATION_MESSAGES_PAGE_SIZE } from './constants';
 import { ChatStreamError, streamErrorInfo, type ChatStreamErrorInfo } from './stream-error';
@@ -283,6 +284,59 @@ function buildStoppedMessages(
   );
   if (targetIsLast && !targetIsCard) return messages.slice(0, -1);
   return messages;
+}
+
+/**
+ * A stopped run can come back from the server with an empty answer even
+ * though text was on screen (older query services saved "" on cancel). Fills
+ * the stopped row from what streamed so Stop never blanks the answer.
+ */
+export function keepStreamedTextOnStoppedAnswer(
+  messages: ThreadMessageLike[],
+  targetId: string | null | undefined,
+  rawStreamedText: string,
+  citationMaps: CitationMaps | null | undefined,
+  appendId?: string | null,
+): ThreadMessageLike[] {
+  const text = stripAnswerMarkers(rawStreamedText ?? '').trim();
+  if (!text) return messages;
+  const last = messages[messages.length - 1];
+  // History drops an empty stopped reply with no activity, so the turn ends on
+  // the question; the partial then needs a row of its own.
+  if (!targetId && appendId && last?.role === 'user') {
+    return [
+      ...messages,
+      {
+        id: appendId,
+        role: 'assistant' as const,
+        content: [{ type: 'text' as const, text }],
+        metadata: { custom: { status: 'stopped' as const, ...(citationMaps ? { citationMaps } : {}) } },
+      },
+    ];
+  }
+  const target = targetId
+    ? messages.find((m) => m.role === 'assistant' && m.id === targetId)
+    : (last?.role === 'assistant' ? last : undefined);
+  if (!target) return messages;
+  const custom = (target.metadata?.custom ?? {}) as Record<string, unknown>;
+  if (custom.status !== 'stopped' || getThreadMessagePlainText(target).trim()) return messages;
+  const savedMaps = custom.citationMaps as CitationMaps | undefined;
+  const hasSavedCitations = Boolean(savedMaps && Object.keys(savedMaps.citations ?? {}).length);
+  return messages.map((m) =>
+    m === target
+      ? {
+          ...m,
+          content: [{ type: 'text' as const, text }],
+          metadata: {
+            ...m.metadata,
+            custom: {
+              ...custom,
+              ...(!hasSavedCitations && citationMaps ? { citationMaps } : {}),
+            },
+          },
+        }
+      : m,
+  );
 }
 
 /** `repliedInChat`: the message being sent answers this open card, so it shows as closed. */
@@ -1113,6 +1167,9 @@ export async function streamMessageForSlot(
       onChunk: (data) => {
         if (!slotIsOnRun(slotId, streamRunId)) return;
         if (ignoreChunks) return;
+        // A stopped run's final frame can carry an empty `accumulated`; taking
+        // it would wipe the partial answer the user chose to keep.
+        if (!data.accumulated && useChatStore.getState().slots[slotId]?.stopping) return;
         debugLog.chunk();
         accumulatedContent = data.accumulated;
         // Any answer text flowing right now supersedes a stale "Using X…"
@@ -1275,12 +1332,22 @@ export async function streamMessageForSlot(
         const newConvId = conv._id || conv.id || '';
 
         // Build finalized messages from API response
-        const { messages: finalMessages, unansweredAskUserQuestion } = loadHistoricalMessages(data.conversation.messages);
+        const historical = loadHistoricalMessages(data.conversation.messages);
+        const { unansweredAskUserQuestion } = historical;
 
         // SSE placeholder assistant id → persisted Mongo message id after complete.
         const slotBeforeComplete = useChatStore.getState().slots[slotId];
         // Settling clears `stopping`, so a user-stopped run is only knowable here.
         const wasStopped = Boolean(slotBeforeComplete?.stopping);
+        const finalMessages = wasStopped && !resumeAskUserQuestion
+          ? keepStreamedTextOnStoppedAnswer(
+              historical.messages,
+              null,
+              accumulatedContent,
+              pendingCitationMaps ?? slotBeforeComplete?.streamingCitationMaps,
+              pendingAssistantId,
+            )
+          : historical.messages;
         const liveParts = slotBeforeComplete?.streamingParts ?? [];
         const liveFollowUp = resumeAskUserQuestion
           ? [
@@ -1805,6 +1872,7 @@ export async function streamRegenerateForSlot(
     onChunk: (data) => {
       if (!slotIsOnRun(slotId, streamRunId)) return;
       if (ignoreChunks) return;
+      if (!data.accumulated && useChatStore.getState().slots[slotId]?.stopping) return;
       debugLog.chunk();
       accumulatedContent = data.accumulated;
       // See streamMessageForSlot's onChunk — clear on every chunk, not just
@@ -1866,8 +1934,17 @@ export async function streamRegenerateForSlot(
           : await ChatApi.fetchConversation(slot.convId!);
         if (!slotIsOnRun(slotId, streamRunId)) return;
         const pendingBefore = useChatStore.getState().slots[slotId]?.pendingAskUserQuestion;
-        const { messages: loadedMessages, unansweredAskUserQuestion } = loadHistoricalMessages(detail.messages);
-        const regenRowId = assistantRowIdForBackendMessage(loadedMessages, messageId);
+        const historical = loadHistoricalMessages(detail.messages);
+        const { unansweredAskUserQuestion } = historical;
+        const regenRowId = assistantRowIdForBackendMessage(historical.messages, messageId);
+        const loadedMessages = wasStopped
+          ? keepStreamedTextOnStoppedAnswer(
+              historical.messages,
+              regenRowId,
+              accumulatedContent,
+              pendingCitationMaps ?? useChatStore.getState().slots[slotId]?.streamingCitationMaps,
+            )
+          : historical.messages;
         const finalMessages = pendingBefore?.payload
           ? stampPendingCardOnMessages(loadedMessages, {
               ...pendingBefore,

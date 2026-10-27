@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const saveTextFile = vi.hoisted(() => vi.fn());
 vi.mock('../save-text-file', () => ({ saveTextFile }));
 
-import { downloadTableCsv, rowsToCsv, tableNodeToRows, type TableNode } from '../table-csv';
+import { downloadTableCsv, rowsToCsv, tableCsvFileName, tableNodeToRows, type TableNode } from '../table-csv';
 
 beforeEach(() => saveTextFile.mockReset());
 
@@ -132,13 +132,30 @@ describe('rowsToCsv', () => {
 });
 
 describe('downloadTableCsv', () => {
-  it('saves table.csv with a byte order mark so Excel reads non-Latin text', () => {
+  it('saves a CSV with a byte order mark so Excel reads non-Latin text', () => {
     downloadTableCsv([['Nom', 'Prix'], ['Café', '3,5']]);
 
     expect(saveTextFile).toHaveBeenCalledTimes(1);
     const [name, content, mime] = saveTextFile.mock.calls[0];
-    expect(name).toBe('table.csv');
+    expect(name).toMatch(/^nom-\d{8}-\d{6}\.csv$/);
     expect(mime).toBe('text/csv');
     expect(content).toBe('\uFEFFNom,Prix\r\nCafé,"3,5"\r\n');
+  });
+});
+
+describe('tableCsvFileName', () => {
+  const at = new Date(2026, 9, 27, 9, 5, 7);
+
+  it('names the file after the first header and the local time', () => {
+    expect(tableCsvFileName([['Industry Name', 'Count']], at)).toBe('industry-name-20261027-090507.csv');
+  });
+
+  it('drops accents and symbols from the header', () => {
+    expect(tableCsvFileName([['Café / Prix (€)']], at)).toBe('cafe-prix-20261027-090507.csv');
+  });
+
+  it('falls back to table- when the header has nothing usable', () => {
+    expect(tableCsvFileName([['#'], ['1']], at)).toBe('table-20261027-090507.csv');
+    expect(tableCsvFileName([], at)).toBe('table-20261027-090507.csv');
   });
 });

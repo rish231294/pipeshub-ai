@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/config';
 import { useUserStore } from '@/lib/store/user-store';
 import { useToastStore } from '@/lib/store/toast-store';
+import { getUserFacingErrorMessage } from '@/lib/api/api-error';
 import {
   WorkspaceRightPanel,
   FormField,
@@ -433,9 +434,10 @@ export function TeamDetailSidebar({
       });
       onUpdateSuccess?.();
     } catch (error) {
-      const message =
-        (error as { response?: { data?: { message?: string } }; message?: string })?.response?.data?.message
-        ?? t('workspace.teams.edit.saveErrorDescription', 'Could not update team. Please try again.');
+      const message = getUserFacingErrorMessage(
+        error,
+        t('workspace.teams.edit.saveErrorDescription', 'Could not update team. Please try again.')
+      );
       addToast({
         variant: 'error',
         title: t('workspace.teams.edit.saveError', 'Failed to update team'),

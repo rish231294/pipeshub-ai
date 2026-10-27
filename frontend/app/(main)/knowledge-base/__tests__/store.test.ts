@@ -293,3 +293,28 @@ describe('browsing state', () => {
     expect(store().nodes.map((n) => n.id)).toEqual(['n1', 'n2']);
   });
 });
+
+describe('applyNodeRename', () => {
+  it('shows a renamed collection in the header, breadcrumbs, rows and All Records selection at once', () => {
+    store().setTableData({
+      currentNode: { id: 'kb1', name: 'Old', nodeType: 'app' },
+      parentNode: null,
+      breadcrumbs: [{ id: 'kb1', name: 'Old', nodeType: 'app' }],
+      items: [node('kb1', { name: 'Old' }), node('r1', { name: 'keep' })],
+    } as never);
+    store().setAllRecordsSidebarSelection({ type: 'collection', id: 'kb1', name: 'Old' });
+
+    store().applyNodeRename('kb1', 'New');
+
+    expect(store().tableData?.currentNode?.name).toBe('New');
+    expect(store().tableData?.breadcrumbs?.[0]?.name).toBe('New');
+    expect(store().tableData?.items.map((i) => i.name)).toEqual(['New', 'keep']);
+    expect(store().allRecordsSidebarSelection).toEqual({ type: 'collection', id: 'kb1', name: 'New' });
+  });
+
+  it('leaves everything alone when nothing open has that id', () => {
+    store().setTableData({ currentNode: { id: 'kb2', name: 'Other', nodeType: 'app' }, items: [] } as never);
+    store().applyNodeRename('kb1', 'New');
+    expect(store().tableData?.currentNode?.name).toBe('Other');
+  });
+});

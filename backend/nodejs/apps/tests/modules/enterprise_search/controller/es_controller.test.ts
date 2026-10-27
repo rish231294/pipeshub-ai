@@ -55,6 +55,7 @@ import {
   unarchiveAgentConversation,
   updateAgentConversationTitle,
   uploadChatAttachments,
+  resolveChatAttachmentMimeType,
   uploadChatAttachmentsInternal,
   deleteChatAttachment,
   cancelConversationStream,
@@ -14011,6 +14012,45 @@ describe('Enterprise Search Controller', () => {
 
         expect(next.calledOnce).to.be.true
         expect(next.firstCall.args[0].message).to.match(/Unsupported attachment type/)
+        expect(next.firstCall.args[0].message).to.include('received content type: application/zip')
+      })
+
+      it('should accept an .xlsx sent as application/octet-stream by its extension', async () => {
+        let sentMime = ''
+        sinon.stub(AIServiceCommand.prototype, 'execute').callsFake(function (this: any) {
+          sentMime = JSON.parse(this.body).attachments[0].mimeType
+          return Promise.resolve({ statusCode: 200, data: {} } as any)
+        })
+        const handler = uploadChatAttachments(createMockAppConfig())
+        const req = createMockRequest({
+          files: [{ ...pdfMulterFile, mimetype: 'application/octet-stream', originalname: 'X.xlsx' }],
+        })
+        const res = createMockResponse()
+        const next = createMockNext()
+
+        await handler(req, res, next)
+
+        expect(next.called).to.be.false
+        expect(sentMime).to.equal('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+      })
+
+      it('should still refuse a generic content type whose extension is unsupported', async () => {
+        const handler = uploadChatAttachments(createMockAppConfig())
+        const req = createMockRequest({
+          files: [{ ...pdfMulterFile, mimetype: 'application/octet-stream', originalname: 'run.exe' }],
+        })
+        const res = createMockResponse()
+        const next = createMockNext()
+
+        await handler(req, res, next)
+
+        expect(next.calledOnce).to.be.true
+        expect(next.firstCall.args[0].message).to.include('received content type: application/octet-stream')
+      })
+
+      it('should not let an extension override a specific unsupported content type', () => {
+        expect(resolveChatAttachmentMimeType({ mimetype: 'application/zip', originalname: 'a.pdf' })).to.equal(null)
+        expect(resolveChatAttachmentMimeType({ mimetype: '', originalname: 'notes.MD' })).to.equal('text/markdown')
       })
 
       it('should POST attachment payload to the AI backend and return its JSON', async () => {
