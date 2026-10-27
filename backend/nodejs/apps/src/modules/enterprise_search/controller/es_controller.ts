@@ -484,7 +484,11 @@ export const resolveChatAttachmentMimeType = (
   const name = file.originalname || '';
   const dot = name.lastIndexOf('.');
   if (dot < 0) return null;
-  return CHAT_ATTACHMENT_MIME_BY_EXTENSION[name.slice(dot + 1).toLowerCase()] ?? null;
+  const extension = name.slice(dot + 1).toLowerCase();
+  // Own keys only: a file named "x.constructor" would otherwise resolve to Object.
+  return Object.prototype.hasOwnProperty.call(CHAT_ATTACHMENT_MIME_BY_EXTENSION, extension)
+    ? CHAT_ATTACHMENT_MIME_BY_EXTENSION[extension]
+    : null;
 };
 
 export const uploadChatAttachments =

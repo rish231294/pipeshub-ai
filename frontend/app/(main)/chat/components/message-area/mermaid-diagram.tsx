@@ -10,8 +10,10 @@ import { toast } from '@/lib/store/toast-store';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Low enough that "fit to screen" can show a very tall diagram whole. */
+/** Floor for the zoom-out button. */
 const MIN_ZOOM = 5;
+/** "Fit to screen" may go below MIN_ZOOM so a very tall diagram still shows whole. */
+const MIN_FIT_ZOOM = 1;
 const MAX_ZOOM = 400;
 const ZOOM_STEP = 25;
 /** 100% = SVG fills the full width of the dialog content area. */
@@ -464,17 +466,23 @@ export function fitZoomPercent(
   if (naturalWidth <= 0 || naturalHeight <= 0 || areaWidth <= 0 || areaHeight <= 0) return DEFAULT_ZOOM;
   const byHeight = (areaHeight * naturalWidth) / (naturalHeight * areaWidth);
   const pct = Math.floor(Math.min(1, byHeight) * 100);
-  return Math.min(DEFAULT_ZOOM, Math.max(MIN_ZOOM, pct));
+  return Math.min(DEFAULT_ZOOM, Math.max(MIN_FIT_ZOOM, pct));
+}
+
+/** One zoom-out step, floored at MIN_ZOOM; a fit already below the floor stays put rather than jumping up. */
+export function zoomOutPercent(zoom: number): number {
+  return zoom <= MIN_ZOOM ? zoom : Math.max(zoom - ZOOM_STEP, MIN_ZOOM);
 }
 
 /**
  * PNG scale: at least 2x (or the screen's pixel ratio), raised so a small
- * diagram's long side reaches ~2000px, and capped to keep the canvas sane.
+ * diagram's long side reaches ~2000px, and capped so the long side never
+ * exceeds 8000px (below 1x for huge diagrams) to keep the canvas sane.
  */
 export function pngExportScale(naturalWidth: number, naturalHeight: number, devicePixelRatio = 1): number {
   const longSide = Math.max(naturalWidth, naturalHeight, 1);
   const wanted = Math.max(2, devicePixelRatio || 1, 2000 / longSide);
-  return Math.min(wanted, 4, Math.max(1, 8000 / longSide));
+  return Math.min(wanted, 4, 8000 / longSide);
 }
 
 function parseSvgDimensions(svgString: string): { width: number; height: number } {
@@ -698,7 +706,7 @@ export function MermaidDiagram({ chart }: MermaidDiagramProps) {
 
   // ── Zoom ────────────────────────────────────────────────────────────────────
   const zoomIn    = useCallback(() => setZoom((z) => Math.min(z + ZOOM_STEP, MAX_ZOOM)), []);
-  const zoomOut   = useCallback(() => setZoom((z) => Math.max(z - ZOOM_STEP, MIN_ZOOM)), []);
+  const zoomOut   = useCallback(() => setZoom(zoomOutPercent), []);
   const zoomReset = useCallback(() => setZoom(DEFAULT_ZOOM), []);
   const zoomFit   = useCallback(() => setZoom(computeFitZoom()), [computeFitZoom]);
 

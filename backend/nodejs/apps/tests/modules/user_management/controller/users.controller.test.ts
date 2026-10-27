@@ -1348,6 +1348,44 @@ describe('UserController', () => {
       expect(res.json.called).to.be.false;
     });
 
+    it('lets a member mark their own account as signed in, as first sign-in does', async () => {
+      // userAccount.controller sends { hasLoggedIn: true } with the new
+      // member's own token on their first sign-in.
+      req.params.id = req.user.userId;
+      req.body = { hasLoggedIn: true, email: 'test@test.com' };
+      const mockUser = {
+        _id: req.user.userId,
+        orgId: new mongoose.Types.ObjectId(req.user.orgId),
+        email: 'test@test.com',
+        hasLoggedIn: false,
+        save: sinon.stub().resolves(),
+        toObject: sinon.stub().returns({ _id: req.user.userId, hasLoggedIn: true }),
+      };
+      const findOne = sinon.stub(Users, 'findOne').resolves(mockUser as any);
+
+      await controller.updateUser(req, res, next);
+
+      expect(next.called).to.be.false;
+      expect(mockUser.hasLoggedIn).to.equal(true);
+      expect(mockUser.save.calledOnce).to.be.true;
+      // No admin lookup: the transition is allowed for the user themselves.
+      expect(findOne.calledOnce).to.be.true;
+    });
+
+    it("refuses a member who marks someone else's account as signed in", async () => {
+      req.params.id = '507f1f77bcf86cd799439013';
+      req.body = { hasLoggedIn: true };
+      sinon.stub(Users, 'findOne').returns({
+        select: sinon.stub().returnsThis(),
+        lean: sinon.stub().resolves({ role: 'member' }),
+      } as any);
+
+      await controller.updateUser(req, res, next);
+
+      expect(next.calledOnce).to.be.true;
+      expect(next.firstCall.args[0].statusCode).to.equal(403);
+    });
+
     it('lets an admin set hasLoggedIn on a user', async () => {
       const targetId = '507f1f77bcf86cd799439013';
       req.params.id = targetId;

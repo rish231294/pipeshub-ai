@@ -70,6 +70,14 @@ export function rowsToCsv(rows: string[][]): string {
 /** The byte order mark lets Excel read accented and non-Latin text as UTF-8. */
 const UTF8_BOM = '\uFEFF';
 
+/**
+ * Everything but letters, numbers and combining marks, so non-Latin headers
+ * keep their text while path separators, control characters and the
+ * characters Windows rejects (<>:"/\|?*) are dropped. Built at runtime because
+ * the es5 target rejects the `u` flag on a regex literal.
+ */
+const NON_FILENAME_CHARS = new RegExp('[^\\p{L}\\p{N}\\p{M}]+', 'gu');
+
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
@@ -79,14 +87,15 @@ function pad2(n: number): string {
  * header has nothing usable, so repeated downloads do not all land as `table.csv`.
  */
 export function tableCsvFileName(rows: string[][], now: Date = new Date()): string {
-  const slug = (rows[0]?.[0] ?? '')
+  const cleaned = (rows[0]?.[0] ?? '')
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
+    .normalize('NFC')
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 40)
-    .replace(/-+$/, '');
+    .replace(NON_FILENAME_CHARS, '-')
+    .replace(/^-+|-+$/g, '');
+  // By code point, so the cut never splits a surrogate pair.
+  const slug = Array.from(cleaned).slice(0, 40).join('').replace(/-+$/, '');
   const stamp =
     `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}` +
     `-${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`;

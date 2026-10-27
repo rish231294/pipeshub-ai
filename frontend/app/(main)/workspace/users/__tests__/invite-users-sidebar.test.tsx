@@ -219,7 +219,9 @@ describe('importing a file', () => {
     await waitFor(() => expect(useUsersStore.getState().inviteEmails.length).toBeGreaterThan(0));
     const listed = useUsersStore.getState().inviteEmails;
     expect(listed.find((t) => t.value === 'a@x.com')?.isValid).toBe(true);
-    expect(listed.filter((t) => t.value.includes('pipeshub.app')).every((t) => t.isValid === false)).toBe(true);
+    const fromFormula = listed.filter((t) => t.value.includes('user@example.com'));
+    expect(fromFormula.length).toBeGreaterThan(0);
+    expect(fromFormula.every((t) => t.isValid === false)).toBe(true);
     expect((sendButton() as HTMLButtonElement).disabled).toBe(true);
   });
 

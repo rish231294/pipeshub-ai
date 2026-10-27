@@ -765,6 +765,21 @@ export const useKnowledgeBaseStore = create<KnowledgeBaseStore>()(
           if (selection?.type === 'collection' && selection.id === nodeId) {
             selection.name = newName;
           }
+          // The sidebar trees also feed the duplicate-name check, which must see
+          // the new name even when the tree refresh after a rename fails.
+          const renameInTree = (tree: FolderTreeNode[]): void => {
+            for (const node of tree) {
+              if (node.id === nodeId) node.name = newName;
+              if (node.children?.length) renameInTree(node.children);
+            }
+          };
+          if (state.categorizedNodes) {
+            renameInTree(state.categorizedNodes.shared);
+            renameInTree(state.categorizedNodes.private);
+          }
+          for (const node of state.nodes) {
+            if (node.id === nodeId) node.name = newName;
+          }
         }),
 
       setIsLoadingTableData: (loading) =>

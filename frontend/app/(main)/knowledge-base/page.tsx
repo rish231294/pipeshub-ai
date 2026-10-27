@@ -2465,6 +2465,11 @@ function KnowledgeBasePageContent() {
           nodeType,
           rootKbId: selectedKbId,
         });
+      } else if (nodeType === 'record') {
+        await KnowledgeBaseApi.renameRecord(nodeId, newName);
+      } else {
+        // Without this, an unhandled breadcrumb type would report success with nothing saved.
+        throw new Error(`Cannot rename a ${nodeType} from the breadcrumb`);
       }
 
       toast.success('Renamed successfully', {

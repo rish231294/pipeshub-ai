@@ -14053,6 +14053,14 @@ describe('Enterprise Search Controller', () => {
         expect(resolveChatAttachmentMimeType({ mimetype: '', originalname: 'notes.MD' })).to.equal('text/markdown')
       })
 
+      it('should not resolve an extension that names an inherited object key', () => {
+        for (const name of ['file.constructor', 'file.toString', 'file.__proto__', 'file.hasOwnProperty']) {
+          expect(
+            resolveChatAttachmentMimeType({ mimetype: 'application/octet-stream', originalname: name }),
+          ).to.equal(null)
+        }
+      })
+
       it('should POST attachment payload to the AI backend and return its JSON', async () => {
         sinon.stub(AIServiceCommand.prototype, 'execute').callsFake(function (this: any) {
           expect(this.uri).to.equal('http://localhost:8000/api/v1/chat/attachments/upload')

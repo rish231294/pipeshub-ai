@@ -110,6 +110,7 @@ export function formatChatMode(chatMode?: string): string {
 interface ToolActivityPart {
   type?: string;
   toolName?: string;
+  status?: string;
   parts?: ToolActivityPart[];
 }
 
@@ -119,6 +120,8 @@ export type AnswerSearchSource = 'internal' | 'web' | 'internal_and_web';
 // toolsets the Internal search / Web search toggles turn on and off.
 const INTERNAL_SEARCH_TOOL = /^(retrieval|knowledgehub|knowledge_hub|knowledgegraph|knowledge_graph)([._]|$)/i;
 const WEB_SEARCH_TOOL = /(^|[._])(web_search|fetch_url)$/i;
+// A call refused by policy, still waiting on approval, or that failed fed nothing into the answer.
+const UNUSED_TOOL_STATUSES = new Set(['blocked', 'awaiting_approval', 'failed']);
 
 /**
  * Which search an assistant answer actually used, read from its tool calls.
@@ -129,7 +132,7 @@ export function answerSearchSource(parts?: ToolActivityPart[] | null): AnswerSea
   let web = false;
   const visit = (list: ToolActivityPart[] | undefined) => {
     for (const part of list ?? []) {
-      if (part.type === 'tool_call' && part.toolName) {
+      if (part.type === 'tool_call' && part.toolName && !UNUSED_TOOL_STATUSES.has(part.status ?? '')) {
         if (INTERNAL_SEARCH_TOOL.test(part.toolName)) internal = true;
         else if (WEB_SEARCH_TOOL.test(part.toolName)) web = true;
       }

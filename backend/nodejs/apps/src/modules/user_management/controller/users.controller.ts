@@ -1126,8 +1126,16 @@ export class UserController {
       // alone is not enough: it lets a member edit their own record).
       // After userExists, req.user is the target document but still carries JWT userId.
       const sentBody = req.body as Record<string, unknown>;
+      // First sign-in marks the user's own record as logged in with the user's
+      // own token (userAccount.controller); that one transition stays open, so
+      // only an admin can reset someone to "Pending".
+      const isSelfMarkedLoggedIn =
+        req.params.id === String(req.user.userId) && sentBody.hasLoggedIn === true;
       const adminOnlyFieldsSent = ADMIN_ONLY_FIELDS.filter(
-        (field) => field in sentBody && sentBody[field] !== undefined,
+        (field) =>
+          field in sentBody &&
+          sentBody[field] !== undefined &&
+          !(field === 'hasLoggedIn' && isSelfMarkedLoggedIn),
       );
       if (adminOnlyFieldsSent.length > 0) {
         const actorUserId = req.user.userId;

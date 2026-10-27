@@ -28,6 +28,19 @@ describe('answerSearchSource', () => {
     expect(answerSearchSource([call('retrieval.search'), call('fetch_url')])).toBe('internal_and_web');
   });
 
+  it('ignores search calls that never ran or failed', () => {
+    const withStatus = (toolName: string, status: string) => ({ type: 'tool_call', toolName, status });
+    expect(answerSearchSource([withStatus('web_search', 'blocked')])).toBeNull();
+    expect(answerSearchSource([withStatus('web_search', 'awaiting_approval')])).toBeNull();
+    expect(answerSearchSource([withStatus('fetch_url', 'failed')])).toBeNull();
+    expect(answerSearchSource([
+      withStatus('retrieval.search', 'completed'),
+      withStatus('web_search', 'blocked'),
+    ])).toBe('internal');
+    expect(answerSearchSource([withStatus('web_search', 'running'), withStatus('retrieval.search', 'completed')]))
+      .toBe('internal_and_web');
+  });
+
   it('is null when no search tool ran', () => {
     expect(answerSearchSource([call('jira.create_issue'), { type: 'text' }])).toBeNull();
     expect(answerSearchSource(undefined)).toBeNull();

@@ -57,7 +57,13 @@ vi.mock('../api', async () => {
 // triggers the crashing import-time hydration described above.
 const { useChatStore } = (await import('../store')) as unknown as { useChatStore: typeof UseChatStoreType };
 const { ChatApi } = (await import('../api')) as unknown as { ChatApi: typeof ChatApiType };
-const { cancelStreamForSlot, streamMessageForSlot, streamRegenerateForSlot, keepStreamedTextOnStoppedAnswer } = await import('../streaming');
+const {
+  cancelStreamForSlot,
+  streamMessageForSlot,
+  streamRegenerateForSlot,
+  keepStreamedTextOnStoppedAnswer,
+  trailingStoppedReplyId,
+} = await import('../streaming');
 const { streamSSERequest } = await import('@/lib/api');
 
 const SLOT_ID = 'slot-under-test';
@@ -731,6 +737,23 @@ describe('Stop keeps the streamed partial answer when the server saved it empty'
     expect((out[1].metadata?.custom as { citationMaps?: unknown }).citationMaps).toBe(maps);
   });
 
+  it('appends a row carrying the persisted reply id when history dropped the empty stopped reply', () => {
+    const out = keepStreamedTextOnStoppedAnswer([userRow], null, 'Partial', null, 'pending-1', 'b1');
+    expect(out).toHaveLength(2);
+    expect(out[1].id).toBe('pending-1');
+    expect((out[1].metadata?.custom as { messageId?: string }).messageId).toBe('b1');
+  });
+
+  it('finds the stopped reply that ends the latest turn of the raw history', () => {
+    const at = new Date().toISOString();
+    const row = (id: string, messageType: string, extra: Record<string, unknown> = {}) =>
+      ({ _id: id, messageType, content: '', contentFormat: 'MARKDOWN', citations: [], followUpQuestions: [], feedback: [], createdAt: at, updatedAt: at, ...extra }) as never;
+    expect(trailingStoppedReplyId([row('u1', 'user_query'), row('b1', 'bot_response', { status: 'stopped' })])).toBe('b1');
+    expect(trailingStoppedReplyId([row('u1', 'user_query'), row('b1', 'bot_response')])).toBeNull();
+    expect(trailingStoppedReplyId([row('b0', 'bot_response', { status: 'stopped' }), row('u1', 'user_query')])).toBeNull();
+    expect(trailingStoppedReplyId(undefined)).toBeNull();
+  });
+
   it('end to end: an empty final frame and an empty saved answer leave the partial on screen', async () => {
     type Cb = {
       onChunk?: (d: unknown) => void;
@@ -763,6 +786,60 @@ describe('Stop keeps the streamed partial answer when the server saved it empty'
     const last = slot?.messages[slot.messages.length - 1] as ThreadMessageLike;
     expect(last.content).toEqual([{ type: 'text', text: 'Partial answer' }]);
     expect((last.metadata?.custom as { status?: string }).status).toBe('stopped');
+    // Feedback, fork and regenerate render only with the persisted id.
+    expect((last.metadata?.custom as { messageId?: string }).messageId).toBe('b1');
     streamSpy.mockRestore();
+  });
+
+  it('end to end: a stopped regenerate whose empty reply history drops gets its own row, not the earlier answer', async () => {
+    type Cb = {
+      onChunk?: (d: unknown) => void;
+      onComplete?: (d: unknown) => Promise<void>;
+    };
+    let callbacks: Cb = {};
+    let release: () => void = () => {};
+    const regenSpy = vi.spyOn(ChatApi, 'streamRegenerate').mockImplementation(((_c: string, _m: string, cb: Cb) => {
+      callbacks = cb;
+      return new Promise<void>((resolve) => { release = resolve; });
+    }) as never);
+    const now = new Date().toISOString();
+    const raw = (id: string, messageType: string, content: string, extra: Record<string, unknown> = {}) =>
+      ({ _id: id, messageType, content, contentFormat: 'MARKDOWN', citations: [], followUpQuestions: [], feedback: [], createdAt: now, updatedAt: now, ...extra });
+    const fetchSpy = vi.spyOn(ChatApi, 'fetchConversation').mockResolvedValue({
+      conversation: { id: 'conv-1', title: 't' },
+      messages: [
+        raw('u0', 'user_query', 'first'),
+        raw('b0', 'bot_response', '', { status: 'stopped', parts: [{ type: 'text', text: 'x' }] }),
+        raw('u1', 'user_query', 'q'),
+        raw('b1', 'bot_response', '', { status: 'stopped' }),
+      ],
+      pagination: { page: 1, hasNextPage: false },
+    } as never);
+    const before: ThreadMessageLike[] = [
+      { role: 'user', id: 'u0', content: [{ type: 'text', text: 'first' }] },
+      { role: 'assistant', id: 'b0', content: [{ type: 'text', text: '' }], metadata: { custom: { messageId: 'b0', status: 'stopped' } } },
+      { role: 'user', id: 'u1', content: [{ type: 'text', text: 'q' }] },
+      { role: 'assistant', id: 'b1', content: [{ type: 'text', text: 'old answer' }], metadata: { custom: { messageId: 'b1' } } },
+    ];
+    seedSlot({ isStreaming: false, runId: null, messages: before });
+    const run = streamRegenerateForSlot(SLOT_ID, 'b1');
+    await vi.waitFor(() => expect(regenSpy).toHaveBeenCalled());
+
+    callbacks.onChunk?.({ chunk: 'Regenerated partial', accumulated: 'Regenerated partial', citations: [] });
+    cancelStreamForSlot(SLOT_ID);
+    await callbacks.onComplete?.({});
+    release();
+    await run;
+
+    const slot = useChatStore.getState().slots[SLOT_ID];
+    const rows = slot?.messages ?? [];
+    const last = rows[rows.length - 1] as ThreadMessageLike;
+    expect(last.id).toBe('b1');
+    expect(last.content).toEqual([{ type: 'text', text: 'Regenerated partial' }]);
+    expect((last.metadata?.custom as { messageId?: string }).messageId).toBe('b1');
+    const earlier = rows.find((m) => m.id === 'b0') as ThreadMessageLike;
+    expect(earlier.content).not.toEqual([{ type: 'text', text: 'Regenerated partial' }]);
+    regenSpy.mockRestore();
+    fetchSpy.mockRestore();
   });
 });

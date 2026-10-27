@@ -28795,7 +28795,7 @@ paths:
         GET can be sent unchanged.
 
         **Updatable fields:** `fullName`, `firstName`, `lastName`, `middleName`, `email`,
-        `designation`, `mobile`, `address`, `hasLoggedIn` (admins only), `role` (admins only).
+        `designation`, `mobile`, `address`, `hasLoggedIn` (admins only, except a user setting their own to `true`), `role` (admins only).
         `dataCollectionConsent` is
         accepted but not stored: the user record has no such field, so it never appears in the
         response.
@@ -28820,8 +28820,10 @@ paths:
         with `400` when the change would exceed 5 non-deleted admins (including pending
         admin invites). Demoting the last remaining admin is also rejected.
 
-        **Signed-in state:** Only org admins can set `hasLoggedIn`, even on their own record; a
-        member who sends it gets `403` (`Only admins can change whether a user has signed in`).
+        **Signed-in state:** Only org admins can set `hasLoggedIn`, with one exception: a user may
+        set their own to `true`, which first sign-in does with the user's own token. A member who
+        sends `false`, or any value for another user, gets `403` (`Only admins can change whether
+        a user has signed in`).
 
         **Authorization:** Admin can update any user's other fields; non-admin can only update
         themselves (`userAdminOrSelfCheck` middleware, `403` otherwise). The email rule
@@ -29027,8 +29029,8 @@ paths:
         '403':
           description: |
             A caller who is not an org admin sent `role`, even the role the user already has
-            (`Only admins can change user roles`), or sent `hasLoggedIn`
-            (`Only admins can change whether a user has signed in`).
+            (`Only admins can change user roles`), or sent `hasLoggedIn` other than `true` on
+            their own record (`Only admins can change whether a user has signed in`).
 
             Only the account owner can change its email address: the request's `email`
             differs from the stored address and the caller isn't that user. Checked after
@@ -29728,12 +29730,14 @@ paths:
                     type: string
                     format: email
                     maxLength: 254
-                    pattern: '^[^\s@"(),:;<>[\]\\`]+@(?:[\p{L}\p{N}-]+\.)+[\p{L}\p{N}-]{2,}$'
                   minItems: 1
                   description: |
                     Array of email addresses to invite. The validator only checks for strings; the
-                    pattern is the handler's check, which answers `400` `Invalid emails are found`.
-                    Surrounding whitespace is trimmed before either check.
+                    handler then refuses the whole request with `400` `Invalid emails are found` if
+                    any address has whitespace, `@`, `"`, `(`, `)`, `,`, `:`, `;`, `<`, `>`, `[`,
+                    `]`, `\` or a backtick in its local part, or a domain that is not dot-separated
+                    labels of Unicode letters, digits and `-` ending in a label of two or more
+                    characters. Surrounding whitespace is trimmed before either check.
                   example: ["user1@company.com", "user2@company.com"]
                 groupIds:
                   type: array
@@ -32196,9 +32200,9 @@ paths:
         **Observed behavior:**
         Returns `{ status, message, team }`. Node enriches member and `createdByUser` `profilePicture` when present.
 
-        Membership is not required: any user of the organization can read any of its teams,
-        members included. For a caller who is not an OWNER, `canEdit`, `canDelete` and
-        `canManageMembers` are `false`.
+        Only members of the team and org admins can read it; anyone else gets `404`, the same
+        answer as for a team that does not exist. For a caller who is neither an OWNER nor an org
+        admin, `canEdit`, `canDelete` and `canManageMembers` are `false`.
 
         Service accounts among the members are left out for a caller who does
         not administer the organisation, and `memberCount` leaves them out too.
@@ -32577,9 +32581,9 @@ paths:
         **Observed behavior:**
         Returns `{ status, message, team, pagination }` where `pagination` includes `totalCount`, `hasNextPage`, and `hasPrevPage`. Node enriches member `profilePicture` on the nested `team` object.
 
-        Membership is not required: any user of the organization can list the members of any of
-        its teams. For a caller who is not an OWNER, `canEdit`, `canDelete` and
-        `canManageMembers` are `false`. Query parameters not listed here are dropped by the
+        Only members of the team and org admins can list its members; anyone else gets `404`, the
+        same answer as for a team that does not exist. For a caller who is neither an OWNER nor an
+        org admin, `canEdit`, `canDelete` and `canManageMembers` are `false`. Query parameters not listed here are dropped by the
         gateway. A fractional `page` or `limit` (`1.5`) passes the gateway and is refused by the
         service with `422`.
 
@@ -32666,7 +32670,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: No team of this organization has this id ("Team not found").
+          description: |
+            No team of this organization has this id, or the caller is not a member of it and is
+            not an org admin (both answer alike, so team ids cannot be probed).
           content:
             application/json:
               schema:

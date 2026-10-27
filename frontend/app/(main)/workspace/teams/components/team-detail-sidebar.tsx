@@ -65,6 +65,12 @@ export function TeamDetailSidebar({
   const [isDeleting, setIsDeleting] = useState(false);
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
   const nestedModalHost = useWorkspaceDrawerNestedModalHost(isDetailPanelOpen);
+
+  // The store closes the panel (browser Back, another team) without touching
+  // this local flag, which would otherwise reopen the dialog on the next open.
+  useEffect(() => {
+    if (!isDetailPanelOpen) setIsDeleteConfirmOpen(false);
+  }, [isDetailPanelOpen]);
   const [addMemberRole, setAddMemberRole] = useState<TeamMemberRole>('READER');
   // Pending per-member role updates (Mongo userId; applied on Save as updateUserRoles)
   const [pendingUpdateRoles, setPendingUpdateRoles] = useState<Map<string, TeamMemberRole>>(

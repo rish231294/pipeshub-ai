@@ -312,6 +312,27 @@ describe('applyNodeRename', () => {
     expect(store().allRecordsSidebarSelection).toEqual({ type: 'collection', id: 'kb1', name: 'New' });
   });
 
+  it('renames the collection in the sidebar trees the duplicate-name check reads', () => {
+    const tree = (id: string, name: string, children: unknown[] = []) =>
+      ({ id, name, children, nodeType: 'app', hasChildren: children.length > 0, isExpanded: false, depth: 0, parentId: null });
+    useKnowledgeBaseStore.setState({
+      categorizedNodes: {
+        shared: [tree('kbS', 'Shared')],
+        private: [tree('kb1', 'Old', [tree('f1', 'Folder')])],
+      } as never,
+      nodes: [node('kb1', { name: 'Old' })],
+    });
+
+    store().applyNodeRename('kb1', 'New');
+    store().applyNodeRename('f1', 'Folder 2');
+
+    const cat = store().categorizedNodes;
+    expect(cat?.private[0]?.name).toBe('New');
+    expect(cat?.private[0]?.children[0]?.name).toBe('Folder 2');
+    expect(cat?.shared[0]?.name).toBe('Shared');
+    expect(store().nodes[0]?.name).toBe('New');
+  });
+
   it('leaves everything alone when nothing open has that id', () => {
     store().setTableData({ currentNode: { id: 'kb2', name: 'Other', nodeType: 'app' }, items: [] } as never);
     store().applyNodeRename('kb1', 'New');

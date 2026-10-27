@@ -154,6 +154,23 @@ describe('tableCsvFileName', () => {
     expect(tableCsvFileName([['Café / Prix (€)']], at)).toBe('cafe-prix-20261027-090507.csv');
   });
 
+  it('keeps non-Latin headers', () => {
+    expect(tableCsvFileName([['姓名']], at)).toBe('姓名-20261027-090507.csv');
+    expect(tableCsvFileName([['売上 (円)']], at)).toBe('売上-円-20261027-090507.csv');
+    expect(tableCsvFileName([['Выручка']], at)).toBe('выручка-20261027-090507.csv');
+    expect(tableCsvFileName([['हिन्दी']], at)).toBe('हिन्दी-20261027-090507.csv');
+  });
+
+  it('drops path separators, control characters and characters Windows rejects', () => {
+    expect(tableCsvFileName([['a/b\\c:d*e?f"g<h>i|j\u0007k']], at)).toBe('a-b-c-d-e-f-g-h-i-j-k-20261027-090507.csv');
+    expect(tableCsvFileName([['../../売上']], at)).toBe('売上-20261027-090507.csv');
+  });
+
+  it('cuts a long header by character, not code unit', () => {
+    const name = tableCsvFileName([['𝒜'.repeat(50)]], at);
+    expect(name).toBe(`${'a'.repeat(40)}-20261027-090507.csv`);
+  });
+
   it('falls back to table- when the header has nothing usable', () => {
     expect(tableCsvFileName([['#'], ['1']], at)).toBe('table-20261027-090507.csv');
     expect(tableCsvFileName([], at)).toBe('table-20261027-090507.csv');

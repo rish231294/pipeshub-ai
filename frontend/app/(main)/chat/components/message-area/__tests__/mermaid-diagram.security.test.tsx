@@ -16,6 +16,7 @@ import {
   makeSvgResponsive,
   parseSvgNaturalSize,
   pngExportScale,
+  zoomOutPercent,
 } from '../mermaid-diagram';
 
 afterEach(() => {
@@ -61,11 +62,29 @@ describe('MermaidDiagram sizing', () => {
     expect(fitZoomPercent(1200, 300, 1000, 600)).toBe(100);
   });
 
+  it('fits a very tall diagram below the zoom-out floor, down to 1%', () => {
+    expect(fitZoomPercent(190, 10_000, 1000, 600)).toBe(1);
+    expect(fitZoomPercent(10, 1_000_000, 1000, 600)).toBe(1);
+  });
+
+  it('zooms out to the 5% floor without jumping up from a smaller fit', () => {
+    expect(zoomOutPercent(100)).toBe(75);
+    expect(zoomOutPercent(20)).toBe(5);
+    expect(zoomOutPercent(5)).toBe(5);
+    expect(zoomOutPercent(2)).toBe(2);
+  });
+
   it('exports PNGs at 2x at least and enlarges small diagrams', () => {
     expect(pngExportScale(1600, 1200, 1)).toBe(2);
     expect(pngExportScale(1600, 1200, 3)).toBe(3);
     expect(pngExportScale(190, 694, 1)).toBeCloseTo(2000 / 694);
     expect(pngExportScale(5000, 5000, 1)).toBeLessThanOrEqual(8000 / 5000);
+  });
+
+  it('scales a diagram larger than the PNG cap below 1x', () => {
+    expect(pngExportScale(20_000, 20_000, 1)).toBeCloseTo(0.4);
+    expect(pngExportScale(400, 16_000, 2)).toBeCloseTo(0.5);
+    expect(Math.max(20_000, 20_000) * pngExportScale(20_000, 20_000, 3)).toBeLessThanOrEqual(8000);
   });
 });
 

@@ -54,6 +54,7 @@ import {
   type MessagePart,
   type ChatKnowledgeFilters,
   type AttachmentRef,
+  type ConversationMessage,
 } from './types';
 import {
   buildCitationMapsFromStreaming,
@@ -287,9 +288,24 @@ function buildStoppedMessages(
 }
 
 /**
+ * `_id` of the stopped reply that ends the latest turn of a raw history page,
+ * which `loadHistoricalMessages` drops when it was saved empty.
+ */
+export function trailingStoppedReplyId(raw: ConversationMessage[] | null | undefined): string | null {
+  for (let i = (raw?.length ?? 0) - 1; i >= 0; i--) {
+    const msg = raw![i];
+    if (msg.messageType === 'user_query') return null;
+    if (msg.messageType === 'bot_response') return msg.status === 'stopped' ? String(msg._id) : null;
+  }
+  return null;
+}
+
+/**
  * A stopped run can come back from the server with an empty answer even
  * though text was on screen (older query services saved "" on cancel). Fills
  * the stopped row from what streamed so Stop never blanks the answer.
+ * `appendMessageId` is the persisted reply's `_id`; feedback, fork and
+ * regenerate need it on an appended row.
  */
 export function keepStreamedTextOnStoppedAnswer(
   messages: ThreadMessageLike[],
@@ -297,6 +313,7 @@ export function keepStreamedTextOnStoppedAnswer(
   rawStreamedText: string,
   citationMaps: CitationMaps | null | undefined,
   appendId?: string | null,
+  appendMessageId?: string | null,
 ): ThreadMessageLike[] {
   const text = stripAnswerMarkers(rawStreamedText ?? '').trim();
   if (!text) return messages;
@@ -310,7 +327,13 @@ export function keepStreamedTextOnStoppedAnswer(
         id: appendId,
         role: 'assistant' as const,
         content: [{ type: 'text' as const, text }],
-        metadata: { custom: { status: 'stopped' as const, ...(citationMaps ? { citationMaps } : {}) } },
+        metadata: {
+          custom: {
+            status: 'stopped' as const,
+            ...(appendMessageId ? { messageId: appendMessageId } : {}),
+            ...(citationMaps ? { citationMaps } : {}),
+          },
+        },
       },
     ];
   }
@@ -369,17 +392,25 @@ function stampPendingCardOnMessages(
   return next;
 }
 
-function assistantRowIdForBackendMessage(
+function exactAssistantRowIdForBackendMessage(
   messages: ThreadMessageLike[],
   backendMessageId: string,
-): string {
+): string | null {
   const row = messages.find((m) => {
     if (m.role !== 'assistant') return false;
     if (m.id === backendMessageId) return true;
     const custom = m.metadata?.custom as { messageId?: string } | undefined;
     return custom?.messageId === backendMessageId;
   });
-  if (row && typeof row.id === 'string') return row.id;
+  return row && typeof row.id === 'string' ? row.id : null;
+}
+
+function assistantRowIdForBackendMessage(
+  messages: ThreadMessageLike[],
+  backendMessageId: string,
+): string {
+  const exact = exactAssistantRowIdForBackendMessage(messages, backendMessageId);
+  if (exact) return exact;
   const last = [...messages].reverse().find((m) => m.role === 'assistant');
   return last && typeof last.id === 'string' ? last.id : backendMessageId;
 }
@@ -1346,6 +1377,7 @@ export async function streamMessageForSlot(
               accumulatedContent,
               pendingCitationMaps ?? slotBeforeComplete?.streamingCitationMaps,
               pendingAssistantId,
+              trailingStoppedReplyId(data.conversation.messages),
             )
           : historical.messages;
         const liveParts = slotBeforeComplete?.streamingParts ?? [];
@@ -1936,15 +1968,31 @@ export async function streamRegenerateForSlot(
         const pendingBefore = useChatStore.getState().slots[slotId]?.pendingAskUserQuestion;
         const historical = loadHistoricalMessages(detail.messages);
         const { unansweredAskUserQuestion } = historical;
-        const regenRowId = assistantRowIdForBackendMessage(historical.messages, messageId);
-        const loadedMessages = wasStopped
-          ? keepStreamedTextOnStoppedAnswer(
-              historical.messages,
-              regenRowId,
-              accumulatedContent,
-              pendingCitationMaps ?? useChatStore.getState().slots[slotId]?.streamingCitationMaps,
-            )
-          : historical.messages;
+        const exactRegenRowId = exactAssistantRowIdForBackendMessage(historical.messages, messageId);
+        const stoppedMaps = pendingCitationMaps ?? useChatStore.getState().slots[slotId]?.streamingCitationMaps;
+        // History drops a regenerated reply that was stopped before any text was saved. The
+        // nearest-row fallback would then point at an earlier answer, so the partial gets a row
+        // of its own under the regenerated message's id instead.
+        const stoppedRegenRowMissing = wasStopped && !exactRegenRowId;
+        const regenRowId = exactRegenRowId
+          ?? (stoppedRegenRowMissing
+            ? messageId
+            : assistantRowIdForBackendMessage(historical.messages, messageId));
+        let loadedMessages = historical.messages;
+        if (wasStopped && exactRegenRowId) {
+          loadedMessages = keepStreamedTextOnStoppedAnswer(
+            historical.messages, exactRegenRowId, accumulatedContent, stoppedMaps,
+          );
+        } else if (stoppedRegenRowMissing && historical.messages[historical.messages.length - 1]?.role === 'user') {
+          loadedMessages = keepStreamedTextOnStoppedAnswer(
+            historical.messages,
+            null,
+            accumulatedContent,
+            stoppedMaps,
+            messageId,
+            trailingStoppedReplyId(detail.messages) ?? messageId,
+          );
+        }
         const finalMessages = pendingBefore?.payload
           ? stampPendingCardOnMessages(loadedMessages, {
               ...pendingBefore,
