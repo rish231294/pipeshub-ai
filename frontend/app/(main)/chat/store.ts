@@ -52,6 +52,23 @@ function lsGetAgentCapabilities(agentId?: string): AgentCapabilities {
   }
 }
 
+/**
+ * Key under which a project chat keeps its own "+" menu capabilities, beside
+ * the per-agent ones. Project chats used to send the global setting, so
+ * turning Internal search off anywhere stopped them reading the project's files.
+ */
+export function projectCapabilitiesKey(projectId: string): string {
+  return `project:${projectId}`;
+}
+
+/** The capabilities a project chat sends: its own choice, else everything on. */
+export function projectAgentCapabilities(
+  scoped: Record<string, AgentCapabilities>,
+  projectId: string,
+): AgentCapabilities {
+  return scoped[projectCapabilitiesKey(projectId)] ?? { ...DEFAULT_AGENT_CAPABILITIES };
+}
+
 function lsSetAgentCapabilities(caps: AgentCapabilities, agentId?: string): void {
   if (typeof window === 'undefined') return;
   try {

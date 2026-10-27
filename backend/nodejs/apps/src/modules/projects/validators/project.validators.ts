@@ -133,13 +133,37 @@ const appliedFiltersSchema = z
   })
   .optional();
 
+/**
+ * Zod's `max` counts code points, but the Mongo schema's `maxlength` (and the
+ * browser's `maxLength`) count UTF-16 units, so text with emoji near the limit
+ * passed here and then failed the save with a 500. Count the way the schema does.
+ */
+function maxUtf16(max: number): (value: string, ctx: z.RefinementCtx) => void {
+  return (value, ctx) => {
+    if (value.length > max) {
+      ctx.addIssue({
+        code: 'too_big',
+        origin: 'string',
+        maximum: max,
+        inclusive: true,
+        input: value,
+      });
+    }
+  };
+}
+
 const projectBodyFieldsSchema = {
   name: z
     .string()
     .trim()
     .min(1, { message: 'Project name is required' })
-    .max(PROJECT_NAME_MAX_LENGTH),
-  description: z.string().max(PROJECT_DESCRIPTION_MAX_LENGTH).optional(),
+    .max(PROJECT_NAME_MAX_LENGTH)
+    .superRefine(maxUtf16(PROJECT_NAME_MAX_LENGTH)),
+  description: z
+    .string()
+    .max(PROJECT_DESCRIPTION_MAX_LENGTH)
+    .superRefine(maxUtf16(PROJECT_DESCRIPTION_MAX_LENGTH))
+    .optional(),
   icon: z.string().max(100).optional(),
   color: z
     .string()
@@ -148,7 +172,11 @@ const projectBodyFieldsSchema = {
       message: 'Color must be a hex code, a CSS color name or a theme variable',
     })
     .optional(),
-  instructions: z.string().max(PROJECT_INSTRUCTIONS_MAX_LENGTH).optional(),
+  instructions: z
+    .string()
+    .max(PROJECT_INSTRUCTIONS_MAX_LENGTH)
+    .superRefine(maxUtf16(PROJECT_INSTRUCTIONS_MAX_LENGTH))
+    .optional(),
   knowledgeScope: knowledgeScopeSchema,
   appliedFilters: appliedFiltersSchema,
   tools: toolsSchema,
@@ -226,6 +254,22 @@ export const upsertProjectMembersSchema = z.object({
       .min(1, { message: 'At least one member is required' })
       .max(PROJECT_MEMBERS_BATCH_MAX, {
         message: `At most ${PROJECT_MEMBERS_BATCH_MAX} members may be updated per request`,
+      })
+      // Two rows for one principal used to save whichever came last, silently.
+      .superRefine((members, ctx) => {
+        const seen = new Set<string>();
+        members.forEach((member, index) => {
+          const key = `${member.principalType ?? 'user'}:${member.principalId}`;
+          if (seen.has(key)) {
+            ctx.addIssue({
+              code: 'custom',
+              path: [index, 'principalId'],
+              message: 'Each member may appear only once per request',
+              input: member.principalId,
+            });
+          }
+          seen.add(key);
+        });
       }),
   }),
 });

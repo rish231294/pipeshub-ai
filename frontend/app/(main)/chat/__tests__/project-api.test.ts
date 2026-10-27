@@ -71,6 +71,12 @@ describe('ProjectApi.get / create / update / remove', () => {
     expect(result).toEqual(project);
   });
 
+  it('get() can leave the error to the caller instead of the client toast', async () => {
+    mockedGet.mockResolvedValueOnce({ data: { project: { _id: 'p1' } } });
+    await ProjectApi.get('p1', { suppressErrorToast: true });
+    expect(mockedGet).toHaveBeenCalledWith('/api/v1/projects/p1', { suppressErrorToast: true });
+  });
+
   it('create() posts the input and unwraps { project }', async () => {
     const project = { _id: 'p1', name: 'Q3' };
     mockedPost.mockResolvedValueOnce({ data: { project } });

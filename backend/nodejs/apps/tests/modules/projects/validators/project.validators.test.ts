@@ -58,6 +58,36 @@ describe('projects/validators/project.validators', () => {
       expect(result.success).to.equal(true)
     })
 
+    // The Mongo schema counts UTF-16 units; a name that passed here as 100
+    // code points used to fail the save with a 500.
+    it('counts an emoji as two characters, as the database does', () => {
+      const overByEmoji = createProjectSchema.safeParse({
+        body: { name: 'a'.repeat(PROJECT_NAME_MAX_LENGTH - 1) + '\u{1F680}' },
+      })
+      expect(overByEmoji.success).to.equal(false)
+      expect(overByEmoji.error!.issues[0].code).to.equal('too_big')
+
+      const exactlyFull = createProjectSchema.safeParse({
+        body: { name: '\u{1F680}'.repeat(PROJECT_NAME_MAX_LENGTH / 2) },
+      })
+      expect(exactlyFull.success).to.equal(true)
+    })
+
+    it('counts emoji the same way in description and instructions', () => {
+      expect(
+        createProjectSchema.safeParse({ body: { name: 'x', description: '\u{1F680}'.repeat(501) } }).success,
+      ).to.equal(false)
+      expect(
+        createProjectSchema.safeParse({ body: { name: 'x', instructions: '\u{1F680}'.repeat(4001) } }).success,
+      ).to.equal(false)
+      expect(
+        updateProjectSchema.safeParse({
+          params: { projectId: VALID_OID },
+          body: { name: '\u{1F680}'.repeat(51) },
+        }).success,
+      ).to.equal(false)
+    })
+
     it('accepts optional description/icon/color/instructions/knowledgeScope/appliedFilters', () => {
       const result = createProjectSchema.safeParse({
         body: {
@@ -373,6 +403,33 @@ describe('projects/validators/project.validators', () => {
       const result = upsertProjectMembersSchema.safeParse({
         params: { projectId: VALID_OID },
         body: { members: [{ principalId: VALID_OID, role: 'viewer' }] },
+      })
+      expect(result.success).to.equal(true)
+    })
+
+    it('rejects the same member twice in one request, pointing at the repeat', () => {
+      const result = upsertProjectMembersSchema.safeParse({
+        params: { projectId: VALID_OID },
+        body: {
+          members: [
+            { principalId: VALID_OID, role: 'viewer' },
+            { principalId: VALID_OID, principalType: 'user', role: 'editor' },
+          ],
+        },
+      })
+      expect(result.success).to.equal(false)
+      expect(result.error!.issues[0].path).to.deep.equal(['body', 'members', 1, 'principalId'])
+    })
+
+    it('treats a user and a team with different ids as different members', () => {
+      const result = upsertProjectMembersSchema.safeParse({
+        params: { projectId: VALID_OID },
+        body: {
+          members: [
+            { principalId: VALID_OID, role: 'viewer' },
+            { principalId: '11111111-2222-4333-8444-555555555555', principalType: 'team', role: 'viewer' },
+          ],
+        },
       })
       expect(result.success).to.equal(true)
     })

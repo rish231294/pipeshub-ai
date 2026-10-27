@@ -251,6 +251,14 @@ tags:
       member's private chats. See `Conversations` for the two fields
       (`projectId`, `projectVisibility`) that link a conversation to a
       project.
+
+      Projects are a Labs feature. While an admin has **Enable Projects**
+      turned off, every `/projects` route answers `403`, as do starting a
+      chat with a `projectId` and moving a chat into a project; an existing
+      project chat keeps answering, without its project's context.
+
+      Name, description and instruction lengths count UTF-16 code units, the
+      way a browser's `maxLength` does, so an emoji counts as two characters.
   - name: Code Graph
     description: Code repositories indexed into a navigable code graph, and each one's graph status
   - name: Semantic Search
@@ -46591,8 +46599,9 @@ paths:
             `projectId` is not a 24-character hex id or the body failed validation
             (`VALIDATION_ERROR`): `members` missing, empty or longer than 50, a `principalId`
             missing, not a 24-character hex id for a user or not a team id (UUID or
-            `all_<orgId>`) for a team, a `role` other than `viewer`/`editor`, or a
-            `principalType` other than `user`/`team`. Also `HTTP_BAD_REQUEST` with
+            `all_<orgId>`) for a team, a `role` other than `viewer`/`editor`, a
+            `principalType` other than `user`/`team`, or the same member listed twice
+            ("Each member may appear only once per request"). Also `HTTP_BAD_REQUEST` with
             `User not found: <id>` when a user principal is not a live user of this org,
             or `Team not found: <id>` when a team principal is not a team in its graph;
             this check runs before the project is looked up.

@@ -17,6 +17,7 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../../../src/libs/errors/http.errors'
+import { ProjectsFeature } from '../../../../src/modules/projects/utils/projects-feature'
 
 const NO_TEAMS = { resolveTeamIds: async () => [] as string[] }
 
@@ -339,6 +340,18 @@ describe('project-context', () => {
   // resolveProjectLink
   // -----------------------------------------------------------------------
   describe('resolveProjectLink', () => {
+    it('refuses a new project chat while Projects is turned off, before any access check', async () => {
+      sinon.stub(ProjectsFeature, 'isEnabled').resolves(false)
+      const accessStub = sinon.stub(ProjectService, 'assertAccess')
+      try {
+        await resolveProjectLink(ORG_ID, USER_ID, { projectId: PROJECT_ID })
+        expect.fail('expected ForbiddenError')
+      } catch (error) {
+        expect(error).to.be.instanceOf(ForbiddenError)
+      }
+      expect(accessStub.called).to.equal(false)
+    })
+
     it('returns {} when the body has no projectId', async () => {
       const result = await resolveProjectLink(ORG_ID, USER_ID, {})
       expect(result).to.deep.equal({})
@@ -435,6 +448,18 @@ describe('project-context', () => {
   // loadProjectForSession
   // -----------------------------------------------------------------------
   describe('loadProjectForSession', () => {
+    it('runs a follow-up without project context while Projects is turned off, keeping the link', async () => {
+      sinon.stub(ProjectsFeature, 'isEnabled').resolves(false)
+      const accessStub = sinon.stub(ProjectService, 'assertAccess')
+      const updateStub = sinon.stub(ChatSession, 'updateOne')
+      const result = await loadProjectForSession(ORG_ID, USER_ID, PROJECT_ID, {
+        conversationId: new mongoose.Types.ObjectId(),
+      })
+      expect(result).to.be.undefined
+      expect(accessStub.called).to.equal(false)
+      expect(updateStub.called).to.equal(false)
+    })
+
     it('returns undefined when projectId is undefined', async () => {
       const result = await loadProjectForSession(ORG_ID, USER_ID, undefined)
       expect(result).to.be.undefined

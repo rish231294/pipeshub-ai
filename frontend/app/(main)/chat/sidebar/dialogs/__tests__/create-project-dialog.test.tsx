@@ -35,8 +35,10 @@ describe('CreateProjectDialog', () => {
       </Theme>,
     );
     const name = screen.getByLabelText('Name');
-    const errorSlot = document.getElementById(name.getAttribute('aria-describedby') ?? '');
+    const [errorId, countId] = (name.getAttribute('aria-describedby') ?? '').split(' ');
+    const errorSlot = document.getElementById(errorId);
     expect(errorSlot?.style.visibility).toBe('hidden');
+    expect(document.getElementById(countId)?.textContent).toContain('100');
 
     fireEvent.click(screen.getByRole('button', { name: 'Create project' }));
     expect(screen.getByRole('alert').textContent).toBe('Name is required');

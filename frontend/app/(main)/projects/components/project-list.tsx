@@ -530,6 +530,7 @@ export function ProjectList() {
         onOpenChange={(open) => !open && setPendingDelete(null)}
         onConfirm={confirmDelete}
         isDeleting={pendingDelete !== null && busyId === pendingDelete._id}
+        projectName={pendingDelete?.name}
       />
 
       <LeaveProjectDialog

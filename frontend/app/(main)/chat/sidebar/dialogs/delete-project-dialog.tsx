@@ -9,6 +9,8 @@ interface DeleteProjectDialogProps {
   onOpenChange: (open: boolean) => void;
   onConfirm: () => Promise<void>;
   isDeleting?: boolean;
+  /** Shown under the title so the owner can see which project goes. */
+  projectName?: string;
 }
 
 /**
@@ -21,6 +23,7 @@ export function DeleteProjectDialog({
   onOpenChange,
   onConfirm,
   isDeleting = false,
+  projectName,
 }: DeleteProjectDialogProps) {
   const { t } = useTranslation();
 
@@ -31,9 +34,16 @@ export function DeleteProjectDialog({
           <Dialog.Title>{t('chat.projects.deleteDialog.title')}</Dialog.Title>
         </VisuallyHidden>
         <Flex direction="column" gap="4">
-          <Text size="4" weight="bold" style={{ color: 'var(--olive-12)' }}>
-            {t('chat.projects.deleteDialog.title')}
-          </Text>
+          <Flex direction="column" gap="1">
+            <Text size="4" weight="bold" style={{ color: 'var(--olive-12)' }}>
+              {t('chat.projects.deleteDialog.title')}
+            </Text>
+            {projectName ? (
+              <Text size="2" weight="medium" style={{ color: 'var(--olive-12)', overflowWrap: 'anywhere' }}>
+                {projectName}
+              </Text>
+            ) : null}
+          </Flex>
           <Text as="p" size="2" style={{ color: 'var(--slate-11)' }}>
             {t('chat.projects.deleteDialog.description')}
           </Text>

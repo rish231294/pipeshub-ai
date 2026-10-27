@@ -40,6 +40,7 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: CreatePro
   const fieldId = useId();
   const nameId = `${fieldId}-name`;
   const nameErrorId = `${fieldId}-name-error`;
+  const nameCountId = `${fieldId}-name-count`;
   const descriptionId = `${fieldId}-description`;
   const descriptionCountId = `${fieldId}-description-count`;
   const instructionsId = `${fieldId}-instructions`;
@@ -129,6 +130,7 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: CreatePro
             label={t('chat.projects.createDialog.nameLabel')}
             error={nameError ? t('chat.projects.createDialog.nameRequired') : null}
             errorId={nameErrorId}
+            counter={<CharCount id={nameCountId} length={name.length} max={PROJECT_NAME_MAX} />}
           >
             <TextField.Root
               id={nameId}
@@ -144,7 +146,7 @@ export function CreateProjectDialog({ open, onOpenChange, onCreated }: CreatePro
               required
               maxLength={PROJECT_NAME_MAX}
               aria-invalid={nameError || undefined}
-              aria-describedby={nameErrorId}
+              aria-describedby={`${nameErrorId} ${nameCountId}`}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) void handleCreate();
               }}

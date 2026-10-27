@@ -22,6 +22,7 @@ export function EditProjectDialog({ open, onOpenChange, project, onSaved }: Edit
   const fieldId = useId();
   const nameId = `${fieldId}-name`;
   const nameErrorId = `${fieldId}-name-error`;
+  const nameCountId = `${fieldId}-name-count`;
   const descriptionId = `${fieldId}-description`;
   const descriptionCountId = `${fieldId}-description-count`;
   const [name, setName] = useState(project.name);
@@ -75,6 +76,7 @@ export function EditProjectDialog({ open, onOpenChange, project, onSaved }: Edit
             label={t('chat.projects.createDialog.nameLabel')}
             error={nameError ? t('chat.projects.createDialog.nameRequired') : null}
             errorId={nameErrorId}
+            counter={<CharCount id={nameCountId} length={name.length} max={PROJECT_NAME_MAX} />}
           >
             <TextField.Root
               id={nameId}
@@ -84,7 +86,7 @@ export function EditProjectDialog({ open, onOpenChange, project, onSaved }: Edit
               disabled={saving}
               autoFocus
               aria-invalid={nameError || undefined}
-              aria-describedby={nameErrorId}
+              aria-describedby={`${nameErrorId} ${nameCountId}`}
               onChange={(e) => {
                 setName(e.target.value);
                 if (nameError) setNameError(false);

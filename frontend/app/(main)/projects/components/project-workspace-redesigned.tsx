@@ -681,13 +681,15 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
                 label={t('chat.projects.workspace.suggestPlanWork', { defaultValue: 'Plan a piece of work' })}
                 onClick={() => handleSuggestionClick('plan')}
               />
-              <SuggestionPill
-                icon="sync_alt"
-                label={t('chat.projects.workspace.suggestWriteInstructions', {
-                  defaultValue: 'Write the project instructions',
-                })}
-                onClick={() => handleSuggestionClick('instructions')}
-              />
+              {canEdit && (
+                <SuggestionPill
+                  icon="sync_alt"
+                  label={t('chat.projects.workspace.suggestWriteInstructions', {
+                    defaultValue: 'Write the project instructions',
+                  })}
+                  onClick={() => handleSuggestionClick('instructions')}
+                />
+              )}
             </Flex>
           </Box>
           {!stacked && <Box style={{ flex: 6, minHeight: 0 }} />}
@@ -757,6 +759,7 @@ export function ProjectWorkspaceRedesigned({ projectId }: ProjectWorkspaceRedesi
         onOpenChange={setDeleteDialogOpen}
         onConfirm={handleConfirmDelete}
         isDeleting={isDeleting}
+        projectName={project.name}
       />
     </Flex>
   );

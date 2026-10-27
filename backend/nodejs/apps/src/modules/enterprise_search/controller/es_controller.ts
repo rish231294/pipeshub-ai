@@ -170,6 +170,7 @@ import {
 import { ArtifactCopier, ArtifactCopyOutcome } from '../utils/fork-artifacts';
 import { executeConnectorCommand } from '../../tokens_manager/utils/connector.utils';
 import { resolveCallerTeamIds } from '../../projects/utils/team-membership';
+import { ProjectsFeature } from '../../projects/utils/projects-feature';
 import { ProjectService } from '../../projects/services/project.service';
 import {
   assignAgentCapabilitiesToPayload,
@@ -3277,6 +3278,7 @@ export const setConversationProject = async (
     if (projectId === null) {
       update = { $unset: { projectId: '', projectVisibility: '' } };
     } else {
+      await ProjectsFeature.assertEnabled();
       const { project } = await ProjectService.assertAccess(
         orgId,
         userId,

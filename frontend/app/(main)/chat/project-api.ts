@@ -58,10 +58,11 @@ export const ProjectApi = {
     return data;
   },
 
-  async get(projectId: string): Promise<ProjectDetail> {
-    const { data } = await apiClient.get<{ project: ProjectDetail }>(
-      `${PROJECTS_BASE_URL}/${encodeURIComponent(projectId)}`,
-    );
+  async get(projectId: string, options: { suppressErrorToast?: boolean } = {}): Promise<ProjectDetail> {
+    const url = `${PROJECTS_BASE_URL}/${encodeURIComponent(projectId)}`;
+    const { data } = options.suppressErrorToast
+      ? await apiClient.get<{ project: ProjectDetail }>(url, { suppressErrorToast: true })
+      : await apiClient.get<{ project: ProjectDetail }>(url);
     return data.project;
   },
 
@@ -116,10 +117,14 @@ export const ProjectApi = {
   async listConversations(
     projectId: string,
     params: { page?: number; limit?: number } = {},
+    options: { suppressErrorToast?: boolean } = {},
   ): Promise<ProjectConversationsResult> {
     const { data } = await apiClient.get<ProjectConversationsResult>(
       `${PROJECTS_BASE_URL}/${encodeURIComponent(projectId)}/conversations`,
-      { params: { page: params.page ?? 1, limit: params.limit ?? 20 } },
+      {
+        params: { page: params.page ?? 1, limit: params.limit ?? 20 },
+        ...(options.suppressErrorToast ? { suppressErrorToast: true } : {}),
+      },
     );
     return data;
   },

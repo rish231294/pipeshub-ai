@@ -30,11 +30,14 @@ import {
   updateProject,
   upsertProjectMembers,
 } from '../controller/project.controller';
+import { requireProjectsEnabled } from '../utils/projects-feature';
 
 export function createProjectsRouter(container: Container): Router {
   const router = Router();
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
   const appConfig = container.get<AppConfig>('AppConfig');
+
+  router.use(requireProjectsEnabled);
 
   router.post(
     '/',

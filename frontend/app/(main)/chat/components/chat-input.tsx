@@ -37,6 +37,7 @@ import {
   ctxKeyFromAgent,
   isModelReasoningCapable,
   getModelDefaultReasoningEffort,
+  projectCapabilitiesKey,
 } from '@/chat/store';
 import { useIsMobile } from '@/lib/hooks/use-is-mobile';
 import { touchTarget, TOUCH_TARGET_PX } from '@/app/components/ui/responsive';
@@ -430,6 +431,10 @@ export function ChatInput({
   const setProjectKnowledgeScope = useChatStore((s) => s.setProjectKnowledgeScope);
   const projectStreamToolsSel = useChatStore((s) => s.projectStreamTools);
   const isProjectChat = !isAgentChat && projectScope !== null;
+  const projectCapsKey = isProjectChat && projectScope ? projectCapabilitiesKey(projectScope.projectId) : null;
+  const projectCaps = useChatStore((s) =>
+    projectCapsKey ? s.scopedAgentCapabilities[projectCapsKey] : undefined
+  );
   // An agent's or project's sources can't be searched in one request, so @ offers nothing there.
   // Editing or regenerating re-asks with the filters the question was first sent with.
   const mentionsOff = isAgentChat || isProjectChat || isActionMode;
@@ -447,15 +452,21 @@ export function ChatInput({
   // resolved `agentId` disables the toggles instead of silently no-op'ing.
   const plusMenuCapabilities = useMemo(() => {
     const canPersistScoped = isAgentChat && Boolean(agentId);
+    // A project chat keeps its own choice (on by default) instead of the global one.
+    const ownCaps = projectCapsKey
+      ? { internalSearch: projectCaps?.internalSearch ?? true, webSearch: projectCaps?.webSearch ?? true }
+      : settings.agentCapabilities;
     return {
-      internalSearch: isAgentChat ? scopedInternalSearch : settings.agentCapabilities.internalSearch,
-      webSearch: isAgentChat ? scopedWebSearch : settings.agentCapabilities.webSearch,
+      internalSearch: isAgentChat ? scopedInternalSearch : ownCaps.internalSearch,
+      webSearch: isAgentChat ? scopedWebSearch : ownCaps.webSearch,
       onToggleInternalSearch: (enabled: boolean) => {
         if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { internalSearch: enabled });
+        else if (projectCapsKey) setScopedAgentCapabilities(projectCapsKey, { internalSearch: enabled });
         else if (!isAgentChat) setAgentCapabilities({ internalSearch: enabled });
       },
       onToggleWebSearch: (enabled: boolean) => {
         if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { webSearch: enabled });
+        else if (projectCapsKey) setScopedAgentCapabilities(projectCapsKey, { webSearch: enabled });
         else if (!isAgentChat) setAgentCapabilities({ webSearch: enabled });
       },
       agentHasInternalSearch: isAgentChat
@@ -470,6 +481,8 @@ export function ChatInput({
     agentId,
     scopedInternalSearch,
     scopedWebSearch,
+    projectCapsKey,
+    projectCaps,
     settings.agentCapabilities,
     setScopedAgentCapabilities,
     setAgentCapabilities,

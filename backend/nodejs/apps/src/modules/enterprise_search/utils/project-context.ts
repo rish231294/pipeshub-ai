@@ -8,6 +8,7 @@ import { IProjectDocument } from '../../projects/types/project.interfaces';
 import { ProjectService } from '../../projects/services/project.service';
 import { Project } from '../../projects/schema/project.schema';
 import { resolveCallerTeamIds } from '../../projects/utils/team-membership';
+import { ProjectsFeature } from '../../projects/utils/projects-feature';
 import { ChatSession } from '../schema/chat.session.schema';
 
 const logger = Logger.getInstance({ service: 'ProjectContext' });
@@ -95,6 +96,7 @@ export async function resolveProjectLink(
   if (!projectId) {
     return {};
   }
+  await ProjectsFeature.assertEnabled();
   assertProjectReadScope(caller);
   const { project } = await ProjectService.assertAccess(
     orgId,
@@ -290,6 +292,9 @@ export async function loadProjectForSession(
   } = {},
 ): Promise<IProjectDocument | undefined> {
   if (!projectId) return undefined;
+  // With Projects off the chat carries on without project context; the link
+  // is kept, so turning Projects back on restores it.
+  if (!(await ProjectsFeature.isEnabled())) return undefined;
   assertProjectReadScope(options.caller);
   try {
     const { project } = await ProjectService.assertAccess(
