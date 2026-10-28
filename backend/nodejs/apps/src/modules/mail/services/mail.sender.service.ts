@@ -1,4 +1,4 @@
-import { inject, injectable } from 'inversify';
+import { inject, injectable, optional } from 'inversify';
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import { Logger } from '../../../libs/services/logger.service';
@@ -58,6 +58,11 @@ export class MailSenderService {
     @inject('AppConfigProvider')
     private readonly getAppConfig: () => AppConfig,
     @inject('Logger') private readonly logger: Logger,
+    // Another replica may have turned email off or deleted it; this process's
+    // AppConfig only changes when the reload request reaches it.
+    @inject('StoredSmtpConfig')
+    @optional()
+    private readonly readStoredSmtpConfig?: () => Promise<SmtpConfig | null>,
   ) {}
 
   /** Resolves the live SMTP config, or null when the org has not set one up. */
@@ -236,6 +241,30 @@ export class MailSenderService {
     smtpConfig: SmtpConfig,
     deadlineMs: number = SMTP_SEND_DEADLINE_MS,
   ): Promise<MailSendResult> {
+    if (this.readStoredSmtpConfig) {
+      let stored: SmtpConfig | null;
+      try {
+        stored = await this.readStoredSmtpConfig();
+      } catch (error) {
+        this.logger.warn(
+          'Could not read the stored SMTP settings before sending',
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        return {
+          status: 'transient',
+          error: 'Could not read the SMTP settings',
+        };
+      }
+      if (!stored) {
+        return {
+          status: 'permanent',
+          error: 'Email is turned off or not configured',
+        };
+      }
+    }
+
     let emailContent: string;
     try {
       emailContent = this.renderContent(

@@ -103,6 +103,36 @@ describe('MailSenderService', () => {
     expect((MailModel.prototype.save as sinon.SinonStub).calledOnce).to.be.true;
   });
 
+  it('sends nothing when the stored SMTP settings were turned off or deleted on another replica', async () => {
+    // This process still holds the settings it loaded; only the stored copy says email is off.
+    const readStored = sinon.stub().resolves(null);
+    const sender = new MailSenderService(() => ({ smtp }) as any, mockLogger, readStored);
+
+    const result = await sender.send(body, smtp);
+
+    expect(result.status).to.equal('permanent');
+    expect(readStored.calledOnce).to.be.true;
+    expect(sendMailStub.called).to.be.false;
+  });
+
+  it('sends nothing, and asks for a retry, when the stored SMTP settings cannot be read', async () => {
+    const readStored = sinon.stub().rejects(new Error('kv down'));
+    const sender = new MailSenderService(() => ({ smtp }) as any, mockLogger, readStored);
+
+    const result = await sender.send(body, smtp);
+
+    expect(result.status).to.equal('transient');
+    expect(sendMailStub.called).to.be.false;
+  });
+
+  it('sends when the stored SMTP settings are on', async () => {
+    const readStored = sinon.stub().resolves(smtp);
+    const sender = new MailSenderService(() => ({ smtp }) as any, mockLogger, readStored);
+
+    expect((await sender.send(body, smtp)).status).to.equal('sent');
+    expect(sendMailStub.calledOnce).to.be.true;
+  });
+
   it('classifies an SMTP 5xx rejection as permanent', async () => {
     sendMailStub.rejects(Object.assign(new Error('550 rejected'), {
       responseCode: 550,
