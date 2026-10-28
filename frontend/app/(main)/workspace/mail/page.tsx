@@ -73,6 +73,13 @@ export default function MailPage() {
     loadSmtpConfig();
   }, [isProfileInitialized, isAdmin, loadSmtpConfig]);
 
+  // A failed request may still have changed what is stored, so show that rather than the old state.
+  const refreshSmtpConfig = useCallback(async () => {
+    const config = await SmtpApi.getSmtpConfig();
+    setSmtpConfig(config);
+    setIsConfigured(!!config?.inherited || (!!config?.host && !!config?.fromEmail));
+  }, []);
+
   // ── Save SMTP config ──────────────────────────────────────
   const handleSave = useCallback(
     async (config: SmtpConfig) => {
@@ -107,11 +114,13 @@ export default function MailPage() {
         });
       } catch {
         addToast({ variant: 'error', title: t('workspace.mail.toasts.actionFailed') });
+        setTurnOffOpen(false);
+        await refreshSmtpConfig();
       } finally {
         setIsMutating(false);
       }
     },
-    [addToast, t],
+    [addToast, t, refreshSmtpConfig],
   );
 
   const handleDelete = useCallback(async () => {
@@ -124,10 +133,12 @@ export default function MailPage() {
       addToast({ variant: 'success', title: t('workspace.mail.toasts.deleted') });
     } catch {
       addToast({ variant: 'error', title: t('workspace.mail.toasts.actionFailed') });
+      setDeleteOpen(false);
+      await refreshSmtpConfig();
     } finally {
       setIsMutating(false);
     }
-  }, [addToast, t]);
+  }, [addToast, t, refreshSmtpConfig]);
 
   // Prevent rendering while profile is unresolved or for non-admin (redirect above).
   if (!isProfileInitialized || isAdmin === false) {

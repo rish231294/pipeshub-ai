@@ -13,6 +13,7 @@ import { useUserStore } from '@/lib/store/user-store';
 import { useSidebarWidthStore } from '@/lib/store/sidebar-width-store';
 import { useIsMobile } from '@/lib/hooks/use-is-mobile';
 import { BrandMark } from '@/config';
+import { useChatStore } from '@/chat/store';
 
 /** A count you check rather than a place you browse to, so it rides the bar with its number on the glyph. */
 function InboxButton() {
@@ -126,6 +127,12 @@ export function ChatSidebarHeader() {
         href="/chat/"
         onClick={() => {
           if (isMobile) closeMobileSidebar();
+          // Search results share /chat/ with the new-chat page, so the link alone would leave them open.
+          const chat = useChatStore.getState();
+          if (chat.settings.mode === 'search') {
+            chat.setMode('chat');
+            chat.clearSearchResults();
+          }
         }}
         className="touch-hit"
         aria-label={t('nav.home')}

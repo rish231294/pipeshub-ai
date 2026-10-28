@@ -93,6 +93,33 @@ describe('Mail page: turning email off and deleting the settings', () => {
     expect(await screen.findByText('Not configured')).toBeTruthy();
   });
 
+  it('shows what is stored when turning email off fails', async () => {
+    api.setSmtpEnabled.mockRejectedValue(new Error('mail service reload failed'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('switch', { name: 'Send email' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Turn off email?' });
+    // The setting was saved before the reload failed.
+    api.getSmtpConfig.mockResolvedValue({ ...STORED, enabled: false });
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Turn off' }));
+
+    expect(await screen.findByText('Turned off')).toBeTruthy();
+    expect(api.getSmtpConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows what is stored when deleting fails', async () => {
+    api.deleteSmtpConfig.mockRejectedValue(new Error('mail service reload failed'));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete SMTP settings' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Delete SMTP settings?' });
+    api.getSmtpConfig.mockResolvedValue(null);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+    expect(await screen.findByText('Not configured')).toBeTruthy();
+    expect(api.getSmtpConfig).toHaveBeenCalledTimes(2);
+  });
+
   it('offers neither control when nothing is configured', async () => {
     api.getSmtpConfig.mockResolvedValue(null);
     renderPage();
