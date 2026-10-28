@@ -64969,6 +64969,7 @@ paths:
               schema:
                 type: object
                 required: [message]
+                additionalProperties: false
                 properties:
                   message:
                     type: string
@@ -65005,7 +65006,8 @@ paths:
         Keeps the stored SMTP settings and sets whether they are used. While `enabled` is
         `false` the mail service sends nothing, invitations are refused with `400`, and
         `GET /configurationManager/smtpConfig/status` reports `configured: false`. Saving the
-        configuration later keeps the value set here.
+        configuration later keeps the value set here. Fields other than `enabled` are dropped
+        by the validator, not rejected.
       operationId: setSMTPConfigEnabled
       security:
         - bearerAuth: []
@@ -65030,6 +65032,7 @@ paths:
               schema:
                 type: object
                 required: [enabled]
+                additionalProperties: false
                 properties:
                   enabled:
                     type: boolean
