@@ -653,7 +653,11 @@ export const deleteSmtpConfig =
     keyValueStoreService: KeyValueStoreService,
     communicationBackend: string,
     scopedJwtSecret: string,
-  ) =>
+  ): ((
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ) => Promise<void>) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
       if (!req.user) {
@@ -681,7 +685,11 @@ export const setSmtpConfigEnabled =
     keyValueStoreService: KeyValueStoreService,
     communicationBackend: string,
     scopedJwtSecret: string,
-  ) =>
+  ): ((
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ) => Promise<void>) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
       if (!req.user) {

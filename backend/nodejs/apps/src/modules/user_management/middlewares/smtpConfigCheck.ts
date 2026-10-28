@@ -79,8 +79,11 @@ export const smtpConfigCheck =
       if (!credentialsData) {
         throw new NotFoundError('Smtp Configuration not found');
       }
-      if (credentialsData.enabled === false) {
-        throw new BadRequestError('Email is turned off. An admin can turn it on in Mail settings.');
+      const { enabled } = credentialsData as { enabled?: unknown };
+      if (enabled === false) {
+        throw new BadRequestError(
+          'Email is turned off. An admin can turn it on in Mail settings.',
+        );
       }
       if (!credentialsData.host) {
         throw new NotFoundError('Smtp not configured: Host is missing');

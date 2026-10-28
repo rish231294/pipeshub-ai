@@ -379,6 +379,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
    */
   router.delete(
     '/smtpConfig',
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- AuthMiddleware binds authenticate in its constructor
     authMiddleware.authenticate,
     requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,
@@ -395,6 +396,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
    */
   router.put(
     '/smtpConfig/enabled',
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- AuthMiddleware binds authenticate in its constructor
     authMiddleware.authenticate,
     requireScopes(OAuthScopeNames.CONFIG_WRITE),
     userAdminCheck,

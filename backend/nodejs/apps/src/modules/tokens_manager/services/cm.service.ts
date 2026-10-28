@@ -160,9 +160,11 @@ export class ConfigService {
       configPaths.smtp,
     );
     if (encryptedConfig) {
-      const config = JSON.parse(this.encryptionService.decrypt(encryptedConfig));
+      const config = JSON.parse(
+        this.encryptionService.decrypt(encryptedConfig),
+      ) as SmtpConfig;
       // An admin turned email off: the mail service must behave as if none is set.
-      return config?.enabled === false ? null : config;
+      return config.enabled === false ? null : config;
     }
     return null;
   }
