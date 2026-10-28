@@ -125,7 +125,9 @@ export function ChatSidebarHeader() {
     <Flex align="center" justify="between" gap="2" style={{ height: '100%', padding: 'var(--space-4)' }}>
       <Link
         href="/chat/"
-        onClick={() => {
+        onClick={(e) => {
+          // A modified click opens Home elsewhere; this tab keeps its search.
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
           if (isMobile) closeMobileSidebar();
           // Search results share /chat/ with the new-chat page, so the link alone would leave them open.
           const chat = useChatStore.getState();
