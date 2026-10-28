@@ -105,6 +105,8 @@ export function SidebarHeaderActions() {
 export function ChatSidebarHeader() {
   const { t } = useTranslation();
   const profile = useUserStore((s) => s.profile);
+  const isMobile = useIsMobile();
+  const closeMobileSidebar = useMobileSidebarStore((s) => s.close);
 
   const avatar = (
     <UserAvatar
@@ -120,7 +122,17 @@ export function ChatSidebarHeader() {
 
   return (
     <Flex align="center" justify="between" gap="2" style={{ height: '100%', padding: 'var(--space-4)' }}>
-      <BrandMark size={HEADER_ELEMENT_SIZE} color="var(--accent-11)" />
+      <Link
+        href="/chat/"
+        onClick={() => {
+          if (isMobile) closeMobileSidebar();
+        }}
+        className="touch-hit"
+        aria-label={t('nav.home')}
+        style={{ lineHeight: 0, display: 'inline-flex' }}
+      >
+        <BrandMark size={HEADER_ELEMENT_SIZE} color="var(--accent-11)" />
+      </Link>
       <Flex align="center" gap="1">
         <Link href="/workspace/profile/" className="touch-hit" aria-label={t('common.openProfile')} style={{ textDecoration: 'none', lineHeight: 0, display: 'inline-flex' }}>
           {avatar}
