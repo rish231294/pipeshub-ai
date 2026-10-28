@@ -37,8 +37,11 @@ vi.mock('../../components/instance-panel', () => ({ InstanceManagementPanel: () 
 vi.mock('../../demo-data/components', () => ({ DemoDataRemovalNotice: () => null }));
 vi.mock('@/config', async () => ({
   PermissionLockIcon: () => null,
-  TEAM_CONNECTOR_VISIBILITY_WARNINGS: (await import('../../utils/team-visibility-warning'))
-    .TEAM_CONNECTOR_VISIBILITY_WARNINGS,
+  TEAM_CONNECTOR_VISIBILITY_WARNINGS: {
+    ...(await import('../../utils/team-visibility-warning')).TEAM_CONNECTOR_VISIBILITY_WARNINGS,
+    // No shipped connector is team-only today; this one keeps that dialog covered.
+    'Team Only DB': { hasPersonal: false },
+  },
 }));
 vi.mock('@/app/components/ui/MaterialIcon', () => ({ MaterialIcon: () => null }));
 vi.mock('@/app/components/ui/ConnectorIcon', () => ({ ConnectorIcon: () => null }));
@@ -69,7 +72,7 @@ import {
 const jira = makeConnector({ isAdminAccessRequired: true, personalConnectorType: 'Jira personal' });
 const slack = makeConnector({ name: 'Slack', type: 'Slack', appGroup: 'Slack' });
 const s3 = makeConnector({ name: 'S3', type: 'S3', appGroup: 'S3' });
-const mariadb = makeConnector({ name: 'MariaDB', type: 'MariaDB', appGroup: 'MariaDB' });
+const teamOnly = makeConnector({ name: 'Team Only DB', type: 'Team Only DB', appGroup: 'Team Only DB' });
 
 beforeEach(() => {
   installDomShims();
@@ -80,7 +83,7 @@ beforeEach(() => {
   nav.replace.mockReset();
   nav.params = new URLSearchParams();
   for (const fn of Object.values(api)) fn.mockReset();
-  api.getRegistryConnectors.mockResolvedValue({ connectors: [jira, slack, s3, mariadb] });
+  api.getRegistryConnectors.mockResolvedValue({ connectors: [jira, slack, s3, teamOnly] });
   api.getActiveConnectors.mockResolvedValue({ connectors: [] });
   api.getConnectorConfig.mockResolvedValue(makeConfig());
   api.toggleConnector.mockResolvedValue({});
@@ -214,7 +217,7 @@ describe('Team connectors page: connectors whose data the whole organization can
 
   it('offers no personal connector for a team-only connector', async () => {
     renderInTheme(<TeamConnectorsPage />);
-    const card = await screen.findByTestId('connector-card-MariaDB');
+    const card = await screen.findByTestId('connector-card-Team Only DB');
     fireEvent.click(within(card).getByRole('button', { name: /Set up/ }));
 
     const dialog = await screen.findByRole('dialog', { name: warningName });

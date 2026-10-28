@@ -192,11 +192,11 @@ CONNECTOR_POSTGRES_INFO = (
     "is every table the database user can read. "
     + _PERSONAL_CONNECTOR_HINT
 )
-# MariaDB is team-only, so there is no personal option to point at.
 CONNECTOR_MARIADB_INFO = (
-    "Everyone in your organization can search every table this connector syncs; table and "
-    "database permissions are not applied. With Tables empty, that is every table the database "
-    "user can read, so give it a user that can read only what the whole organization may see."
+    "If you create a team connector, everyone in your organization can search every table it "
+    "syncs; table and database permissions are not applied. With Tables empty, that is every "
+    "table the database user can read. "
+    + _PERSONAL_CONNECTOR_HINT
 )
 
 # The permission lists must match what test_connection_and_access checks.

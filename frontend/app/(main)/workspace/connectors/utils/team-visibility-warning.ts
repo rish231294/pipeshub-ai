@@ -12,7 +12,7 @@ export const TEAM_CONNECTOR_VISIBILITY_WARNINGS: Readonly<Record<string, { hasPe
   GCS: { hasPersonal: true },
   MinIO: { hasPersonal: true },
   PostgreSQL: { hasPersonal: true },
-  MariaDB: { hasPersonal: false },
+  MariaDB: { hasPersonal: true },
 };
 
 export function getTeamVisibilityWarning(
