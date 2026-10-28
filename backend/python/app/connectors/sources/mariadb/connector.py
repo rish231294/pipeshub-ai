@@ -24,7 +24,7 @@ from app.config.constants.arangodb import (
     PermissionModel,
     RecordRelations,
 )
-from app.connectors.core.constants import IconPaths
+from app.connectors.core.constants import CONNECTOR_MARIADB_INFO, IconPaths
 from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.error.sql_stream_errors import (
     to_sql_response_error,
@@ -147,6 +147,7 @@ class SyncStats:
 @ConnectorBuilder("MariaDB")\
     .in_group("MariaDB")\
     .with_description("Sync databases and tables from MariaDB")\
+    .with_info(CONNECTOR_MARIADB_INFO)\
     .with_categories(["Database"])\
     .with_scopes([ConnectorScope.TEAM.value])\
     .with_permission_model(PermissionModel.APP_LEVEL)\

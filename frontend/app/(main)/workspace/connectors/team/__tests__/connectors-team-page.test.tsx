@@ -35,7 +35,11 @@ vi.mock('../../components/connector-panel', () => ({
 }));
 vi.mock('../../components/instance-panel', () => ({ InstanceManagementPanel: () => null }));
 vi.mock('../../demo-data/components', () => ({ DemoDataRemovalNotice: () => null }));
-vi.mock('@/config', () => ({ PermissionLockIcon: () => null }));
+vi.mock('@/config', async () => ({
+  PermissionLockIcon: () => null,
+  TEAM_CONNECTOR_VISIBILITY_WARNINGS: (await import('../../utils/team-visibility-warning'))
+    .TEAM_CONNECTOR_VISIBILITY_WARNINGS,
+}));
 vi.mock('@/app/components/ui/MaterialIcon', () => ({ MaterialIcon: () => null }));
 vi.mock('@/app/components/ui/ConnectorIcon', () => ({ ConnectorIcon: () => null }));
 vi.mock('@/app/components/ui/lottie-loader', () => ({
@@ -64,6 +68,8 @@ import {
 
 const jira = makeConnector({ isAdminAccessRequired: true, personalConnectorType: 'Jira personal' });
 const slack = makeConnector({ name: 'Slack', type: 'Slack', appGroup: 'Slack' });
+const s3 = makeConnector({ name: 'S3', type: 'S3', appGroup: 'S3' });
+const mariadb = makeConnector({ name: 'MariaDB', type: 'MariaDB', appGroup: 'MariaDB' });
 
 beforeEach(() => {
   installDomShims();
@@ -74,7 +80,7 @@ beforeEach(() => {
   nav.replace.mockReset();
   nav.params = new URLSearchParams();
   for (const fn of Object.values(api)) fn.mockReset();
-  api.getRegistryConnectors.mockResolvedValue({ connectors: [jira, slack] });
+  api.getRegistryConnectors.mockResolvedValue({ connectors: [jira, slack, s3, mariadb] });
   api.getActiveConnectors.mockResolvedValue({ connectors: [] });
   api.getConnectorConfig.mockResolvedValue(makeConfig());
   api.toggleConnector.mockResolvedValue({});
@@ -176,6 +182,53 @@ describe('Team connectors page: setup that needs admin access at the provider', 
 
     expect(await screen.findByRole('dialog', { name: 'Set up Slack' })).toBeTruthy();
     expect(screen.queryByRole('dialog', { name: 'Admin access required' })).toBeNull();
+  });
+});
+
+describe('Team connectors page: connectors whose data the whole organization can search', () => {
+  const warningName = 'Everyone in your organization will see this data';
+
+  it('warns before setup and points at the personal connector', async () => {
+    renderInTheme(<TeamConnectorsPage />);
+    const card = await screen.findByTestId('connector-card-S3');
+
+    fireEvent.click(within(card).getByRole('button', { name: /Set up/ }));
+
+    const dialog = await screen.findByRole('dialog', { name: warningName });
+    expect(within(dialog).getByText(/Community Edition, the S3 connector does not apply permissions/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Set up personal connector' }));
+    expect(nav.push).toHaveBeenCalledWith('/workspace/connectors/personal/?connectorType=S3');
+    expect(useConnectorsStore.getState().isPanelOpen).toBe(false);
+  });
+
+  it('starts team setup when the admin continues', async () => {
+    renderInTheme(<TeamConnectorsPage />);
+    const card = await screen.findByTestId('connector-card-S3');
+    fireEvent.click(within(card).getByRole('button', { name: /Set up/ }));
+    const dialog = await screen.findByRole('dialog', { name: warningName });
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Continue with team connector' }));
+
+    expect(await screen.findByRole('dialog', { name: 'Set up S3' })).toBeTruthy();
+  });
+
+  it('offers no personal connector for a team-only connector', async () => {
+    renderInTheme(<TeamConnectorsPage />);
+    const card = await screen.findByTestId('connector-card-MariaDB');
+    fireEvent.click(within(card).getByRole('button', { name: /Set up/ }));
+
+    const dialog = await screen.findByRole('dialog', { name: warningName });
+    expect(within(dialog).getByText(/available only as a team connector/)).toBeTruthy();
+    expect(within(dialog).queryByRole('button', { name: 'Set up personal connector' })).toBeNull();
+  });
+
+  it('does not warn for other connectors', async () => {
+    renderInTheme(<TeamConnectorsPage />);
+    const card = await screen.findByTestId('connector-card-Slack');
+    fireEvent.click(within(card).getByRole('button', { name: /Set up/ }));
+
+    expect(await screen.findByRole('dialog', { name: 'Set up Slack' })).toBeTruthy();
+    expect(screen.queryByRole('dialog', { name: warningName })).toBeNull();
   });
 });
 
