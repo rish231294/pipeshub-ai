@@ -69,7 +69,13 @@ export class MailSenderService {
   getSmtpConfig(
     _orgId?: string,
   ): SmtpConfig | null | Promise<SmtpConfig | null> {
-    return (this.getAppConfig().smtp as SmtpConfig | undefined) ?? null;
+    const cached = (this.getAppConfig().smtp as SmtpConfig | undefined) ?? null;
+    if (!this.readStoredSmtpConfig) {
+      return cached;
+    }
+    // A replica that missed the reload must still see email turned back on.
+    // If the store cannot be read, send() reports that as a retryable failure.
+    return this.readStoredSmtpConfig().catch(() => cached);
   }
 
   protected renderContent(
@@ -238,9 +244,10 @@ export class MailSenderService {
   /** Returns the outcome instead of throwing, so the caller decides on retry. */
   async send(
     bodyData: MailBody,
-    smtpConfig: SmtpConfig,
+    requestedConfig: SmtpConfig,
     deadlineMs: number = SMTP_SEND_DEADLINE_MS,
   ): Promise<MailSendResult> {
+    let smtpConfig = requestedConfig;
     if (this.readStoredSmtpConfig) {
       let stored: SmtpConfig | null;
       try {
@@ -263,6 +270,8 @@ export class MailSenderService {
           error: 'Email is turned off or not configured',
         };
       }
+      // The caller's copy can predate a host or credential change saved on another replica.
+      smtpConfig = stored;
     }
 
     let emailContent: string;

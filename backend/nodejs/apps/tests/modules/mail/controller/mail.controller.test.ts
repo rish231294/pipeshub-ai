@@ -22,7 +22,10 @@ describe('mail/controller/mail.controller', () => {
         fromEmail: 'noreply@test.com',
       },
     }
-    mockSender = { send: sinon.stub().resolves({ status: 'sent' }) }
+    mockSender = {
+      send: sinon.stub().resolves({ status: 'sent' }),
+      getSmtpConfig: sinon.stub().callsFake(async () => mockConfig.smtp),
+    }
     mockLogger = {
       info: sinon.stub(),
       error: sinon.stub(),
@@ -110,7 +113,7 @@ describe('mail/controller/mail.controller', () => {
 
   describe('sendMail', () => {
     it('should throw NotFoundError when smtp is not configured', async () => {
-      controller = new MailController({ smtp: null }, mockLogger, mockSender)
+      mockSender.getSmtpConfig.resolves(null)
       const req: any = { body: {} }
       const res: any = { status: sinon.stub().returnsThis(), json: sinon.stub() }
       const next = sinon.stub()
@@ -119,6 +122,20 @@ describe('mail/controller/mail.controller', () => {
 
       expect(next.calledOnce).to.be.true
       expect(next.firstCall.args[0]).to.be.instanceOf(NotFoundError)
+    })
+
+    it('sends with the settings the sender resolves, not the AppConfig loaded at startup', async () => {
+      // This replica loaded no SMTP settings, but email was turned on since.
+      const stored = { host: 'smtp.new.com', port: 587, fromEmail: 'noreply@new.com' }
+      controller = new MailController({ smtp: null }, mockLogger, mockSender)
+      mockSender.getSmtpConfig.resolves(stored)
+      const emailSender = sinon.stub(controller, 'emailSender').resolves({ status: true, data: 'Email sent' })
+      const res: any = { status: sinon.stub().returnsThis(), json: sinon.stub() }
+
+      await controller.sendMail({ body: {} } as any, res, sinon.stub())
+
+      expect(emailSender.firstCall.args[1]).to.deep.equal(stored)
+      expect(res.status.calledWith(200)).to.be.true
     })
 
     it('should send email and respond with 200 on success', async () => {

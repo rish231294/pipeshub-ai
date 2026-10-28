@@ -125,6 +125,40 @@ describe('MailSenderService', () => {
     expect(sendMailStub.called).to.be.false;
   });
 
+  it('delivers with the stored SMTP settings, not the copy the caller passed', async () => {
+    // Another replica saved a new host; this one still passes the settings it loaded.
+    const stored = { ...smtp, host: 'smtp.new.example.com' };
+    const createTransport = nodemailer.createTransport as sinon.SinonStub;
+    const sender = new MailSenderService(
+      () => ({ smtp }) as any,
+      mockLogger,
+      sinon.stub().resolves(stored),
+    );
+
+    expect((await sender.send(body, smtp)).status).to.equal('sent');
+    expect(createTransport.firstCall.args[0]).to.include({ host: 'smtp.new.example.com' });
+  });
+
+  it('resolves the stored SMTP settings, so a replica that loaded none sees email turned on', async () => {
+    const sender = new MailSenderService(
+      () => ({ smtp: null }) as any,
+      mockLogger,
+      sinon.stub().resolves(smtp),
+    );
+
+    expect(await sender.getSmtpConfig()).to.deep.equal(smtp);
+  });
+
+  it('falls back to the loaded SMTP settings when the store cannot be read', async () => {
+    const sender = new MailSenderService(
+      () => ({ smtp }) as any,
+      mockLogger,
+      sinon.stub().rejects(new Error('kv down')),
+    );
+
+    expect(await sender.getSmtpConfig()).to.deep.equal(smtp);
+  });
+
   it('sends when the stored SMTP settings are on', async () => {
     const readStored = sinon.stub().resolves(smtp);
     const sender = new MailSenderService(() => ({ smtp }) as any, mockLogger, readStored);

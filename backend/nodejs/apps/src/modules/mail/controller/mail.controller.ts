@@ -22,7 +22,8 @@ import { SMTP_PROBLEM_MESSAGES } from '../types/mail-event.types';
 @injectable()
 export class MailController {
   constructor(
-    @inject('AppConfig') private config: AppConfig,
+    // Kept for the constructor's shape; SMTP comes from the sender, which reads the stored copy.
+    @inject('AppConfig') _config: AppConfig,
     @inject('Logger') private logger: Logger,
     @inject(MailSenderService) private readonly sender: MailSenderService,
   ) {}
@@ -35,10 +36,11 @@ export class MailController {
     let result;
     try {
       const body = req.body;
-      if (!this.config.smtp) {
+      const smtp = await this.sender.getSmtpConfig();
+      if (!smtp) {
         throw new NotFoundError('Smtp Configuration not set');
       }
-      result = await this.emailSender(body, this.config.smtp);
+      result = await this.emailSender(body, smtp);
       if (!result.status) {
         // `data` is the mail library's own complaint, packed in by emailSender.
         this.logger.error('Sending the email failed', { reason: result.data });

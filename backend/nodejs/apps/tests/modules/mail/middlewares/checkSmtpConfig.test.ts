@@ -3,79 +3,67 @@ import { expect } from 'chai'
 import sinon from 'sinon'
 import { smtpConfigChecker } from '../../../../src/modules/mail/middlewares/checkSmtpConfig'
 
+/** A container whose MailSenderService resolves `smtp`, as the stored settings do. */
+function containerResolving(smtp: unknown): any {
+  return { get: sinon.stub().returns({ getSmtpConfig: sinon.stub().resolves(smtp) }) }
+}
+
 describe('mail/middlewares/checkSmtpConfig', () => {
   afterEach(() => {
     sinon.restore()
   })
 
-  it('should call next() when smtp is properly configured', () => {
-    const mockContainer = {
-      get: sinon.stub().returns({
-        smtp: { host: 'smtp.test.com', port: 587, fromEmail: 'noreply@test.com' },
-      }),
+  it('should call next() when smtp is properly configured', async () => {
+    const req: any = {
+      container: containerResolving({ host: 'smtp.test.com', port: 587, fromEmail: 'noreply@test.com' }),
     }
-    const req: any = { container: mockContainer }
-    const res: any = {}
     const next = sinon.stub()
 
-    smtpConfigChecker(req, res, next)
+    await smtpConfigChecker(req, {} as any, next)
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args).to.have.lengthOf(0)
   })
 
-  it('should call next with error when container is missing', () => {
-    const req: any = {}
-    const res: any = {}
+  it('should call next with error when container is missing', async () => {
     const next = sinon.stub()
 
-    smtpConfigChecker(req, res, next)
+    await smtpConfigChecker({} as any, {} as any, next)
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args[0]).to.be.instanceOf(Error)
   })
 
-  it('should call next with error when smtp is null', () => {
-    const mockContainer = {
-      get: sinon.stub().returns({ smtp: null }),
-    }
-    const req: any = { container: mockContainer }
-    const res: any = {}
+  it('should call next with error when smtp is null', async () => {
     const next = sinon.stub()
 
-    smtpConfigChecker(req, res, next)
+    await smtpConfigChecker({ container: containerResolving(null) } as any, {} as any, next)
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args[0]).to.be.instanceOf(Error)
   })
 
-  it('should call next with error when smtp host is missing', () => {
-    const mockContainer = {
-      get: sinon.stub().returns({
-        smtp: { port: 587, fromEmail: 'noreply@test.com' },
-      }),
-    }
-    const req: any = { container: mockContainer }
-    const res: any = {}
+  it('should call next with error when smtp host is missing', async () => {
     const next = sinon.stub()
 
-    smtpConfigChecker(req, res, next)
+    await smtpConfigChecker(
+      { container: containerResolving({ port: 587, fromEmail: 'noreply@test.com' }) } as any,
+      {} as any,
+      next,
+    )
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args[0]).to.be.instanceOf(Error)
   })
 
-  it('should call next with error when smtp port is missing', () => {
-    const mockContainer = {
-      get: sinon.stub().returns({
-        smtp: { host: 'smtp.test.com', fromEmail: 'noreply@test.com' },
-      }),
-    }
-    const req: any = { container: mockContainer }
-    const res: any = {}
+  it('should call next with error when smtp port is missing', async () => {
     const next = sinon.stub()
 
-    smtpConfigChecker(req, res, next)
+    await smtpConfigChecker(
+      { container: containerResolving({ host: 'smtp.test.com', fromEmail: 'noreply@test.com' }) } as any,
+      {} as any,
+      next,
+    )
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args[0]).to.be.instanceOf(Error)
