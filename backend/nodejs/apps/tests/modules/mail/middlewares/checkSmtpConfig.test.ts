@@ -2,6 +2,7 @@ import 'reflect-metadata'
 import { expect } from 'chai'
 import sinon from 'sinon'
 import { smtpConfigChecker } from '../../../../src/modules/mail/middlewares/checkSmtpConfig'
+import { SmtpSettingsUnreadableError } from '../../../../src/modules/mail/services/mail.sender.service'
 
 /** A container whose MailSenderService resolves `smtp`, as the stored settings do. */
 function containerResolving(smtp: unknown): any {
@@ -23,6 +24,20 @@ describe('mail/middlewares/checkSmtpConfig', () => {
 
     expect(next.calledOnce).to.be.true
     expect(next.firstCall.args).to.have.lengthOf(0)
+  })
+
+  it('answers 503, not "not configured", when the stored settings cannot be read', async () => {
+    const container: any = {
+      get: sinon.stub().returns({
+        getSmtpConfig: sinon.stub().rejects(new SmtpSettingsUnreadableError(new Error('kv down'))),
+      }),
+    }
+    const next = sinon.stub()
+
+    await smtpConfigChecker({ container } as any, {} as any, next)
+
+    expect(next.calledOnce).to.be.true
+    expect(next.firstCall.args[0]).to.have.property('statusCode', 503)
   })
 
   it('should call next with error when container is missing', async () => {

@@ -2,6 +2,7 @@ import 'reflect-metadata'
 import { expect } from 'chai'
 import sinon from 'sinon'
 import { MailController } from '../../../../src/modules/mail/controller/mail.controller'
+import { SmtpSettingsUnreadableError } from '../../../../src/modules/mail/services/mail.sender.service'
 import { NotFoundError } from '../../../../src/libs/errors/http.errors'
 import { isReaderWritten } from '../../../../src/libs/errors/reader-friendly'
 import { SMTP_PROBLEM_MESSAGES } from '../../../../src/modules/mail/types/mail-event.types'
@@ -122,6 +123,16 @@ describe('mail/controller/mail.controller', () => {
 
       expect(next.calledOnce).to.be.true
       expect(next.firstCall.args[0]).to.be.instanceOf(NotFoundError)
+    })
+
+    it('answers 503 when the stored SMTP settings cannot be read', async () => {
+      mockSender.getSmtpConfig.rejects(new SmtpSettingsUnreadableError(new Error('kv down')))
+      const next = sinon.stub()
+
+      await controller.sendMail({ body: {} } as any, { status: sinon.stub().returnsThis(), json: sinon.stub() } as any, next)
+
+      expect(next.firstCall.args[0]).to.have.property('statusCode', 503)
+      expect(mockSender.send.called).to.be.false
     })
 
     it('sends with the settings the sender resolves, not the AppConfig loaded at startup', async () => {

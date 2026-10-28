@@ -24,6 +24,14 @@ const SMTP_POOL_MAX_MESSAGES = 100;
 export const SMTP_CIRCUIT_FAILURE_THRESHOLD = 5;
 export const SMTP_CIRCUIT_COOLDOWN_MS = 60_000;
 
+/** The stored SMTP settings could not be read; unlike missing settings, worth retrying. */
+export class SmtpSettingsUnreadableError extends Error {
+  constructor(readonly reason: unknown) {
+    super('Could not read the SMTP settings');
+    this.name = 'SmtpSettingsUnreadableError';
+  }
+}
+
 interface PooledTransport {
   key: string;
   transporter: Transporter;
@@ -74,8 +82,14 @@ export class MailSenderService {
       return cached;
     }
     // A replica that missed the reload must still see email turned back on.
-    // If the store cannot be read, send() reports that as a retryable failure.
-    return this.readStoredSmtpConfig().catch(() => cached);
+    // An unreadable store must not look like missing settings, which callers
+    // drop without retrying; with a loaded copy, send() re-reads and retries.
+    return this.readStoredSmtpConfig().catch((error: unknown) => {
+      if (cached) {
+        return cached;
+      }
+      throw new SmtpSettingsUnreadableError(error);
+    });
   }
 
   protected renderContent(

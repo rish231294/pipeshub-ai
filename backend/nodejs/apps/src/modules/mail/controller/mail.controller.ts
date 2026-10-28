@@ -3,6 +3,7 @@ import {
   BadGatewayError,
   InternalServerError,
   NotFoundError,
+  ServiceUnavailableError,
 } from '../../../libs/errors/http.errors';
 import {
   markClientSafe,
@@ -16,6 +17,7 @@ import { getEmailContent } from '../utils/email-content';
 import {
   MailSenderService,
   SMTP_SYNC_SEND_DEADLINE_MS,
+  SmtpSettingsUnreadableError,
 } from '../services/mail.sender.service';
 import { SMTP_PROBLEM_MESSAGES } from '../types/mail-event.types';
 
@@ -36,7 +38,15 @@ export class MailController {
     let result;
     try {
       const body = req.body;
-      const smtp = await this.sender.getSmtpConfig();
+      let smtp: SmtpConfig | null;
+      try {
+        smtp = await this.sender.getSmtpConfig();
+      } catch (error) {
+        // The settings may well exist; the caller should retry, not be told to set them up.
+        throw error instanceof SmtpSettingsUnreadableError
+          ? new ServiceUnavailableError(error.message)
+          : error;
+      }
       if (!smtp) {
         throw new NotFoundError('Smtp Configuration not set');
       }

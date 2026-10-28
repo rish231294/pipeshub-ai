@@ -2,7 +2,10 @@ import 'reflect-metadata';
 import { expect } from 'chai';
 import sinon from 'sinon';
 import nodemailer from 'nodemailer';
-import { MailSenderService } from '../../../../src/modules/mail/services/mail.sender.service';
+import {
+  MailSenderService,
+  SmtpSettingsUnreadableError,
+} from '../../../../src/modules/mail/services/mail.sender.service';
 import { MailModel } from '../../../../src/modules/mail/schema/mailInfo.schema';
 import { setMailLogRepository } from '../../../../src/libs/repositories/mail-log';
 import { setIdentityPort } from '../../../../src/libs/repositories/identity';
@@ -147,6 +150,22 @@ describe('MailSenderService', () => {
     );
 
     expect(await sender.getSmtpConfig()).to.deep.equal(smtp);
+  });
+
+  it('says the store could not be read, rather than that nothing is configured, when there is no loaded copy', async () => {
+    const sender = new MailSenderService(
+      () => ({ smtp: null }) as any,
+      mockLogger,
+      sinon.stub().rejects(new Error('kv down')),
+    );
+
+    let thrown: unknown;
+    try {
+      await sender.getSmtpConfig();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).to.be.instanceOf(SmtpSettingsUnreadableError);
   });
 
   it('falls back to the loaded SMTP settings when the store cannot be read', async () => {
